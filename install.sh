@@ -4,7 +4,7 @@
 pip install virtualenv
 python3 -m virtualenv .venv
 source ".venv/bin/activate"
-pip install -r eval/TFB/requirements.txt
+pip install -r requirements.txt
 
 # Ensure eval datasets have been downloaded
 TFB_DATASET_DIR="eval/TFB/dataset"
