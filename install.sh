@@ -1,9 +1,15 @@
 #!/bin/bash
 
+# Assume .venv directory is current, if not specified
+# e.g. can use /tmp/.venv for more space
+if [ -z "$INDB_VENV" ]; then
+  INDB_VENV = ""
+fi
+
 # Install TFB Python dependencies
 pip install virtualenv
-python3 -m virtualenv .venv
-source ".venv/bin/activate"
+python3 -m virtualenv "$INDB_VENV.venv"
+source "$INDB_VENV.venv/bin/activate"
 pip install -r requirements.txt
 
 # Ensure eval datasets have been downloaded

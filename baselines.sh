@@ -1,4 +1,4 @@
-source ".venv/bin/activate"
+source "$INDB_VENV.venv/bin/activate"
 cd eval/TFB
 
 # Univariate forecasts
