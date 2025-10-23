@@ -35,7 +35,7 @@ cd eval/TFB
 
 # Univariate forecasts
 # From scripts/univariate_forecast/univariate-forecast.sh
-FREQUENCIES=("yearly", "quarterly", "monthly" "weekly" "daily" "hourly" "other")
+FREQUENCIES=("yearly" "quarterly", "monthly" "weekly" "daily" "hourly" "other")
 for freq in "${FREQUENCIES[@]}"; do
     echo "Processing: $freq benchmark..."
 
