@@ -1,0 +1,4 @@
+# In-DB Forecasting extension
+comment = ''
+default_version = '1.0'
+relocatable = false

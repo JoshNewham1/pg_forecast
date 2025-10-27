@@ -29,3 +29,14 @@ https://drive.google.com/file/d/1vgpOmAygokoUt235piWKUjfwao6KwLv7/view?usp=drive
 EOF
     exit 1
 fi
+
+# Add TFB adapters (via symlink)
+mkdir -p eval/TFB/ts_benchmark/baselines/pg_forecast
+find src/TFB/ts_benchmark/baselines/pg_forecast \
+  -type f \
+  -exec sh -c '
+    for f; do
+        target="eval/TFB/ts_benchmark/baselines/pg_forecast/${f#src/TFB/ts_benchmark/baselines/pg_forecast/}"
+        ln -sf "$(realpath "$f")" "$target"
+    done
+    ' sh {} +
