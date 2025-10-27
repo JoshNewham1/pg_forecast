@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
+from io import StringIO
 import functools
 from typing import Dict
 
@@ -17,7 +18,7 @@ class InDBModelAdapter(ModelBase):
     """
     Generic In-Database Model Adapter.
 
-    Adapts any in-database forecasting model (ARIMA, Prophet, ETS, etc.)
+    Adapts in-database forecasting model from pg_forecast (ARIMA, ETS, etc.)
     that exposes SQL functions for training and forecasting.
     """
 
@@ -27,7 +28,7 @@ class InDBModelAdapter(ModelBase):
         model_args: dict = None,
         train_fn: str = "pg_forecast_train",
         forecast_fn: str = "pg_forecast",
-        base_table: str = "pg_forecast_tfb_input",
+        base_table: str = "pg_forecast_tfb_eval",
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -48,9 +49,8 @@ class InDBModelAdapter(ModelBase):
 
         if not all((DB_USERNAME, DB_PASSWORD, DB_NAME)):
             raise RuntimeError(
-                "DB_USER, DB_PASSWORD, DB_NAME must be specified in .env")
+                "DB_USERNAME, DB_PASSWORD, DB_NAME must be specified in .env")
 
-        # SQLAlchemy engine
         self.engine = create_engine(
             f"postgresql+psycopg2://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
         )
@@ -58,6 +58,23 @@ class InDBModelAdapter(ModelBase):
     @property
     def model_name(self):
         return self._model_name
+
+    def _copy_to_db(self, df: pd.DataFrame, table: str):
+        """
+        Efficiently uploads a DataFrame to PostgreSQL using COPY.
+        """
+        buffer = StringIO()
+        df.to_csv(buffer, index=False, header=False)
+        buffer.seek(0)
+
+        conn = self.engine.raw_connection()
+        try:
+            cur = conn.cursor()
+            cur.copy_expert(f"COPY {table} FROM STDIN WITH CSV", buffer)
+            conn.commit()
+            cur.close()
+        finally:
+            conn.close()
 
     def forecast_fit(self, train_data: pd.DataFrame, **kwargs) -> "ModelBase":
         """
@@ -72,15 +89,14 @@ class InDBModelAdapter(ModelBase):
                     {date_col} TIMESTAMP,
                     {value_col} DOUBLE PRECISION
                 );
+                TRUNCATE TABLE {self.base_table};
                 """)
             )
-            conn.execute(text(f"TRUNCATE TABLE {self.base_table};"))
 
-        # Bulk insert data
+        # Bulk insert training data
         train_data = train_data.reset_index()
         train_data.columns = [date_col, value_col]
-        train_data.to_sql(self.base_table, self.engine,
-                          if_exists="append", index=False, method="multi")
+        self._copy_to_db(train_data, self.base_table)
 
         # Run in-DB training
         args_str = self._format_sql_args(self.model_args)
@@ -104,15 +120,14 @@ class InDBModelAdapter(ModelBase):
                     {date_col} TIMESTAMP,
                     {value_col} DOUBLE PRECISION
                 );
+                TRUNCATE TABLE {temp_table};
                 """)
             )
-            conn.execute(text(f"TRUNCATE TABLE {temp_table};"))
 
-        # Upload eval data
+        # Bulk insert eval data
         series = series.reset_index()
         series.columns = [date_col, value_col]
-        series.to_sql(temp_table, self.engine, if_exists="append",
-                      index=False, method="multi")
+        self._copy_to_db(series, temp_table)
 
         # Run forecast
         args_str = self._format_sql_args(self.model_args)

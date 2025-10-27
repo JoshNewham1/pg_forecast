@@ -51,3 +51,6 @@ for freq in "${FREQUENCIES[@]}"; do
 	--model-name  "darts.LinearRegressionModel" "darts.StatsForecastAutoETS" "darts.XGBModel" "darts.RandomForest" "darts.AutoARIMA" \
         $PROPERTIES
 done
+
+# Evaluate pg_forecast
+python ./eval/TFB/scripts/run_benchmark.py --config-path fixed_forecast_config_daily.json --save-path pg_forecast --model-name pg_forecast.ARIMA
