@@ -1,4 +1,3 @@
-from ts_benchmark.baselines.pg_forecast import ARIMA
 from ts_benchmark.data.data_source import read_data
 from ts_benchmark.evaluation.metrics import REGRESSION_METRICS
 from sqlalchemy import create_engine
@@ -9,11 +8,8 @@ import os
 from dotenv import load_dotenv
 from inspect import signature
 from sklearn.preprocessing import StandardScaler
+from utils import MODEL_FACTORIES
 
-# List of model factories to test
-MODEL_FACTORIES = [
-    ARIMA["model_factory"],
-]
 
 # Accuracy tolerance vs TFB models
 TOLERANCE = 0.2

@@ -111,7 +111,7 @@ class InDBModelAdapter(ModelBase):
         Executes in-database forecast and retrieves predictions.
         """
         date_col, value_col = "date", "value"
-        temp_table = f"{self.base_table}_eval"
+        temp_table = f"{self.base_table}"
 
         with self.engine.begin() as conn:
             conn.execute(
