@@ -168,7 +168,7 @@ def dict_close(a: dict, b: dict, tolerance=TOLERANCE):
     return "", -1
 
 
-def test_tfb_file(model_factory, test_engine, series, horizon, name, tfb_results):
+def benchmark_against_tfb(model_factory, test_engine, series, horizon, name, tfb_results):
     train_series, eval_series = generate_train_eval(
         series, horizon)
 
@@ -202,29 +202,29 @@ def test_forecast_length(model_factory, test_engine, dummy_series):
 
 @pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_seasonality(model_factory, test_engine, seasonality_series, tfb_results):
-    test_tfb_file(model_factory, test_engine, seasonality_series,
-                  48, "seasonality", tfb_results)
+    benchmark_against_tfb(model_factory, test_engine, seasonality_series,
+                          48, "seasonality", tfb_results)
 
 
 @pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_shifting(model_factory, test_engine, shifting_series, tfb_results):
-    test_tfb_file(model_factory, test_engine, shifting_series,
-                  48, "shifting", tfb_results)
+    benchmark_against_tfb(model_factory, test_engine, shifting_series,
+                          48, "shifting", tfb_results)
 
 
 @pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_stationarity(model_factory, test_engine, stationarity_series, tfb_results):
-    test_tfb_file(model_factory, test_engine, stationarity_series,
-                  13, "stationarity", tfb_results)
+    benchmark_against_tfb(model_factory, test_engine, stationarity_series,
+                          13, "stationarity", tfb_results)
 
 
 @pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_transition(model_factory, test_engine, transition_series, tfb_results):
-    test_tfb_file(model_factory, test_engine, transition_series,
-                  13, "transition", tfb_results)
+    benchmark_against_tfb(model_factory, test_engine, transition_series,
+                          13, "transition", tfb_results)
 
 
 @pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_trend(model_factory, test_engine, trend_series, tfb_results):
-    test_tfb_file(model_factory, test_engine, trend_series,
-                  8, "trend", tfb_results)
+    benchmark_against_tfb(model_factory, test_engine, trend_series,
+                          8, "trend", tfb_results)
