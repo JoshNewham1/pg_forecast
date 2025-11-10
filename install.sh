@@ -30,6 +30,26 @@ EOF
     exit 1
 fi
 
+MONASH_DATASET_DIR="eval/monash/data"
+if [ ! -d "$MONASH_DATASET_DIR" ]; then
+    cat << EOF
+--------------------------------------------------------
+ERROR: Monash dataset directory missing!
+
+The directory was not found at the expected location:
+$MONASH_DATASET_DIR
+
+Please download the following datasets from their repository or use
+this direct link:
+https://huggingface.co/datasets/Monash-University/monash_tsf/tree/main/data
+
+* solar_10_minutes_dataset
+* wind_farms_minutely_dataset_with_missing_values
+--------------------------------------------------------
+EOF
+    exit 1
+fi
+
 # Add TFB adapters (via symlink)
 mkdir -p eval/TFB/ts_benchmark/baselines/pg_forecast
 find src/TFB/ts_benchmark/baselines/pg_forecast \
