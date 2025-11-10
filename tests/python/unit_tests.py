@@ -1,26 +1,13 @@
-from ts_benchmark.data.data_source import read_data
-from ts_benchmark.evaluation.metrics import REGRESSION_METRICS
-from sqlalchemy import create_engine
 import pytest
-import numpy as np
-import pandas as pd
+from sqlalchemy import create_engine, text
 import os
 from dotenv import load_dotenv
-from inspect import signature
-from sklearn.preprocessing import StandardScaler
-from utils import MODEL_FACTORIES
-
-
-# Accuracy tolerance vs TFB models
-TOLERANCE = 0.2
-
-# Override with test DB for all tests
 
 
 @pytest.fixture(scope="session")
 def test_engine():
     """
-    Create an SQLAlchemy engine for the test database using TEST_ env vars.
+    Create an SQLAlchemy engine for the test database
     """
     load_dotenv()
     TEST_DB_USERNAME = os.getenv("TEST_DB_USERNAME")
@@ -31,7 +18,8 @@ def test_engine():
 
     if not all([TEST_DB_USERNAME, TEST_DB_PASSWORD, TEST_DB_NAME]):
         raise RuntimeError(
-            "TEST_DB_USERNAME, TEST_DB_PASSWORD, TEST_DB_NAME must be set")
+            "TEST_DB_USERNAME, TEST_DB_PASSWORD, TEST_DB_NAME must be set"
+        )
 
     engine = create_engine(
         f"postgresql+psycopg2://{TEST_DB_USERNAME}:{TEST_DB_PASSWORD}@"
@@ -39,188 +27,107 @@ def test_engine():
     )
     yield engine
 
-# Sample training and evaluation data
+    # Drop after all tests
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS pg_forecast_unit_test;"))
+        conn.commit()
 
 
-@pytest.fixture
-def seasonality_series():
-    return read_data(os.path.join(os.path.dirname(__file__), "data", "seasonality.csv"))
-
-
-@pytest.fixture
-def shifting_series():
-    return read_data(os.path.join(os.path.dirname(__file__), "data", "shifting.csv"))
-
-
-@pytest.fixture
-def stationarity_series():
-    return read_data(os.path.join(os.path.dirname(__file__), "data", "stationarity.csv"))
-
-
-@pytest.fixture
-def transition_series():
-    return read_data(os.path.join(os.path.dirname(__file__), "data", "transition.csv"))
-
-
-@pytest.fixture
-def trend_series():
-    return read_data(os.path.join(os.path.dirname(__file__), "data", "trend.csv"))
-
-
-@pytest.fixture
-def dummy_series():
-    return read_data(os.path.join(os.path.dirname(__file__), "data", "dummy.csv"))
-
-
-@pytest.fixture
-def tfb_results():
-    return {
-        "ARIMA": {
-            "seasonality": {
-                "mae": 2.95696873656854, "mse": 11.9230570738923, "rmse": 3.45297800078314, "mape": 13.4911463615142, "smape": 12.8213109346346, "mase": 19.2336534915092, "wape": 12.2399533766204, "msmape": 12.7923137365198
-            },
-            "shifting": {
-                "mae": 0.0267676271849295, "mse": 0.000949339932568961, "rmse": 0.0308113604465781, "mape": 8.99349270195414, "smape": 9.2748679923273, "mase": 1.78882660349899E-05, "wape": 8.98888895632077, "msmape": 7.90347186691741
-            },
-            "stationarity": {
-                "mae": 70.7891739080406, "mse": 6995.52247939511, "rmse": 83.6392400694501, "mape": 0.713667100315758, "smape": 0.716592852326448, "mase": 2.12231720719545, "wape": 0.717266970123747, "msmape": 0.716589224838155
-            },
-            "transition": {
-                "mae": 0.0744705575580259, "mse": 0.00554586394300325, "rmse": 0.0744705575580259, "mape": float("inf"), "smape": 200, "mase": 0.0135846976036936, "wape": float("inf"), "msmape": 24.8235191860086
-            },
-            "trend": {
-                "mae": 279.953890699423, "mse": 110072.244498126, "rmse": 331.771373837656, "mape": 1.23255859634321, "smape": 1.24283892107891, "mase": 1.04040914804184, "wape": 1.24263482776306, "msmape": 1.24283616195403
-            }
-        }
-    }
-
-# Inject test database engine into model factories
-
-
-def make_test_model(model_factory, engine):
+@pytest.fixture(scope="function", autouse=True)
+def setup_schema(test_engine):
     """
-    Override the model's engine to point to the test database.
+    Optionally set up / tear down schema for each test.
     """
-    model = model_factory()
-    model.engine = engine
-    return model
+    with test_engine.connect() as conn:
+        # Create function (you can also assume it exists)
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS pg_forecast_unit_test (
+            t TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+            series_id TEXT NOT NULL,
+            value DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (t, series_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pg_forecast_unit_test_t ON public.pg_forecast_unit_test (t);
+        TRUNCATE TABLE pg_forecast_unit_test;
+        """))
+        conn.commit()
+    yield
 
 
-def generate_train_eval(series, horizon):
-    train_series = series[:-horizon]
-    eval_series = series[-horizon:]["channel_1"]
-    return train_series, eval_series
-
-
-def evaluate_series(train, eval, pred):
-    metrics = {}
-    for metric, func in REGRESSION_METRICS.items():
-        sig = signature(func)
-        args = [eval, pred]
-
-        # For metrics requiring normalisation
-        if "scaler" in sig.parameters:
-            # Reshape inputs into 2D array for sklearn's scaler
-            eval = np.asarray(eval).reshape(-1, 1)
-            pred = np.asarray(pred).reshape(-1, 1)
-            args = [eval, pred]
-            args.append(StandardScaler().fit(eval))
-        # For MASE
-        if "hist_data" in sig.parameters:
-            args.append(train)
-        # TODO: Implement MASE
-        if "seasonality" in sig.parameters:
-            continue
-
-        metrics[metric] = func(*args)
-    return metrics
-
-
-def dict_close(a: dict, b: dict, tolerance=TOLERANCE):
+def run_function(engine, func_name, *args):
     """
-    Compute percentage closeness of values for all matching keys in two dictionaries.
-
-    Parameters
-    ----------
-    a : dict
-        First dictionary with numeric values.
-    b : dict
-        Second dictionary with numeric values.
-    tolerance : float, optional
-        Maximum relative difference allowed.
-
-    Returns
-    -------
-    string
-        Failing key, or "" if all keys are within `tolerance`
-    float
-        Percentage closeness of a failing key, or -1 if all keys are within `tolerance`.
+    Helper to call a Postgres function with parameters and return result.
     """
-    for key in a.keys():
-        if key in b and a[key] <= b[key]*(1-tolerance):
-            return key, (b[key] / a[key]) * 100
-        elif key in b and a[key] > b[key]*(1+tolerance):
-            return key, (a[key] / b[key]) * 100
-    return "", -1
+    placeholders = ", ".join([f":param{i}" for i in range(len(args))])
+    query = text(f"SELECT {func_name}({placeholders}) AS result;")
+    params = {f"param{i}": arg for i, arg in enumerate(args)}
+    with engine.connect() as conn:
+        result = conn.execute(query, params).scalar()
+    return result
 
 
-def benchmark_against_tfb(model_factory, test_engine, series, horizon, name, tfb_results):
-    train_series, eval_series = generate_train_eval(
-        series, horizon)
+def assert_close(actual, expected, tolerance=1e-3, name="value"):
+    """
+    Assert that two numeric values are approximately equal within `tolerance`.
 
-    model = make_test_model(model_factory, test_engine)
-    model.forecast_fit(train_series)
-    preds = model.forecast(horizon, train_series)
-
-    metrics = evaluate_series(train_series, eval_series, preds)
-    goal_metrics = tfb_results[model.model_name][name]
-
-    fail_key, fail_tolerance = dict_close(metrics, goal_metrics)
-    if fail_key != "":
-        raise ValueError(
-            f"{fail_key} is outside the tolerance range ({round(metrics[fail_key], 2)}, {round(fail_tolerance, 2)}% of baseline)")
-
-# Parametrised tests for all models
-
-
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_forecast_length(model_factory, test_engine, dummy_series):
-    horizon = 5
-    train_series, eval_series = generate_train_eval(dummy_series, horizon)
-
-    model = make_test_model(model_factory, test_engine)
-    model.forecast_fit(train_series)
-    preds = model.forecast(horizon, eval_series)
-
-    assert isinstance(preds, np.ndarray)
-    assert len(preds) == horizon
+    Raises
+    ------
+    AssertionError
+        If the values differ by more than `tolerance`.
+    """
+    if actual is None:
+        raise AssertionError(f"{name} is None (expected {expected})")
+    diff = abs(actual - expected)
+    if diff > tolerance:
+        raise AssertionError(
+            f"{name} differs from expected value by {diff:.6f} "
+            f"(actual={actual:.6f}, expected={expected:.6f})"
+        )
 
 
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_seasonality(model_factory, test_engine, seasonality_series, tfb_results):
-    benchmark_against_tfb(model_factory, test_engine, seasonality_series,
-                          48, "seasonality", tfb_results)
+def setup_basic_dataset(test_engine):
+    with test_engine.connect() as conn:
+        conn.execute(text("""
+        INSERT INTO pg_forecast_unit_test (t, series_id, value) VALUES
+        ('2023-01-01 00:00:00', 'TestSeries', 10.0), -- x_1
+        ('2023-01-02 00:00:00', 'TestSeries', 10.5), -- x_2
+        ('2023-01-03 00:00:00', 'TestSeries', 10.8), -- x_3
+        ('2023-01-04 00:00:00', 'TestSeries', 11.2), -- x_4
+        ('2023-01-05 00:00:00', 'TestSeries', 11.5), -- x_5
+        ('2023-01-06 00:00:00', 'TestSeries', 11.7), -- x_6
+        ('2023-01-07 00:00:00', 'TestSeries', 11.9); -- x_7
+        """))
+        conn.commit()
 
 
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_shifting(model_factory, test_engine, shifting_series, tfb_results):
-    benchmark_against_tfb(model_factory, test_engine, shifting_series,
-                          48, "shifting", tfb_results)
+def test_arima_css_p_1_q_1(test_engine):
+    """
+    Unit test for ARIMA CSS function on a basic dataset
+    where p=1, q=1
+    """
+    setup_basic_dataset(test_engine)
+    result = run_function(test_engine, "arima_css", "pg_forecast_unit_test WHERE series_id = 'TestSeries'",
+                          't', 'value', 1, 1, [0.5], [0.3])
+    assert_close(result, 130.1938)
 
 
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_stationarity(model_factory, test_engine, stationarity_series, tfb_results):
-    benchmark_against_tfb(model_factory, test_engine, stationarity_series,
-                          13, "stationarity", tfb_results)
+def test_arima_css_p_2_q_1(test_engine):
+    """
+    Unit test for ARIMA CSS function on a basic dataset
+    where p=2, q=1
+    """
+    setup_basic_dataset(test_engine)
+    result = run_function(test_engine, "arima_css", "pg_forecast_unit_test WHERE series_id = 'TestSeries'",
+                          't', 'value', 2, 1, [0.5, 0.5], [0.3])
+    assert_close(result, 2.1648)
 
 
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_transition(model_factory, test_engine, transition_series, tfb_results):
-    benchmark_against_tfb(model_factory, test_engine, transition_series,
-                          13, "transition", tfb_results)
-
-
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_trend(model_factory, test_engine, trend_series, tfb_results):
-    benchmark_against_tfb(model_factory, test_engine, trend_series,
-                          8, "trend", tfb_results)
+def test_arima_css_p_2_q_2(test_engine):
+    """
+    Unit test for ARIMA CSS function on a basic dataset
+    where p=2, q=2
+    """
+    setup_basic_dataset(test_engine)
+    result = run_function(test_engine, "arima_css", "pg_forecast_unit_test",
+                          't', 'value', 2, 2, [0.5, 0.25], [0.3, 0.5])
+    assert_close(result, 15.408)

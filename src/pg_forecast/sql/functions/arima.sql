@@ -25,7 +25,7 @@ $$ LANGUAGE plpgsql;
  * @param theta_params The array of MA parameters (theta_1, theta_2, ... theta_q).
  * @returns The total Conditional Sum of Squares (CSS).
  */
-CREATE OR REPLACE FUNCTION arima_css_sql(
+CREATE OR REPLACE FUNCTION arima_css(
     source_table TEXT,
     date_col TEXT,
     value_col TEXT,
