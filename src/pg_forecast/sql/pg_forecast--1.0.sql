@@ -1,6 +1,3 @@
--- complain if script is sourced in psql, rather than via CREATE EXTENSION
-\echo Use "CREATE EXTENSION pg_forecast" to load this file. \quit
-
 -- Generic
 CREATE OR REPLACE FUNCTION pg_forecast_train(
     model_name TEXT,
@@ -34,5 +31,16 @@ BEGIN
         FROM generate_series(1, %s)
         $f$, horizon
     );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION arima(
+    d INT, -- Number of times to difference
+    p INT, -- Number of lagged y_t
+    q INT,  -- Number of lagged residuals
+    horizon INT
+)
+RETURNS TABLE(date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
+BEGIN
+    
 END;
 $$ LANGUAGE plpgsql;
