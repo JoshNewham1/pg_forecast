@@ -36,7 +36,6 @@ CREATE OR REPLACE FUNCTION arima_css(
 )
 RETURNS DOUBLE PRECISION AS $$
 DECLARE
-    -- Dynamically build AR and MA calculation strings
     ar_sum_sql TEXT := '0.0';
     ma_sum_sql TEXT := '0.0';
     lag_cols_sql TEXT := '';
@@ -44,8 +43,11 @@ DECLARE
     k INT;
     css_query TEXT;
     result_css DOUBLE PRECISION;
+    ncond INT;
 BEGIN
-    -- ar_sum_sql: Dynamic number of windowed sums for AR terms
+    ncond := GREATEST(p, q);
+
+    -- Build AR lag expressions
     FOR j IN 1..p LOOP
         lag_cols_sql := lag_cols_sql || format(
             ', LAG(%I, %s) OVER (ORDER BY %I) AS x_lag_%s',
@@ -54,21 +56,25 @@ BEGIN
         ar_sum_sql := ar_sum_sql || format(' + COALESCE(d.x_lag_%s * %L, 0.0)', j, phi_params[j]);
     END LOOP;
 
-    -- ma_sum_sql: Dynamic number of summed residuals for MA terms
+    -- Build MA sum respecting min(i - ncond, q)
+    ma_sum_sql := '0.0';
     FOR k IN 1..q LOOP
-        ma_sum_sql := ma_sum_sql || format(' + COALESCE(r.past_errors[%s] * %L, 0.0)', k, theta_params[k]);
+        ma_sum_sql := ma_sum_sql || format(
+            ' + CASE WHEN r.i - %s >= %s THEN COALESCE(r.past_errors[%s] * %L, 0.0) ELSE 0.0 END',
+            ncond, k, k, theta_params[k]
+        );
     END LOOP;
 
+    -- Construct recursive CSS query starting at i = ncond
     css_query := format(
         $QUERY$
         WITH RECURSIVE
-        -- Pre-calculate all AR lags (x_i-j)
         ordered_data AS (
             SELECT
                 %I AS t,
                 %I AS x_i,
-                ROW_NUMBER() OVER (ORDER BY %I) AS i -- time index
-                %s -- "lag_cols_sql" from above
+                ROW_NUMBER() OVER (ORDER BY %I) AS i
+                %s -- date_col, value_col, date_col, lag_cols_sql
             FROM %s
         ),
 
@@ -79,44 +85,30 @@ BEGIN
             SELECT
                 d.i,
                 d.x_i,
-                0.0::double precision AS ar_part,
-                0.0::double precision AS ma_part,
                 0.0::double precision AS a_i,
-                ARRAY_FILL(0.0::double precision, ARRAY[%s]) AS past_errors -- q-length array of 0s
+                ARRAY_FILL(0.0::double precision, ARRAY[%s]) AS past_errors
             FROM ordered_data d
-            WHERE d.i = 1
+            WHERE d.i = %s
 
             UNION ALL
 
-            -- Recursive Step: i > 1
+            -- Recursive step: i > ncond
             SELECT
                 d.i,
                 d.x_i,
-                -- AR: SUM(phi_j * x_i-j)
-                (%s) AS ar_part,
-                -- MA: SUM(theta_k * a_i-k)
-                (%s) AS ma_part,
-                -- Error: a_i = x_i - AR_part - MA_part
                 (d.x_i - (%s) - (%s)) AS a_i,
-                -- New history of errors: [new_a_i, old_a_i-1, ... ]
                 ARRAY[(d.x_i - (%s) - (%s))] || r.past_errors[1:%s] AS past_errors
             FROM error_calculator r
             JOIN ordered_data d ON d.i = r.i + 1
         )
-        -- CSS = SUM(a_i^2)
         SELECT sum(a_i * a_i)
-        FROM error_calculator
-        WHERE i > %s; -- Sum starts after p observations (otherwise inaccurate)
+        FROM error_calculator;
         $QUERY$,
-        date_col, value_col, date_col, -- ordered_data SELECT
-        lag_cols_sql,                  -- ordered_data lags
-        source_table,                  -- ordered_data FROM
-        q,                             -- Base case past_errors array_fill
-        ar_sum_sql, ma_sum_sql,        -- Recursive ar_part, ma_part
-        ar_sum_sql, ma_sum_sql,        -- Recursive a_i calculation
-        ar_sum_sql, ma_sum_sql,        -- Recursive past_errors calculation
-        q - 1,                         -- Slice for past_errors array
-        p                              -- Final CSS SUM WHERE i > p
+        date_col, value_col, date_col, lag_cols_sql, source_table, -- ordered_data
+        q, ncond,                        -- base case past_errors length, start at i = ncond
+        ar_sum_sql, ma_sum_sql,          -- residual a_i
+        ar_sum_sql, ma_sum_sql,          -- past_errors array
+        q                                -- slice past_errors
     );
 
     RAISE DEBUG 'Generated CSS Query: %', css_query;
@@ -124,3 +116,15 @@ BEGIN
     RETURN result_css;
 END;
 $$ LANGUAGE plpgsql;
+
+-- TODO: Write array version (from scratch) in PG/plSQL and C
+-- Use SQL for aggregations, joins and AR
+-- C for CSS calculation (so it can be called many times by the optimiser)
+/*
+SELECT
+    value AS x_i,
+    -- phi_1 = 0.5, phi_2 = 0.25
+    COALESCE(LAG(value, 1) OVER (ORDER BY t),0)*0.5 + COALESCE(LAG(value, 2) OVER (ORDER BY t),0)*0.25 AS ar
+FROM time_series_data WHERE series_id = 'TestSeries'
+ORDER BY t ASC
+*/

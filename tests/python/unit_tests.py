@@ -119,7 +119,7 @@ def test_arima_css_p_2_q_1(test_engine):
     setup_basic_dataset(test_engine)
     result = run_function(test_engine, "arima_css", "pg_forecast_unit_test WHERE series_id = 'TestSeries'",
                           't', 'value', 2, 1, [0.5, 0.5], [0.3])
-    assert_close(result, 2.1648)
+    assert_close(result, 0.706344)
 
 
 def test_arima_css_p_2_q_2(test_engine):
@@ -130,4 +130,4 @@ def test_arima_css_p_2_q_2(test_engine):
     setup_basic_dataset(test_engine)
     result = run_function(test_engine, "arima_css", "pg_forecast_unit_test",
                           't', 'value', 2, 2, [0.5, 0.25], [0.3, 0.5])
-    assert_close(result, 15.408)
+    assert_close(result, 23.0322)
