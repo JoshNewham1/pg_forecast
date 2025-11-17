@@ -66,6 +66,28 @@ def run_function(engine, func_name, *args):
     return result
 
 
+def css_loss_query(phi: list[float], theta: list[float], p: int, q: int, series_id=None):
+    """
+    Build a SQLAlchemy text query to call css_loss on pg_forecast_unit_test.
+    """
+    where_clause = f"WHERE series_id = '{series_id}'" if series_id else ""
+    phi_array = ", ".join(map(str, phi))
+    theta_array = ", ".join(map(str, theta))
+
+    query_str = f"""
+        SELECT css_loss(
+            vals := array_agg(value ORDER BY t)::double precision[],
+            phi := ARRAY[{phi_array}]::double precision[],
+            theta := ARRAY[{theta_array}]::double precision[],
+            p := {p},
+            q := {q}
+        )
+        FROM pg_forecast_unit_test
+        {where_clause};
+    """
+    return text(query_str)
+
+
 def assert_close(actual, expected, tolerance=1e-3, name="value"):
     """
     Assert that two numeric values are approximately equal within `tolerance`.
@@ -100,34 +122,40 @@ def setup_basic_dataset(test_engine):
         conn.commit()
 
 
-def test_arima_css_p_1_q_1(test_engine):
+def test_css_loss_p_1_q_1(test_engine):
     """
     Unit test for ARIMA CSS function on a basic dataset
     where p=1, q=1
     """
     setup_basic_dataset(test_engine)
-    result = run_function(test_engine, "arima_css", "pg_forecast_unit_test WHERE series_id = 'TestSeries'",
-                          't', 'value', 1, 1, [0.5], [0.3])
+    query = css_loss_query(phi=[0.5], theta=[0.3],
+                           p=1, q=1, series_id='TestSeries')
+    with test_engine.connect() as conn:
+        result = conn.execute(query).scalar()
     assert_close(result, 130.1938)
 
 
-def test_arima_css_p_2_q_1(test_engine):
+def test_css_loss_p_2_q_1(test_engine):
     """
     Unit test for ARIMA CSS function on a basic dataset
     where p=2, q=1
     """
     setup_basic_dataset(test_engine)
-    result = run_function(test_engine, "arima_css", "pg_forecast_unit_test WHERE series_id = 'TestSeries'",
-                          't', 'value', 2, 1, [0.5, 0.5], [0.3])
+    query = css_loss_query(phi=[0.5, 0.5], theta=[
+                           0.3], p=2, q=1, series_id='TestSeries')
+    with test_engine.connect() as conn:
+        result = conn.execute(query).scalar()
     assert_close(result, 0.706344)
 
 
-def test_arima_css_p_2_q_2(test_engine):
+def test_css_loss_p_2_q_2(test_engine):
     """
     Unit test for ARIMA CSS function on a basic dataset
     where p=2, q=2
     """
     setup_basic_dataset(test_engine)
-    result = run_function(test_engine, "arima_css", "pg_forecast_unit_test",
-                          't', 'value', 2, 2, [0.5, 0.25], [0.3, 0.5])
+    query = css_loss_query(phi=[0.5, 0.25], theta=[
+                           0.3, 0.5], p=2, q=2, series_id='TestSeries')
+    with test_engine.connect() as conn:
+        result = conn.execute(query).scalar()
     assert_close(result, 23.0322)

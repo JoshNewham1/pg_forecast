@@ -5,6 +5,13 @@ EXTVERSION = $(shell grep default_version $(EXTENSION).control | \
 DATA = $(filter-out $(wildcard sql/*--*.sql),$(wildcard sql/*.sql))
 PG_CONFIG = pg_config
 
+# C compilation
+MODULE_big = pg_forecast
+OBJS = c/arima.o
+PG_CFLAGS += $(PERMIT_DECLARATION_AFTER_STATEMENT)
+
+# SQL compilation
+
 # Depends on 1 output SQL file
 all: sql/$(EXTENSION)--$(EXTVERSION).sql
 

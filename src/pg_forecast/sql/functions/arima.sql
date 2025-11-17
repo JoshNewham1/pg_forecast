@@ -25,7 +25,7 @@ $$ LANGUAGE plpgsql;
  * @param theta_params The array of MA parameters (theta_1, theta_2, ... theta_q).
  * @returns The total Conditional Sum of Squares (CSS).
  */
-CREATE OR REPLACE FUNCTION arima_css(
+CREATE OR REPLACE FUNCTION css_loss_sql(
     source_table TEXT,
     date_col TEXT,
     value_col TEXT,
@@ -117,14 +117,32 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+
+CREATE FUNCTION css_loss(
+    vals DOUBLE PRECISION[],
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    p INT,
+    q INT
+)
+RETURNS DOUBLE PRECISION
+AS 'MODULE_PATHNAME', 'css_loss'
+LANGUAGE C STRICT VOLATILE;
+
 -- TODO: Write array version (from scratch) in PG/plSQL and C
 -- Use SQL for aggregations, joins and AR
 -- C for CSS calculation (so it can be called many times by the optimiser)
 /*
 SELECT
-    value AS x_i,
-    -- phi_1 = 0.5, phi_2 = 0.25
-    COALESCE(LAG(value, 1) OVER (ORDER BY t),0)*0.5 + COALESCE(LAG(value, 2) OVER (ORDER BY t),0)*0.25 AS ar
-FROM time_series_data WHERE series_id = 'TestSeries'
-ORDER BY t ASC
+    css_loss(
+        vals := array_agg(value ORDER BY t)::double precision[],
+        phi := ARRAY[0.5]::double precision[],
+        theta := ARRAY[0.3]::double precision[],
+        p := 1,
+        q := 1
+    )
+FROM
+    time_series_data
+WHERE
+    series_id = 'TestSeries';
 */
