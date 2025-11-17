@@ -177,7 +177,7 @@ optimise_arima(PG_FUNCTION_ARGS)
     PG_RETURN_ARRAYTYPE_P(pg_opt_result);
 }
 
-double arima_nelder_objective(unsigned n, const double *x, double *grad, void *data)
+static double arima_nelder_objective(unsigned n, const double *x, double *grad, void *data)
 {
     css_data_t *d = (css_data_t *)data;
     double *phi = (double *)x;

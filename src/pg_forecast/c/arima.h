@@ -10,7 +10,6 @@ typedef struct {
     int q;
 } css_data_t;
 
-double arima_nelder_objective(unsigned n, const double *x, double *grad, void *data);
 double *optimise_arima_nelder(double *vals, int n_vals, int p, int q);
 
 #endif
