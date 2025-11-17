@@ -129,9 +129,6 @@ RETURNS DOUBLE PRECISION
 AS 'MODULE_PATHNAME', 'css_loss'
 LANGUAGE C STRICT VOLATILE;
 
--- TODO: Write array version (from scratch) in PG/plSQL and C
--- Use SQL for aggregations, joins and AR
--- C for CSS calculation (so it can be called many times by the optimiser)
 /*
 SELECT
     css_loss(
@@ -146,3 +143,12 @@ FROM
 WHERE
     series_id = 'TestSeries';
 */
+
+CREATE FUNCTION optimise_arima(
+    vals DOUBLE PRECISION[],
+    p INT,
+    q INT
+)
+RETURNS DOUBLE PRECISION[]
+AS 'MODULE_PATHNAME', 'optimise_arima'
+LANGUAGE C STRICT VOLATILE;

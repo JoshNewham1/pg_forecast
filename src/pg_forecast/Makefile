@@ -9,6 +9,7 @@ PG_CONFIG = pg_config
 MODULE_big = pg_forecast
 OBJS = c/arima.o
 PG_CFLAGS += $(PERMIT_DECLARATION_AFTER_STATEMENT)
+SHLIB_LINK = -lnlopt
 
 # SQL compilation
 
