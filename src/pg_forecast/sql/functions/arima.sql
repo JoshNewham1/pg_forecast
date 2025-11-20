@@ -147,7 +147,8 @@ WHERE
 CREATE FUNCTION optimise_arima(
     vals DOUBLE PRECISION[],
     p INT,
-    q INT
+    q INT,
+    method TEXT DEFAULT 'Nelder-Mead' -- 'Nelder-Mead', 'L-BFGS'
 )
 RETURNS DOUBLE PRECISION[]
 AS 'MODULE_PATHNAME', 'optimise_arima'

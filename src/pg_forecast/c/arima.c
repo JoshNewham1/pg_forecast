@@ -2,6 +2,7 @@
 #include "fmgr.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
+#include "utils/builtins.h"
 #include "catalog/pg_type.h"
 
 #include <stdio.h>
@@ -32,13 +33,23 @@ PG_FUNCTION_INFO_V1(optimise_arima);
 double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, double* grad)
 {
     int ncond = max(p, q);
-    double* resid = palloc(n_vals * sizeof(double));
-    memset(resid, 0.0, n_vals * sizeof(double));
+    double* resid = palloc0(n_vals * sizeof(double));
     double ssq = 0.0;
+    double **dphi, **dtheta = NULL;
 
     if (grad != NULL)
     {
         memset(grad, 0.0, (p + q) * sizeof(double));
+        dphi = palloc(sizeof(double*) * p);
+        for (int k = 0; k < p; k++)
+        {
+            dphi[k] = palloc0(sizeof(double) * n_vals);
+        }
+        dtheta = palloc(sizeof(double*) * q);
+        for (int k = 0; k < q; k++)
+        {
+            dtheta[k] = palloc0(sizeof(double) * n_vals);
+        }
     }
 
     for (int t = ncond; t < n_vals; t++)
@@ -65,26 +76,47 @@ double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, d
 
         if (grad != NULL)
         {
-            /*
-              CSS = sum_{t=ncond}^n e^2_t
-              e_t = y_t - sum_{j=1}^p phi_j y_{t-j} - sum_{j=1}^q theta_j e_{t-j}
-              dCSS/dphi_k = -2 * sum_{t=ncond}^n e_t y_{t-k}
-              dCSS/dtheta_k = -2 * sum_{t=ncond}^n e_t e_{t-k}
-            */
-            // Set phi gradients
-            for (int j = 0; j < p; j++)
+            /* Compute derivatives d e_t / d phi_k and d e_t / d theta_k recursively */
+            int max_ma = min(t - ncond, q);
+            // phi derivatives: d e_t / d phi_k = - y_{t-k-1} - sum_j theta_j * d e_{t-j-1} / d phi_k
+            for (int k = 0; k < p; k++)
             {
-                grad[j] -= 2.0 * tmp * vals[t-j-1];
+                double d = 0.0;
+                int idx = t - k - 1;
+                if (idx >= 0) d = - vals[idx];
+                // Add MA contribution (recursive)
+                for (int j = 0; j < max_ma; j++)
+                {
+                    d -= theta[j] * dphi[k][t-j-1];
+                }
+                dphi[k][t] = d;
+                // Accumulate gradient: d(CSS)/dphi_k = 2 * sum_t e_t * d e_t / dphi_k
+                grad[k] += 2.0 * tmp * dphi[k][t];
             }
-            // Set theta gradients
-            for (int j = 0; j < min(t-ncond, q); j++)
+
+            // theta derivatives: d e_t / d theta_k = - e_{t-k-1} - sum_j theta_j * d e_{t-j-1} / d theta_k */
+            for (int k = 0; k < q; k++)
             {
-                grad[p+j] -= 2.0 * tmp * resid[t-j-1];
+                double d = 0.0;
+                int idx = t - k - 1;
+                if (idx >= 0) d = - resid[idx];
+                for (int j = 0; j < max_ma; j++)
+                {
+                    d -= theta[j] * dtheta[k][t-j-1];
+                }
+                dtheta[k][t] = d;
+                grad[p + k] += 2.0 * tmp * dtheta[k][t];
             }
         }
     }
-    if (grad != NULL) elog(INFO, "grad 0: %f\n", grad[0]);
-    elog(INFO, "css: %f\n", ssq);
+    // Free derivative arrays
+    if (grad != NULL)
+    {
+        for (int k = 0; k < p; k++) pfree(dphi[k]);
+        if (p>0) pfree(dphi);
+        for (int k = 0; k < q; k++) pfree(dtheta[k]);
+        if (q>0) pfree(dtheta);
+    }
     pfree(resid);
     return ssq;
 }
@@ -161,6 +193,7 @@ optimise_arima(PG_FUNCTION_ARGS)
     int32 p = PG_GETARG_INT32(1);
     int32 q = PG_GETARG_INT32(2);
     int n_vals = ArrayGetNItems(ARR_NDIM(vals_arr), ARR_DIMS(vals_arr));
+    char* arima_method = text_to_cstring(PG_GETARG_TEXT_P(3));
 
     /* Validate arguments */
     if (ARR_NDIM(vals_arr) != 1)
@@ -185,10 +218,22 @@ optimise_arima(PG_FUNCTION_ARGS)
         vals[i] = DatumGetFloat8(vals_d[i]);
 
     /* Call optimiser */
-    double* opt_result = optimise_arima_lbfgs(vals, n_vals, p, q);
+    double* opt_result;
+    int n_params = p + q;
+    if (strcmp(arima_method, "Nelder-Mead") == 0)
+    {
+        opt_result = optimise_arima_nelder(vals, n_vals, p, q);
+    }
+    else if (strcmp(arima_method, "L-BFGS") == 0)
+    {
+        opt_result = optimise_arima_lbfgs(vals, n_vals, p, q);
+    }
+    else
+    {
+        elog(ERROR, "Invalid optimiser provided: %s\n", arima_method);
+    }
 
     /* Warn for risky bounds */
-    int n_params = p + q;
     for (int i = 0; i < n_params; i++)
     {
         double val = opt_result[i];
@@ -278,8 +323,8 @@ double *optimise_arima_lbfgs(double *vals, int n_vals, int p, int q)
     double *ub = palloc(sizeof(double) * n_params);
     for (int i = 0; i < n_params; i++)
     {
-        lb[i] = -1.0;
-        ub[i] = 1.0;
+        lb[i] = -2.0;
+        ub[i] = 2.0;
     }
     nlopt_set_lower_bounds(opt, lb);
     nlopt_set_upper_bounds(opt, ub);
