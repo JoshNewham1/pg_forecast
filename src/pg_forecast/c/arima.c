@@ -4,6 +4,7 @@
 #include "utils/lsyscache.h"
 #include "utils/builtins.h"
 #include "catalog/pg_type.h"
+#include "funcapi.h"
 
 #include <stdio.h>
 #include <math.h>
@@ -30,10 +31,10 @@ PG_FUNCTION_INFO_V1(optimise_arima);
   If the gradient isn't required, leave `grad` = NULL
   If the gradient is required, leave enough space for p+q values
 */
-double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, double* grad)
+double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, double* grad, double* resid)
 {
     int ncond = max(p, q);
-    double* resid = palloc0(n_vals * sizeof(double));
+    memset(resid, 0.0, n_vals * sizeof(double));
     double ssq = 0.0;
     double **dphi, **dtheta = NULL;
 
@@ -117,7 +118,6 @@ double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, d
         for (int k = 0; k < q; k++) pfree(dtheta[k]);
         if (q>0) pfree(dtheta);
     }
-    pfree(resid);
     return ssq;
 }
 
@@ -182,7 +182,8 @@ css_loss(PG_FUNCTION_ARGS)
         theta[i] = DatumGetFloat8(theta_d[i]);
     
     /* CSS logic */
-    PG_RETURN_FLOAT8(css(vals, phi, theta, p, q, n_vals, NULL));
+    double* resid = palloc(n_vals * sizeof(double));
+    PG_RETURN_FLOAT8(css(vals, phi, theta, p, q, n_vals, NULL, resid));
 }
 
 Datum
@@ -218,7 +219,7 @@ optimise_arima(PG_FUNCTION_ARGS)
         vals[i] = DatumGetFloat8(vals_d[i]);
 
     /* Call optimiser */
-    double* opt_result;
+    opt_result_t opt_result;
     int n_params = p + q;
     if (strcmp(arima_method, "Nelder-Mead") == 0)
     {
@@ -236,23 +237,61 @@ optimise_arima(PG_FUNCTION_ARGS)
     /* Warn for risky bounds */
     for (int i = 0; i < n_params; i++)
     {
-        double val = opt_result[i];
+        double val = opt_result.params[i];
         if (val > 1.0 || val < -1.0)
         {
             elog(WARNING, "phi/theta coefficient outside of [-1, 1]: %f\n", val);
         }
     }
 
-    /* Convert to PG return type */
-    Datum *darray = palloc(sizeof(Datum) * n_params);
-    for (int i = 0; i < n_params; i++)
+    /* Convert to optimise_arima_result return type */
+    TupleDesc tupdesc;
+    Datum values[3];
+    bool nulls[3];
+    HeapTuple tuple;
+    Datum result;
+    Oid type_oid = get_call_result_type(fcinfo, NULL, &tupdesc);
+    if (!OidIsValid(type_oid))
     {
-        darray[i] = Float8GetDatum(opt_result[i]);
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("type \"optimise_arima_result\" does not exist")));
     }
-    ArrayType *pg_opt_result = construct_array(darray, n_params, FLOAT8OID,
-                                               sizeof(double), FLOAT8PASSBYVAL,
-                                               'd');
-    PG_RETURN_ARRAYTYPE_P(pg_opt_result);
+    
+    // Phi array
+    Datum *phi_array = palloc(sizeof(Datum) * p);
+    for (int i = 0; i < p; i++)
+    {
+        phi_array[i] = Float8GetDatum(opt_result.params[i]);
+    }
+    ArrayType *phi_converted = construct_array(phi_array, p, FLOAT8OID, sizeof(double), FLOAT8PASSBYVAL, 'd');
+    values[0] = PointerGetDatum(phi_converted);
+    nulls[0] = false;
+
+    // Theta array
+    Datum *theta_array = palloc(sizeof(Datum) * q);
+    for (int i = 0; i < q; i++)
+    {
+        theta_array[i] = Float8GetDatum(opt_result.params[p+i]);
+    }
+    ArrayType *theta_converted = construct_array(theta_array, q, FLOAT8OID, sizeof(double), FLOAT8PASSBYVAL, 'd');
+    values[1] = PointerGetDatum(theta_converted);
+    nulls[1] = false;
+
+    // Residuals array
+    Datum *resid_array = palloc(sizeof(Datum) * q);
+    for (int i = 0; i < q; i++)
+    {
+        resid_array[i] = Float8GetDatum(opt_result.resid[n_vals-i-1]);
+    }
+    ArrayType *resid_converted = construct_array(resid_array, q, FLOAT8OID, sizeof(double), FLOAT8PASSBYVAL, 'd');
+    values[2] = PointerGetDatum(resid_converted);
+    nulls[2] = false;
+
+    tuple = heap_form_tuple(tupdesc, values, nulls);
+    result = HeapTupleGetDatum(tuple);
+    ReleaseTupleDesc(tupdesc);
+    PG_RETURN_DATUM(result);
 }
 
 static double arima_nelder_objective(unsigned n, const double *x, double *grad, void *data)
@@ -260,9 +299,10 @@ static double arima_nelder_objective(unsigned n, const double *x, double *grad, 
     css_data_t *d = (css_data_t *)data;
     double *phi = (double *)x;
     double* theta = (double *)(x + d->p);
+    double* resid = (double *)(d->resid);
 
     // Gradient is not required by Nelder-Mead algorithm
-    return css(d->vals, phi, theta, d->p, d->q, d->n_vals, NULL);
+    return css(d->vals, phi, theta, d->p, d->q, d->n_vals, NULL, resid);
 }
 
 static double lbfgs_objective(unsigned n, const double *x, double *grad, void *data)
@@ -270,16 +310,18 @@ static double lbfgs_objective(unsigned n, const double *x, double *grad, void *d
     css_data_t *d = (css_data_t *)data;
     double *phi = (double *)x;
     double* theta = (double *)(x + d->p);
+    double* resid = (double *)(d->resid);
     
-    return css(d->vals, phi, theta, d->p, d->q, d->n_vals, grad);
+    return css(d->vals, phi, theta, d->p, d->q, d->n_vals, grad, resid);
 }
 
-double *optimise_arima_nelder(double *vals, int n_vals, int p, int q)
+opt_result_t optimise_arima_nelder(double *vals, int n_vals, int p, int q)
 {
     int n_params = p + q;
     nlopt_opt opt = nlopt_create(NLOPT_LN_NELDERMEAD, n_params);
+    double* resid = palloc(n_params * sizeof(double));
 
-    css_data_t data = {vals, n_vals, p, q};
+    css_data_t data = {vals, n_vals, p, q, resid};
     nlopt_set_min_objective(opt, arima_nelder_objective, &data);
 
     // Lower and upper bounds (stationarity assumed to be enforced)
@@ -306,16 +348,17 @@ double *optimise_arima_nelder(double *vals, int n_vals, int p, int q)
 
     nlopt_destroy(opt);
     elog(INFO, "Min CSS: %f\n", result);
-
-    return x;
+    opt_result_t return_val = {x, resid};
+    return return_val;
 }
 
-double *optimise_arima_lbfgs(double *vals, int n_vals, int p, int q)
+opt_result_t optimise_arima_lbfgs(double *vals, int n_vals, int p, int q)
 {
     int n_params = p + q;
     nlopt_opt opt = nlopt_create(NLOPT_LD_LBFGS, n_params);
+    double* resid = palloc(n_params * sizeof(double));
 
-    css_data_t data = {vals, n_vals, p, q};
+    css_data_t data = {vals, n_vals, p, q, resid};
     nlopt_set_min_objective(opt, lbfgs_objective, &data);
 
     // Lower and upper bounds (stationarity assumed to be enforced)
@@ -343,5 +386,6 @@ double *optimise_arima_lbfgs(double *vals, int n_vals, int p, int q)
     nlopt_destroy(opt);
     elog(INFO, "Min CSS: %f\n", result);
 
-    return x;
+    opt_result_t return_val = {x, resid};
+    return return_val;
 }

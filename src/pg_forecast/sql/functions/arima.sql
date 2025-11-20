@@ -144,12 +144,18 @@ WHERE
     series_id = 'TestSeries';
 */
 
+CREATE TYPE optimise_arima_result AS (
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    residuals DOUBLE PRECISION[]
+);
+
 CREATE FUNCTION optimise_arima(
     vals DOUBLE PRECISION[],
     p INT,
     q INT,
     method TEXT DEFAULT 'Nelder-Mead' -- 'Nelder-Mead', 'L-BFGS'
 )
-RETURNS DOUBLE PRECISION[]
+RETURNS optimise_arima_result
 AS 'MODULE_PATHNAME', 'optimise_arima'
 LANGUAGE C STRICT VOLATILE;
