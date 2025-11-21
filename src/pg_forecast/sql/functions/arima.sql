@@ -1,12 +1,61 @@
 CREATE OR REPLACE FUNCTION arima(
     p INT, -- Number of lagged y_t
     d INT, -- Number of times to difference
-    q INT,  -- Number of lagged residuals
-    horizon INT
+    q INT, -- Number of lagged residuals
+    horizon INT,
+    source_table TEXT, -- Table/view name
+    date_col TEXT,     -- Timestamp column
+    value_col TEXT     -- Numerical value column
 )
 RETURNS TABLE(date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
+DECLARE
+    ncond INT;
+    vals DOUBLE PRECISION[];
+    opt_result arima_optimise_result;
+    last_vals DOUBLE PRECISION[];
+    last_residuals DOUBLE PRECISION[];
+    forecasts DOUBLE PRECISION[];
+    last_date TIMESTAMP;
+    i INT;
 BEGIN
-    
+    ncond := GREATEST(p, q);
+
+    -- Aggregate the series into an array
+    EXECUTE format(
+        'SELECT array_agg(%I ORDER BY %I) FROM %I',
+        value_col,
+        date_col,
+        source_table
+    )
+    INTO vals;
+
+    IF vals IS NULL OR array_length(vals, 1) = 0 THEN
+        RAISE EXCEPTION
+            'ARIMA: no data found in % for columns %, %',
+            source_table, date_col, value_col;
+    END IF;
+
+    -- Fit ARIMA model
+    opt_result := arima_optimise(vals, p, q);
+
+    -- Determine number of values/residuals needed for forecast
+    last_vals := vals[array_length(vals,1) - ncond + 1 : array_length(vals,1)];
+    last_residuals := opt_result.residuals[array_length(opt_result.residuals,1) - ncond + 1 : array_length(opt_result.residuals,1)];
+
+    -- Generate forecasts
+    forecasts := arima_forecast(last_vals, last_residuals, p, q, opt_result.phi, opt_result.theta, horizon);
+
+    -- Get the last timestamp to build forecast dates
+    SELECT MAX(t) INTO last_date
+    FROM time_series_data
+    WHERE series_id = 'TestSeries';
+
+    -- Return table of dates and forecast values
+    FOR i IN 1..horizon LOOP
+        date := last_date + (i * interval '1 day');  -- adjust interval if your data is not daily
+        forecast_value := forecasts[i];
+        RETURN NEXT;
+    END LOOP;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -144,18 +193,31 @@ WHERE
     series_id = 'TestSeries';
 */
 
-CREATE TYPE optimise_arima_result AS (
+CREATE TYPE arima_optimise_result AS (
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
     residuals DOUBLE PRECISION[]
 );
 
-CREATE FUNCTION optimise_arima(
+CREATE FUNCTION arima_optimise(
     vals DOUBLE PRECISION[],
     p INT,
     q INT,
     method TEXT DEFAULT 'L-BFGS' -- 'Nelder-Mead', 'L-BFGS'
 )
-RETURNS optimise_arima_result
+RETURNS arima_optimise_result
 AS 'MODULE_PATHNAME', 'arima_optimise'
+LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION arima_forecast(
+    last_vals DOUBLE PRECISION[],      -- Last max(p, q) values
+    last_residuals DOUBLE PRECISION[], -- Last max(p, q) residuals
+    p INT,
+    q INT,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    horizon INT
+)
+RETURNS DOUBLE PRECISION[]
+AS 'MODULE_PATHNAME', 'arima_forecast'
 LANGUAGE C STRICT VOLATILE;

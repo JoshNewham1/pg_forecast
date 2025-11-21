@@ -16,7 +16,4 @@ typedef struct {
     double *resid;
 } opt_result_t;
 
-opt_result_t optimise_arima_nelder(double *vals, int n_vals, int p, int q);
-opt_result_t optimise_arima_lbfgs(double *vals, int n_vals, int p, int q);
-
 #endif

@@ -25,6 +25,7 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(css_loss);
 PG_FUNCTION_INFO_V1(arima_optimise);
+PG_FUNCTION_INFO_V1(arima_forecast);
 
 /* ARIMA loss function */
 /* 
@@ -262,7 +263,6 @@ arima_optimise(PG_FUNCTION_ARGS)
     ArrayType *vals_arr  = PG_GETARG_ARRAYTYPE_P(0);
     int32 p = PG_GETARG_INT32(1);
     int32 q = PG_GETARG_INT32(2);
-    int n_vals = ArrayGetNItems(ARR_NDIM(vals_arr), ARR_DIMS(vals_arr));
     char* arima_method = text_to_cstring(PG_GETARG_TEXT_P(3));
 
     /* Validate arguments */
@@ -280,6 +280,7 @@ arima_optimise(PG_FUNCTION_ARGS)
     /* Convert psql array to C array */
     Datum *vals_d;
     bool *vals_nulls;
+    int n_vals;
 
     deconstruct_array(vals_arr, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
                       &vals_d, &vals_nulls, &n_vals);
@@ -314,11 +315,11 @@ arima_optimise(PG_FUNCTION_ARGS)
         double val = opt_result.params[i];
         if (val > 1.0 || val < -1.0)
         {
-            elog(WARNING, "phi/theta coefficient outside of [-1, 1]: %f\n", val);
+            elog(WARNING, "AR/MA model not invertible: phi/theta = %f\n", val);
         }
     }
 
-    /* Convert to optimise_arima_result return type */
+    /* Convert to arima_optimise_result return type */
     TupleDesc tupdesc;
     Datum values[3];
     bool nulls[3];
@@ -329,7 +330,7 @@ arima_optimise(PG_FUNCTION_ARGS)
     {
         ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_OBJECT),
-                 errmsg("type \"optimise_arima_result\" does not exist")));
+                 errmsg("type \"arima_optimise_result\" does not exist")));
     }
     
     // Phi array
@@ -366,4 +367,122 @@ arima_optimise(PG_FUNCTION_ARGS)
     result = HeapTupleGetDatum(tuple);
     ReleaseTupleDesc(tupdesc);
     PG_RETURN_DATUM(result);
+}
+
+// TODO: implement Kalman Filter (same as R)?
+
+/* Forecasting values */
+static double* arima_predict(double* values, int n_vals, double* resid, int p, int q, double* phi, double* theta, unsigned int horizon)
+{
+    double* yhat = palloc0(horizon * sizeof(double));
+    double fcast, ar, ma;
+
+    for (int t = 0; t < horizon; t++)
+    {
+        fcast = 0.0;
+        for (int j = 0; j < p; j++)
+        {
+            ar = 0.0;
+            // If we're forecasting from future values, use yhat
+            // (if not, use values provided)
+            if (t > j)
+            {
+                ar = phi[j] * yhat[t-j-1];
+            }
+            else
+            {
+                int idx = n_vals - (j+1-t);
+                if (idx >= 0) ar = phi[j] * values[idx];
+            }
+            fcast += ar;
+        }
+        for (int k = 0; k < q; k++)
+        {
+            ma = 0.0;
+            // If we're forecasting from past values
+            // (if not, residual is 0)
+            if (t <= k)
+            {
+                int idx = n_vals - (k+1-t);
+                if (idx >= 0) ma = theta[k] * resid[idx];
+            }
+            fcast += ma;
+        }
+        yhat[t] = fcast;
+    }
+    return yhat;
+}
+
+Datum
+arima_forecast(PG_FUNCTION_ARGS)
+{
+    /* Get arguments */
+    ArrayType *vals_arr  = PG_GETARG_ARRAYTYPE_P(0);
+    ArrayType *resid_arr  = PG_GETARG_ARRAYTYPE_P(1);
+    int32 p = PG_GETARG_INT32(2);
+    int32 q = PG_GETARG_INT32(3);
+    ArrayType *phi_arr  = PG_GETARG_ARRAYTYPE_P(4);
+    ArrayType *theta_arr  = PG_GETARG_ARRAYTYPE_P(5);
+    int32 horizon = PG_GETARG_INT32(6);
+
+    /* Validate arguments */
+    if (ARR_NDIM(vals_arr) != 1 || ARR_NDIM(resid_arr) != 1 || ARR_NDIM(phi_arr) != 1 || ARR_NDIM(theta_arr) != 1)
+    {
+        ereport(ERROR,
+                (errmsg("vals, residuals, phi and theta must be 1-D arrays")));
+    }
+    if (p < 1 || q < 1 || horizon < 1)
+    {
+        ereport(ERROR,
+                (errmsg("p, q and horizon must be positive integers")));
+    }
+
+    /* Convert psql arrays to C arrays */
+    Datum *vals_d;
+    bool *vals_nulls;
+    int n_vals;
+    Datum *resid_d;
+    bool *resid_nulls;
+    int n_resid;
+    Datum *phi_d;
+    bool *phi_nulls;
+    int n_phi;
+    Datum *theta_d;
+    bool *theta_nulls;
+    int n_theta;
+
+    deconstruct_array(vals_arr, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
+                      &vals_d, &vals_nulls, &n_vals);
+    deconstruct_array(resid_arr, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
+                      &resid_d, &resid_nulls, &n_resid);
+    deconstruct_array(phi_arr, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
+                      &phi_d, &phi_nulls, &n_phi);
+    deconstruct_array(theta_arr, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
+                      &theta_d, &theta_nulls, &n_theta);
+    double *vals = palloc(sizeof(double) * n_vals);
+    double *resid = palloc(sizeof(double) * n_resid);
+    double *phi = palloc(sizeof(double) * n_phi);
+    double *theta = palloc(sizeof(double) * n_theta);
+    for (int i = 0; i < n_vals; i++)
+        vals[i] = DatumGetFloat8(vals_d[i]);
+    for (int i = 0; i < n_resid; i++)
+        resid[i] = DatumGetFloat8(resid_d[i]);
+    for (int i = 0; i < n_phi; i++)
+        phi[i] = DatumGetFloat8(phi_d[i]);
+    for (int i = 0; i < n_theta; i++)
+        theta[i] = DatumGetFloat8(theta_d[i]);
+
+    /* Predict */
+    double* yhat = arima_predict(vals, n_vals, resid, p, q, phi, theta, horizon);
+
+    /* Convert to PG return type */
+    Datum *darray = palloc(sizeof(Datum) * horizon);
+    for (int i = 0; i < horizon; i++)
+    {
+        darray[i] = Float8GetDatum(yhat[i]);
+    }
+    ArrayType *pg_yhat = construct_array(darray, horizon, FLOAT8OID,
+                                        sizeof(double), FLOAT8PASSBYVAL,
+                                        'd');
+    PG_RETURN_ARRAYTYPE_P(pg_yhat);
 }
