@@ -154,8 +154,8 @@ CREATE FUNCTION optimise_arima(
     vals DOUBLE PRECISION[],
     p INT,
     q INT,
-    method TEXT DEFAULT 'Nelder-Mead' -- 'Nelder-Mead', 'L-BFGS'
+    method TEXT DEFAULT 'L-BFGS' -- 'Nelder-Mead', 'L-BFGS'
 )
 RETURNS optimise_arima_result
-AS 'MODULE_PATHNAME', 'optimise_arima'
+AS 'MODULE_PATHNAME', 'arima_optimise'
 LANGUAGE C STRICT VOLATILE;

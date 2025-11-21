@@ -24,7 +24,7 @@
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(css_loss);
-PG_FUNCTION_INFO_V1(optimise_arima);
+PG_FUNCTION_INFO_V1(arima_optimise);
 
 /* ARIMA loss function */
 /* 
@@ -194,8 +194,69 @@ css_loss(PG_FUNCTION_ARGS)
 }
 
 /* ARIMA optimisation */
+static double arima_objective_no_grad(unsigned n, const double *x, double *grad, void *data)
+{
+    css_data_t *d = (css_data_t *)data;
+    double *phi = (double *)x;
+    double* theta = (double *)(x + d->p);
+    double* resid = (double *)(d->resid);
+
+    // Gradient is not required by Nelder-Mead algorithm
+    return css(d->vals, phi, theta, d->p, d->q, d->n_vals, NULL, resid);
+}
+
+static double arima_objective_grad(unsigned n, const double *x, double *grad, void *data)
+{
+    css_data_t *d = (css_data_t *)data;
+    double *phi = (double *)x;
+    double* theta = (double *)(x + d->p);
+    double* resid = (double *)(d->resid);
+    
+    return css(d->vals, phi, theta, d->p, d->q, d->n_vals, grad, resid);
+}
+
+static opt_result_t arima_nlopt(double* vals, int n_vals, int p, int q,
+                                nlopt_algorithm algorithm, const char* algorithm_name,
+                                double (*objective)(unsigned, const double*, double*, void*))
+{
+    int n_params = p + q;
+    nlopt_opt opt = nlopt_create(algorithm, n_params);
+    double* resid = palloc(n_vals * sizeof(double));
+
+    css_data_t data = {vals, n_vals, p, q, resid};
+    nlopt_set_min_objective(opt, objective, &data);
+
+    // Lower and upper bounds (stationarity assumed to be enforced)
+    double *lb = palloc(sizeof(double) * n_params);
+    double *ub = palloc(sizeof(double) * n_params);
+    for (int i = 0; i < n_params; i++)
+    {
+        lb[i] = -2.0;
+        ub[i] = 2.0;
+    }
+    nlopt_set_lower_bounds(opt, lb);
+    nlopt_set_upper_bounds(opt, ub);
+
+    // Initial guess - all parameters are 0.1
+    double *x = palloc(sizeof(double) * n_params);
+    for (int i = 0; i < n_params; i++) x[i] = 0.1;
+
+    double result;
+    if (nlopt_optimize(opt, x, &result) < 0)
+    {
+        ereport(ERROR,
+        errmsg("NLopt %s failed\n", algorithm_name));
+    }
+
+    nlopt_destroy(opt);
+    elog(INFO, "Min CSS: %f\n", result);
+
+    opt_result_t return_val = {x, resid};
+    return return_val;
+}
+
 Datum
-optimise_arima(PG_FUNCTION_ARGS)
+arima_optimise(PG_FUNCTION_ARGS)
 {
     /* Get arguments */
     ArrayType *vals_arr  = PG_GETARG_ARRAYTYPE_P(0);
@@ -227,20 +288,25 @@ optimise_arima(PG_FUNCTION_ARGS)
         vals[i] = DatumGetFloat8(vals_d[i]);
 
     /* Call optimiser */
-    opt_result_t opt_result;
+    double (*opt_objective)(unsigned, const double *, double *, void *);
+    nlopt_algorithm opt_algorithm;
     int n_params = p + q;
+    opt_result_t opt_result;
     if (strcmp(arima_method, "Nelder-Mead") == 0)
     {
-        opt_result = optimise_arima_nelder(vals, n_vals, p, q);
+        opt_objective = arima_objective_no_grad;
+        opt_algorithm = NLOPT_LN_NELDERMEAD;
     }
     else if (strcmp(arima_method, "L-BFGS") == 0)
     {
-        opt_result = optimise_arima_lbfgs(vals, n_vals, p, q);
+        opt_objective = arima_objective_grad;
+        opt_algorithm = NLOPT_LD_LBFGS;
     }
     else
     {
         elog(ERROR, "Invalid optimiser provided: %s\n", arima_method);
     }
+    opt_result = arima_nlopt(vals, n_vals, p, q, opt_algorithm, arima_method, opt_objective);
 
     /* Warn for risky bounds */
     for (int i = 0; i < n_params; i++)
@@ -300,100 +366,4 @@ optimise_arima(PG_FUNCTION_ARGS)
     result = HeapTupleGetDatum(tuple);
     ReleaseTupleDesc(tupdesc);
     PG_RETURN_DATUM(result);
-}
-
-static double arima_nelder_objective(unsigned n, const double *x, double *grad, void *data)
-{
-    css_data_t *d = (css_data_t *)data;
-    double *phi = (double *)x;
-    double* theta = (double *)(x + d->p);
-    double* resid = (double *)(d->resid);
-
-    // Gradient is not required by Nelder-Mead algorithm
-    return css(d->vals, phi, theta, d->p, d->q, d->n_vals, NULL, resid);
-}
-
-static double lbfgs_objective(unsigned n, const double *x, double *grad, void *data)
-{
-    css_data_t *d = (css_data_t *)data;
-    double *phi = (double *)x;
-    double* theta = (double *)(x + d->p);
-    double* resid = (double *)(d->resid);
-    
-    return css(d->vals, phi, theta, d->p, d->q, d->n_vals, grad, resid);
-}
-
-opt_result_t optimise_arima_nelder(double *vals, int n_vals, int p, int q)
-{
-    int n_params = p + q;
-    nlopt_opt opt = nlopt_create(NLOPT_LN_NELDERMEAD, n_params);
-    double* resid = palloc(n_vals * sizeof(double));
-
-    css_data_t data = {vals, n_vals, p, q, resid};
-    nlopt_set_min_objective(opt, arima_nelder_objective, &data);
-
-    // Lower and upper bounds (stationarity assumed to be enforced)
-    double *lb = palloc(sizeof(double) * n_params);
-    double *ub = palloc(sizeof(double) * n_params);
-    for (int i = 0; i < n_params; i++)
-    {
-        lb[i] = -2.0;
-        ub[i] = 2.0;
-    }
-    nlopt_set_lower_bounds(opt, lb);
-    nlopt_set_upper_bounds(opt, ub);
-
-    // Initial guess - all parameters are 0.1
-    double *x = palloc(sizeof(double) * n_params);
-    for (int i = 0; i < n_params; i++) x[i] = 0.1;
-
-    double result;
-    if (nlopt_optimize(opt, x, &result) < 0)
-    {
-        ereport(ERROR,
-        errmsg("NLopt Nelder-Mead failed\n"));
-    }
-
-    nlopt_destroy(opt);
-    elog(INFO, "Min CSS: %f\n", result);
-    opt_result_t return_val = {x, resid};
-    return return_val;
-}
-
-opt_result_t optimise_arima_lbfgs(double *vals, int n_vals, int p, int q)
-{
-    int n_params = p + q;
-    nlopt_opt opt = nlopt_create(NLOPT_LD_LBFGS, n_params);
-    double* resid = palloc(n_vals * sizeof(double));
-
-    css_data_t data = {vals, n_vals, p, q, resid};
-    nlopt_set_min_objective(opt, lbfgs_objective, &data);
-
-    // Lower and upper bounds (stationarity assumed to be enforced)
-    double *lb = palloc(sizeof(double) * n_params);
-    double *ub = palloc(sizeof(double) * n_params);
-    for (int i = 0; i < n_params; i++)
-    {
-        lb[i] = -2.0;
-        ub[i] = 2.0;
-    }
-    nlopt_set_lower_bounds(opt, lb);
-    nlopt_set_upper_bounds(opt, ub);
-
-    // Initial guess - all parameters are 0.1
-    double *x = palloc(sizeof(double) * n_params);
-    for (int i = 0; i < n_params; i++) x[i] = 0.1;
-
-    double result;
-    if (nlopt_optimize(opt, x, &result) < 0)
-    {
-        ereport(ERROR,
-        errmsg("NLopt L-BFGS failed\n"));
-    }
-
-    nlopt_destroy(opt);
-    elog(INFO, "Min CSS: %f\n", result);
-
-    opt_result_t return_val = {x, resid};
-    return return_val;
 }
