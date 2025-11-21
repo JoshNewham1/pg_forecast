@@ -195,7 +195,7 @@ css_loss(PG_FUNCTION_ARGS)
 }
 
 /* ARIMA optimisation */
-static double arima_objective_no_grad(unsigned n, const double *x, double *grad, void *data)
+static double _arima_objective_no_grad(unsigned n, const double *x, double *grad, void *data)
 {
     css_data_t *d = (css_data_t *)data;
     double *phi = (double *)x;
@@ -206,7 +206,7 @@ static double arima_objective_no_grad(unsigned n, const double *x, double *grad,
     return css(d->vals, phi, theta, d->p, d->q, d->n_vals, NULL, resid);
 }
 
-static double arima_objective_grad(unsigned n, const double *x, double *grad, void *data)
+static double _arima_objective_grad(unsigned n, const double *x, double *grad, void *data)
 {
     css_data_t *d = (css_data_t *)data;
     double *phi = (double *)x;
@@ -216,7 +216,7 @@ static double arima_objective_grad(unsigned n, const double *x, double *grad, vo
     return css(d->vals, phi, theta, d->p, d->q, d->n_vals, grad, resid);
 }
 
-static opt_result_t arima_nlopt(double* vals, int n_vals, int p, int q,
+static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q,
                                 nlopt_algorithm algorithm, const char* algorithm_name,
                                 double (*objective)(unsigned, const double*, double*, void*))
 {
@@ -295,19 +295,19 @@ arima_optimise(PG_FUNCTION_ARGS)
     opt_result_t opt_result;
     if (strcmp(arima_method, "Nelder-Mead") == 0)
     {
-        opt_objective = arima_objective_no_grad;
+        opt_objective = _arima_objective_no_grad;
         opt_algorithm = NLOPT_LN_NELDERMEAD;
     }
     else if (strcmp(arima_method, "L-BFGS") == 0)
     {
-        opt_objective = arima_objective_grad;
+        opt_objective = _arima_objective_grad;
         opt_algorithm = NLOPT_LD_LBFGS;
     }
     else
     {
         elog(ERROR, "Invalid optimiser provided: %s\n", arima_method);
     }
-    opt_result = arima_nlopt(vals, n_vals, p, q, opt_algorithm, arima_method, opt_objective);
+    opt_result = _arima_nlopt(vals, n_vals, p, q, opt_algorithm, arima_method, opt_objective);
 
     /* Warn for risky bounds */
     for (int i = 0; i < n_params; i++)
@@ -372,7 +372,8 @@ arima_optimise(PG_FUNCTION_ARGS)
 // TODO: implement Kalman Filter (same as R)?
 
 /* Forecasting values */
-static double* arima_predict(double* values, int n_vals, double* resid, int p, int q, double* phi, double* theta, unsigned int horizon)
+static double* _arima_predict(double* values, int n_vals, double* resid, int p,
+                              int q, double* phi, double* theta, unsigned int horizon)
 {
     double* yhat = palloc0(horizon * sizeof(double));
     double fcast, ar, ma;
@@ -473,7 +474,7 @@ arima_forecast(PG_FUNCTION_ARGS)
         theta[i] = DatumGetFloat8(theta_d[i]);
 
     /* Predict */
-    double* yhat = arima_predict(vals, n_vals, resid, p, q, phi, theta, horizon);
+    double* yhat = _arima_predict(vals, n_vals, resid, p, q, phi, theta, horizon);
 
     /* Convert to PG return type */
     Datum *darray = palloc(sizeof(Datum) * horizon);
