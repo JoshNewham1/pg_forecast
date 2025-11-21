@@ -26,6 +26,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(css_loss);
 PG_FUNCTION_INFO_V1(optimise_arima);
 
+/* ARIMA loss function */
 /* 
   Calculates conditional sum of squares (CSS) and optionally the gradient
   If the gradient isn't required, leave `grad` = NULL
@@ -34,13 +35,13 @@ PG_FUNCTION_INFO_V1(optimise_arima);
 double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, double* grad, double* resid)
 {
     int ncond = max(p, q);
-    memset(resid, 0.0, n_vals * sizeof(double));
+    memset(resid, 0, n_vals * sizeof(double));
     double ssq = 0.0;
     double **dphi, **dtheta = NULL;
 
     if (grad != NULL)
     {
-        memset(grad, 0.0, (p + q) * sizeof(double));
+        memset(grad, 0, (p + q) * sizeof(double));
         dphi = palloc(sizeof(double*) * p);
         for (int k = 0; k < p; k++)
         {
@@ -70,7 +71,7 @@ double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, d
         }
 
         resid[t] = tmp;
-        if (!isnan(tmp))
+        if (!isnan(tmp) && isfinite(tmp))
         {
             ssq += tmp * tmp;
         }
@@ -92,7 +93,10 @@ double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, d
                 }
                 dphi[k][t] = d;
                 // Accumulate gradient: d(CSS)/dphi_k = 2 * sum_t e_t * d e_t / dphi_k
-                grad[k] += 2.0 * tmp * dphi[k][t];
+                if (isfinite(tmp) && isfinite(d))
+                {
+                    grad[k] += 2.0 * tmp * dphi[k][t];
+                }
             }
 
             // theta derivatives: d e_t / d theta_k = - e_{t-k-1} - sum_j theta_j * d e_{t-j-1} / d theta_k */
@@ -106,7 +110,10 @@ double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, d
                     d -= theta[j] * dtheta[k][t-j-1];
                 }
                 dtheta[k][t] = d;
-                grad[p + k] += 2.0 * tmp * dtheta[k][t];
+                if (isfinite(tmp) && isfinite(d))
+                {
+                    grad[p + k] += 2.0 * tmp * dtheta[k][t];
+                }
             }
         }
     }
@@ -186,6 +193,7 @@ css_loss(PG_FUNCTION_ARGS)
     PG_RETURN_FLOAT8(css(vals, phi, theta, p, q, n_vals, NULL, resid));
 }
 
+/* ARIMA optimisation */
 Datum
 optimise_arima(PG_FUNCTION_ARGS)
 {
@@ -319,7 +327,7 @@ opt_result_t optimise_arima_nelder(double *vals, int n_vals, int p, int q)
 {
     int n_params = p + q;
     nlopt_opt opt = nlopt_create(NLOPT_LN_NELDERMEAD, n_params);
-    double* resid = palloc(n_params * sizeof(double));
+    double* resid = palloc(n_vals * sizeof(double));
 
     css_data_t data = {vals, n_vals, p, q, resid};
     nlopt_set_min_objective(opt, arima_nelder_objective, &data);
@@ -356,7 +364,7 @@ opt_result_t optimise_arima_lbfgs(double *vals, int n_vals, int p, int q)
 {
     int n_params = p + q;
     nlopt_opt opt = nlopt_create(NLOPT_LD_LBFGS, n_params);
-    double* resid = palloc(n_params * sizeof(double));
+    double* resid = palloc(n_vals * sizeof(double));
 
     css_data_t data = {vals, n_vals, p, q, resid};
     nlopt_set_min_objective(opt, lbfgs_objective, &data);
