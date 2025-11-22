@@ -13,7 +13,6 @@ DECLARE
     vals DOUBLE PRECISION[];
     opt_result arima_optimise_result;
     last_vals DOUBLE PRECISION[];
-    last_residuals DOUBLE PRECISION[];
     forecasts DOUBLE PRECISION[];
     last_date TIMESTAMP;
     i INT;
@@ -40,15 +39,17 @@ BEGIN
 
     -- Determine number of values/residuals needed for forecast
     last_vals := vals[array_length(vals,1) - ncond + 1 : array_length(vals,1)];
-    last_residuals := opt_result.residuals[array_length(opt_result.residuals,1) - ncond + 1 : array_length(opt_result.residuals,1)];
 
     -- Generate forecasts
-    forecasts := arima_forecast(last_vals, last_residuals, p, q, opt_result.phi, opt_result.theta, horizon);
+    forecasts := arima_forecast(last_vals, opt_result.residuals, p, q, opt_result.phi, opt_result.theta, horizon);
 
     -- Get the last timestamp to build forecast dates
-    SELECT MAX(t) INTO last_date
-    FROM time_series_data
-    WHERE series_id = 'TestSeries';
+    EXECUTE format(
+        'SELECT MAX(%I) FROM %I',
+        date_col,
+        source_table
+    )
+    INTO last_date;
 
     -- Return table of dates and forecast values
     FOR i IN 1..horizon LOOP
