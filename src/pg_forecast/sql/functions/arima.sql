@@ -132,6 +132,14 @@ WHERE
     series_id = 'TestSeries';
 */
 
+CREATE FUNCTION arima_difference(
+    vals DOUBLE PRECISION[],
+    d INT
+)
+RETURNS DOUBLE PRECISION[]
+AS 'MODULE_PATHNAME', 'arima_difference'
+LANGUAGE C STRICT STABLE;
+
 CREATE TYPE arima_optimise_result AS (
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
@@ -146,7 +154,7 @@ CREATE FUNCTION arima_optimise(
 )
 RETURNS arima_optimise_result
 AS 'MODULE_PATHNAME', 'arima_optimise'
-LANGUAGE C STRICT VOLATILE;
+LANGUAGE C STRICT STABLE;
 
 CREATE FUNCTION arima_forecast(
     last_vals DOUBLE PRECISION[],      -- Last max(p, q) values
@@ -159,7 +167,7 @@ CREATE FUNCTION arima_forecast(
 )
 RETURNS DOUBLE PRECISION[]
 AS 'MODULE_PATHNAME', 'arima_forecast'
-LANGUAGE C STRICT VOLATILE;
+LANGUAGE C STRICT STABLE;
 
 CREATE OR REPLACE FUNCTION arima(
     p INT, -- Number of lagged y_t

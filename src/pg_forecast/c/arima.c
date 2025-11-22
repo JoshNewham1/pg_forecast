@@ -23,9 +23,81 @@
 
 PG_MODULE_MAGIC;
 
+PG_FUNCTION_INFO_V1(arima_difference);
 PG_FUNCTION_INFO_V1(css_loss);
 PG_FUNCTION_INFO_V1(arima_optimise);
 PG_FUNCTION_INFO_V1(arima_forecast);
+
+/* Differencing and Integration */
+Datum
+arima_difference(PG_FUNCTION_ARGS)
+{
+    /* Get arguments */
+    ArrayType *vals_arr = PG_GETARG_ARRAYTYPE_P(0);
+    int32 d = PG_GETARG_INT32(1);
+
+    /* Validate arguments */
+    if (ARR_NDIM(vals_arr) != 1)
+    {
+        ereport(ERROR,
+                (errmsg("vals must be a 1-D array")));
+    }
+    // No differencing required
+    if (d <= 0)
+    {
+        PG_RETURN_ARRAYTYPE_P(vals_arr);
+    }
+
+    /* Convert psql array to C array */
+    Datum *vals_d;
+    bool *vals_nulls;
+    int n_vals;
+
+    deconstruct_array(vals_arr,
+                      FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
+                      &vals_d, &vals_nulls, &n_vals);
+
+    double* vals = palloc(n_vals * sizeof(double));
+    for (int i = 0; i < n_vals; i++)
+    {
+        vals[i] = DatumGetFloat8(vals_d[i]);
+    }
+    
+    // Reject NULLs
+    for (int i = 0; i < n_vals; i++)
+    {
+        if (vals_nulls[i])
+            ereport(ERROR, (errmsg("arima_difference: input array contains NULLs")));
+    }
+
+    /* Perform differencing */
+    double *differenced = palloc0(n_vals * sizeof(double));
+    for (int i = 0; i < d; i++)
+    {
+        for (int j = n_vals - 1; j > 0; j--)
+        {
+            differenced[j] = vals[j] - vals[j-1];
+        }
+        if (i + 1 < d)
+        {
+            double* tmp = vals;
+            vals = differenced;
+            differenced = tmp;
+        }
+        differenced[i] = 0.0;
+    }
+
+    /* Convert to PG return type */
+    Datum *darray = palloc(sizeof(Datum) * n_vals);
+    for (int i = 0; i < n_vals; i++)
+    {
+        darray[i] = Float8GetDatum(differenced[i]);
+    }
+    ArrayType *pg_differenced = construct_array(darray, n_vals, FLOAT8OID,
+                                                sizeof(double), FLOAT8PASSBYVAL,
+                                                'd');
+    PG_RETURN_ARRAYTYPE_P(pg_differenced);
+}
 
 /* ARIMA loss function */
 /* 
