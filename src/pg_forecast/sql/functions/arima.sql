@@ -1,65 +1,3 @@
-CREATE OR REPLACE FUNCTION arima(
-    p INT, -- Number of lagged y_t
-    d INT, -- Number of times to difference
-    q INT, -- Number of lagged residuals
-    horizon INT,
-    source_table TEXT, -- Table/view name
-    date_col TEXT,     -- Timestamp column
-    value_col TEXT     -- Numerical value column
-)
-RETURNS TABLE(date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
-DECLARE
-    ncond INT;
-    vals DOUBLE PRECISION[];
-    opt_result arima_optimise_result;
-    last_vals DOUBLE PRECISION[];
-    forecasts DOUBLE PRECISION[];
-    last_date TIMESTAMP;
-    i INT;
-BEGIN
-    ncond := GREATEST(p, q);
-
-    -- Aggregate the series into an array
-    EXECUTE format(
-        'SELECT array_agg(%I ORDER BY %I) FROM %I',
-        value_col,
-        date_col,
-        source_table
-    )
-    INTO vals;
-
-    IF vals IS NULL OR array_length(vals, 1) = 0 THEN
-        RAISE EXCEPTION
-            'ARIMA: no data found in % for columns %, %',
-            source_table, date_col, value_col;
-    END IF;
-
-    -- Fit ARIMA model
-    opt_result := arima_optimise(vals, p, q);
-
-    -- Determine number of values/residuals needed for forecast
-    last_vals := vals[array_length(vals,1) - ncond + 1 : array_length(vals,1)];
-
-    -- Generate forecasts
-    forecasts := arima_forecast(last_vals, opt_result.residuals, p, q, opt_result.phi, opt_result.theta, horizon);
-
-    -- Get the last timestamp to build forecast dates
-    EXECUTE format(
-        'SELECT MAX(%I) FROM %I',
-        date_col,
-        source_table
-    )
-    INTO last_date;
-
-    -- Return table of dates and forecast values
-    FOR i IN 1..horizon LOOP
-        date := last_date + (i * interval '1 day');  -- adjust interval if your data is not daily
-        forecast_value := forecasts[i];
-        RETURN NEXT;
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
-
 /**
  * Calculates the Conditional Sum of Squares (CSS) for an ARIMA(p,0,q) model
  * using a recursive CTE, based on the formula from Rosenthal & Lehner 2011.
@@ -222,3 +160,65 @@ CREATE FUNCTION arima_forecast(
 RETURNS DOUBLE PRECISION[]
 AS 'MODULE_PATHNAME', 'arima_forecast'
 LANGUAGE C STRICT VOLATILE;
+
+CREATE OR REPLACE FUNCTION arima(
+    p INT, -- Number of lagged y_t
+    d INT, -- Number of times to difference
+    q INT, -- Number of lagged residuals
+    horizon INT,
+    source_table TEXT, -- Table/view name
+    date_col TEXT,     -- Timestamp column
+    value_col TEXT     -- Numerical value column
+)
+RETURNS TABLE(date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
+DECLARE
+    ncond INT;
+    vals DOUBLE PRECISION[];
+    opt_result arima_optimise_result;
+    last_vals DOUBLE PRECISION[];
+    forecasts DOUBLE PRECISION[];
+    last_date TIMESTAMP;
+    i INT;
+BEGIN
+    ncond := GREATEST(p, q);
+
+    -- Aggregate the series into an array
+    EXECUTE format(
+        'SELECT array_agg(%I ORDER BY %I) FROM %I',
+        value_col,
+        date_col,
+        source_table
+    )
+    INTO vals;
+
+    IF vals IS NULL OR array_length(vals, 1) = 0 THEN
+        RAISE EXCEPTION
+            'ARIMA: no data found in % for columns %, %',
+            source_table, date_col, value_col;
+    END IF;
+
+    -- Fit ARIMA model
+    opt_result := arima_optimise(vals, p, q);
+
+    -- Determine number of values/residuals needed for forecast
+    last_vals := vals[array_length(vals,1) - ncond + 1 : array_length(vals,1)];
+
+    -- Generate forecasts
+    forecasts := arima_forecast(last_vals, opt_result.residuals, p, q, opt_result.phi, opt_result.theta, horizon);
+
+    -- Get the last timestamp to build forecast dates
+    EXECUTE format(
+        'SELECT MAX(%I) FROM %I',
+        date_col,
+        source_table
+    )
+    INTO last_date;
+
+    -- Return table of dates and forecast values
+    FOR i IN 1..horizon LOOP
+        date := last_date + (i * interval '1 day');  -- adjust interval if your data is not daily
+        forecast_value := forecasts[i];
+        RETURN NEXT;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
