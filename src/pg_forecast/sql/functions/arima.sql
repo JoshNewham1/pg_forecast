@@ -140,6 +140,15 @@ RETURNS DOUBLE PRECISION[]
 AS 'MODULE_PATHNAME', 'arima_difference'
 LANGUAGE C STRICT STABLE;
 
+CREATE FUNCTION arima_integrate(
+    differences DOUBLE PRECISION[],
+    d INT,
+    initial_vals DOUBLE PRECISION[]
+)
+RETURNS DOUBLE PRECISION[]
+AS 'MODULE_PATHNAME', 'arima_integrate'
+LANGUAGE C STRICT STABLE;
+
 CREATE TYPE arima_optimise_result AS (
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],

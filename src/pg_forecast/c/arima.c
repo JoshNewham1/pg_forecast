@@ -24,6 +24,7 @@
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(arima_difference);
+PG_FUNCTION_INFO_V1(arima_integrate);
 PG_FUNCTION_INFO_V1(css_loss);
 PG_FUNCTION_INFO_V1(arima_optimise);
 PG_FUNCTION_INFO_V1(arima_forecast);
@@ -78,6 +79,7 @@ arima_difference(PG_FUNCTION_ARGS)
         {
             differenced[j] = vals[j] - vals[j-1];
         }
+        // Swap buffers for next order differencing
         if (i + 1 < d)
         {
             double* tmp = vals;
@@ -97,6 +99,103 @@ arima_difference(PG_FUNCTION_ARGS)
                                                 sizeof(double), FLOAT8PASSBYVAL,
                                                 'd');
     PG_RETURN_ARRAYTYPE_P(pg_differenced);
+}
+
+// Compute coefficients of integration expansion using the Binomial Theorem for d > -1
+// Box, Jenkins, & Reinsel (2008). Time Series Analysis: Forecasting and Control (4th edition, Chapter 10, p.429)
+static double* _integration_coefficients(int d) {
+    double* c = palloc((d + 1) * sizeof(double));
+    long prev = 1;
+    for (int k = 1; k <= d; k++) {
+        prev = prev * (d - (k - 1)) / k;   // binomial(d, k) from binomial(d, k-1)
+        c[k] = (k % 2 ? +prev : -prev);    // apply sign (-1)^(k+1)
+    }
+    return c;
+}
+
+Datum
+arima_integrate(PG_FUNCTION_ARGS)
+{
+    /* Get arguments */
+    ArrayType *diff_arr = PG_GETARG_ARRAYTYPE_P(0);
+    int32 d = PG_GETARG_INT32(1);
+    ArrayType *initial_arr = PG_GETARG_ARRAYTYPE_P(2);
+
+    /* Validate arguments */
+    if (ARR_NDIM(diff_arr) != 1 || ARR_NDIM(initial_arr) != 1)
+    {
+        ereport(ERROR,
+                (errmsg("differences and initial_vals must be 1-D arrays")));
+    }
+    // No differencing required
+    if (d <= 0)
+    {
+        PG_RETURN_ARRAYTYPE_P(diff_arr);
+    }
+
+    /* Convert psql array to C array */
+    Datum *diff_d, *initial_d;
+    bool *diff_nulls, *initial_nulls;
+    int n_diff, n_initial;
+
+    deconstruct_array(diff_arr,
+                      FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
+                      &diff_d, &diff_nulls, &n_diff);
+    deconstruct_array(initial_arr,
+                      FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
+                      &initial_d, &initial_nulls, &n_initial);
+
+    double* differences = palloc(n_diff * sizeof(double));
+    double* initial_vals = palloc(n_initial * sizeof(double));
+    
+    for (int i = 0; i < n_diff; i++)
+    {
+        differences[i] = DatumGetFloat8(diff_d[i]);
+        if (diff_nulls[i])
+            ereport(ERROR, (errmsg("arima_integrate: differences array contains NULLs")));
+    }
+    for (int i = 0; i < n_initial; i++)
+    {
+        initial_vals[i] = DatumGetFloat8(initial_d[i]);
+        if (initial_nulls[i])
+            ereport(ERROR, (errmsg("arima_integrate: initial_vals array contains NULLs")));
+    }
+
+    if (n_initial != d)
+    {
+        ereport(ERROR, (errmsg("arima_integrate: number of initial vals must match differencing order")));
+    }
+
+    /* Perform integration */
+    double *integrated = palloc0((n_diff + d) * sizeof(double));
+    double *coeffs = _integration_coefficients(d);
+    
+    // Copy initial values to result
+    for (int i = 0; i < d; i++)
+    {
+        integrated[i] = initial_vals[i];
+    }
+
+    for (int i = 0; i < n_diff; i++)
+    {
+        double val = differences[i];
+        for (int j = 1; j <= d; j++)
+        {
+            val += coeffs[j] * integrated[i+d-j];
+        }
+        integrated[i+d] = val;
+    }
+
+    /* Convert to PG return type */
+    Datum *darray = palloc(sizeof(Datum) * n_diff);
+    for (int i = 0; i < n_diff; i++)
+    {
+        darray[i] = Float8GetDatum(integrated[i]);
+    }
+    ArrayType *pg_integrated = construct_array(darray, n_diff, FLOAT8OID,
+                                               sizeof(double), FLOAT8PASSBYVAL,
+                                               'd');
+    PG_RETURN_ARRAYTYPE_P(pg_integrated);
 }
 
 /* ARIMA loss function */
