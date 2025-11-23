@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <math.h>
 #include "arima.h"
+#include "constants.h"
+#include "utils.h"
 #include <nlopt.h>
 
 #define max(a,b) \
@@ -50,26 +52,8 @@ arima_difference(PG_FUNCTION_ARGS)
     }
 
     /* Convert psql array to C array */
-    Datum *vals_d;
-    bool *vals_nulls;
     int n_vals;
-
-    deconstruct_array(vals_arr,
-                      FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &vals_d, &vals_nulls, &n_vals);
-
-    double* vals = palloc(n_vals * sizeof(double));
-    for (int i = 0; i < n_vals; i++)
-    {
-        vals[i] = DatumGetFloat8(vals_d[i]);
-    }
-    
-    // Reject NULLs
-    for (int i = 0; i < n_vals; i++)
-    {
-        if (vals_nulls[i])
-            ereport(ERROR, (errmsg("arima_difference: input array contains NULLs")));
-    }
+    double* vals = pg_array_to_c_double(vals_arr, &n_vals, false, "arima_difference");
 
     /* Perform differencing */
     double *differenced = palloc0(n_vals * sizeof(double));
@@ -134,32 +118,9 @@ arima_integrate(PG_FUNCTION_ARGS)
     }
 
     /* Convert psql array to C array */
-    Datum *diff_d, *initial_d;
-    bool *diff_nulls, *initial_nulls;
     int n_diff, n_initial;
-
-    deconstruct_array(diff_arr,
-                      FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &diff_d, &diff_nulls, &n_diff);
-    deconstruct_array(initial_arr,
-                      FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &initial_d, &initial_nulls, &n_initial);
-
-    double* differences = palloc(n_diff * sizeof(double));
-    double* initial_vals = palloc(n_initial * sizeof(double));
-    
-    for (int i = 0; i < n_diff; i++)
-    {
-        differences[i] = DatumGetFloat8(diff_d[i]);
-        if (diff_nulls[i])
-            ereport(ERROR, (errmsg("arima_integrate: differences array contains NULLs")));
-    }
-    for (int i = 0; i < n_initial; i++)
-    {
-        initial_vals[i] = DatumGetFloat8(initial_d[i]);
-        if (initial_nulls[i])
-            ereport(ERROR, (errmsg("arima_integrate: initial_vals array contains NULLs")));
-    }
+    double* differences = pg_array_to_c_double(diff_arr, &n_diff, false, "arima_integrate");
+    double* initial_vals = pg_array_to_c_double(initial_arr, &n_initial, false, "arima_integrate");
 
     if (n_initial != d)
     {
@@ -332,33 +293,9 @@ css_loss(PG_FUNCTION_ARGS)
     }
 
     /* Convert psql array to C array */
-    Datum *vals_d, *phi_d, *theta_d;
-    bool *vals_nulls, *phi_nulls, *theta_nulls;
-
-    deconstruct_array(vals_arr,
-                      FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &vals_d, &vals_nulls, &n_vals);
-
-    deconstruct_array(phi_arr,
-                      FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &phi_d, &phi_nulls, &n_phi);
-
-    deconstruct_array(theta_arr,
-                      FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &theta_d, &theta_nulls, &n_theta);
-    double *vals, *phi, *theta;
-    vals  = palloc(sizeof(double) * n_vals);
-    phi   = palloc(sizeof(double) * n_phi);
-    theta = palloc(sizeof(double) * n_theta);
-
-    for (int i = 0; i < n_vals; i++)
-        vals[i] = DatumGetFloat8(vals_d[i]);
-
-    for (int i = 0; i < n_phi; i++)
-        phi[i] = DatumGetFloat8(phi_d[i]);
-
-    for (int i = 0; i < n_theta; i++)
-        theta[i] = DatumGetFloat8(theta_d[i]);
+    double* vals = pg_array_to_c_double(vals_arr, &n_vals, false, "css_loss");
+    double* phi = pg_array_to_c_double(phi_arr, &n_phi, false, "css_loss");
+    double* theta = pg_array_to_c_double(theta_arr, &n_theta, false, "css_loss");
     
     /* CSS logic */
     double* resid = palloc(n_vals * sizeof(double));
@@ -403,8 +340,8 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q,
     double *ub = palloc(sizeof(double) * n_params);
     for (int i = 0; i < n_params; i++)
     {
-        lb[i] = -2.0;
-        ub[i] = 2.0;
+        lb[i] = ARIMA_OPTIMISER_MIN_BOUND;
+        ub[i] = ARIMA_OPTIMISER_MAX_BOUND;
     }
     nlopt_set_lower_bounds(opt, lb);
     nlopt_set_upper_bounds(opt, ub);
@@ -449,15 +386,8 @@ arima_optimise(PG_FUNCTION_ARGS)
     }
 
     /* Convert psql array to C array */
-    Datum *vals_d;
-    bool *vals_nulls;
     int n_vals;
-
-    deconstruct_array(vals_arr, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &vals_d, &vals_nulls, &n_vals);
-    double *vals = palloc(sizeof(double) * n_vals);
-    for (int i = 0; i < n_vals; i++)
-        vals[i] = DatumGetFloat8(vals_d[i]);
+    double* vals = pg_array_to_c_double(vals_arr, &n_vals, false, "arima_optimise");
 
     /* Call optimiser */
     double (*opt_objective)(unsigned, const double *, double *, void *);
@@ -610,39 +540,11 @@ arima_forecast(PG_FUNCTION_ARGS)
     }
 
     /* Convert psql arrays to C arrays */
-    Datum *vals_d;
-    bool *vals_nulls;
-    int n_vals;
-    Datum *resid_d;
-    bool *resid_nulls;
-    int n_resid;
-    Datum *phi_d;
-    bool *phi_nulls;
-    int n_phi;
-    Datum *theta_d;
-    bool *theta_nulls;
-    int n_theta;
-
-    deconstruct_array(vals_arr, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &vals_d, &vals_nulls, &n_vals);
-    deconstruct_array(resid_arr, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &resid_d, &resid_nulls, &n_resid);
-    deconstruct_array(phi_arr, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &phi_d, &phi_nulls, &n_phi);
-    deconstruct_array(theta_arr, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
-                      &theta_d, &theta_nulls, &n_theta);
-    double *vals = palloc(sizeof(double) * n_vals);
-    double *resid = palloc(sizeof(double) * n_resid);
-    double *phi = palloc(sizeof(double) * n_phi);
-    double *theta = palloc(sizeof(double) * n_theta);
-    for (int i = 0; i < n_vals; i++)
-        vals[i] = DatumGetFloat8(vals_d[i]);
-    for (int i = 0; i < n_resid; i++)
-        resid[i] = DatumGetFloat8(resid_d[i]);
-    for (int i = 0; i < n_phi; i++)
-        phi[i] = DatumGetFloat8(phi_d[i]);
-    for (int i = 0; i < n_theta; i++)
-        theta[i] = DatumGetFloat8(theta_d[i]);
+    int n_vals, n_resid, n_phi, n_theta;
+    double *vals = pg_array_to_c_double(vals_arr, &n_vals, false, "arima_forecast");
+    double *resid = pg_array_to_c_double(resid_arr, &n_resid, false, "arima_forecast");
+    double *phi = pg_array_to_c_double(phi_arr, &n_phi, false, "arima_forecast");
+    double *theta = pg_array_to_c_double(theta_arr, &n_theta, false, "arima_forecast");
 
     /* Predict */
     double* yhat = _arima_predict(vals, n_vals, resid, p, q, phi, theta, horizon);

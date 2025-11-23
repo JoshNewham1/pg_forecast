@@ -7,7 +7,7 @@ PG_CONFIG = pg_config
 
 # C compilation
 MODULE_big = pg_forecast
-OBJS = c/arima.o
+OBJS = $(patsubst %.c,%.o,$(wildcard c/*.c))  # all .c files in the c dir
 PG_CFLAGS += $(PERMIT_DECLARATION_AFTER_STATEMENT)
 SHLIB_LINK = -lnlopt
 
