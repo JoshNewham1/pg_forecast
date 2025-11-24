@@ -56,27 +56,30 @@ arima_difference(PG_FUNCTION_ARGS)
     double* vals = pg_array_to_c_double(vals_arr, &n_vals, false, "arima_difference");
 
     /* Perform differencing */
-    double *differenced = palloc0((n_vals - d) * sizeof(double));
+    int vals_len = n_vals;
+    double *next = palloc0(vals_len * sizeof(double));
+
     for (int i = 0; i < d; i++)
     {
-        for (int j = 1; j <= n_vals - d; j++)
+        int next_len = vals_len - 1;
+        for (int j = 0; j < next_len; j++)
         {
-            differenced[j-1] = vals[j] - vals[j-1];
+            next[j] = vals[j+1] - vals[j];
         }
+
+        vals_len = next_len;
+
         // Swap buffers for next order differencing
-        if (i + 1 < d)
-        {
-            double* tmp = vals;
-            vals = differenced;
-            differenced = tmp;
-        }
+        double *tmp = vals;
+        vals = next;
+        next = tmp;
     }
 
     /* Convert to PG return type */
     Datum *darray = palloc(sizeof(Datum) * (n_vals - d));
     for (int i = 0; i < n_vals - d; i++)
     {
-        darray[i] = Float8GetDatum(differenced[i]);
+        darray[i] = Float8GetDatum(vals[i]);
     }
     ArrayType *pg_differenced = construct_array(darray, n_vals - d, FLOAT8OID,
                                                 sizeof(double), FLOAT8PASSBYVAL,
