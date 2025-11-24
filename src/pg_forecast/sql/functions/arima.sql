@@ -192,6 +192,9 @@ DECLARE
     ncond INT;
     vals DOUBLE PRECISION[];
     opt_result arima_optimise_result;
+    initial_vals DOUBLE PRECISION[];
+    last_idx INT;
+    n_vals INT;
     last_vals DOUBLE PRECISION[];
     forecasts DOUBLE PRECISION[];
     last_date TIMESTAMP;
@@ -214,11 +217,18 @@ BEGIN
             source_table, date_col, value_col;
     END IF;
 
+    IF d > 0 THEN
+        initial_vals := vals[1:d];
+        vals := arima_difference(vals, d);
+    END IF;
+
     -- Fit ARIMA model
     opt_result := arima_optimise(vals, p, q);
 
     -- Determine number of values/residuals needed for forecast
-    last_vals := vals[array_length(vals,1) - ncond + 1 : array_length(vals,1)];
+    n_vals := array_length(vals, 1);
+    last_idx := n_vals - ncond + 1;
+    last_vals := vals[last_idx : n_vals];
 
     -- Generate forecasts
     forecasts := arima_forecast(last_vals, opt_result.residuals, p, q, opt_result.phi, opt_result.theta, horizon);
@@ -230,6 +240,11 @@ BEGIN
         source_table
     )
     INTO last_date;
+
+    IF d > 0 THEN
+        forecasts := arima_integrate(vals || forecasts, d, initial_vals); -- add in original vals for integration
+        forecasts := forecasts[n_vals+d+1 : n_vals+d+horizon]; -- trim back to forecasted values
+    END IF;
 
     -- Return table of dates and forecast values
     FOR i IN 1..horizon LOOP
