@@ -56,12 +56,12 @@ arima_difference(PG_FUNCTION_ARGS)
     double* vals = pg_array_to_c_double(vals_arr, &n_vals, false, "arima_difference");
 
     /* Perform differencing */
-    double *differenced = palloc0(n_vals * sizeof(double));
+    double *differenced = palloc0((n_vals - d) * sizeof(double));
     for (int i = 0; i < d; i++)
     {
-        for (int j = n_vals - 1; j > 0; j--)
+        for (int j = 1; j <= n_vals - d; j++)
         {
-            differenced[j] = vals[j] - vals[j-1];
+            differenced[j-1] = vals[j] - vals[j-1];
         }
         // Swap buffers for next order differencing
         if (i + 1 < d)
@@ -70,16 +70,15 @@ arima_difference(PG_FUNCTION_ARGS)
             vals = differenced;
             differenced = tmp;
         }
-        differenced[i] = 0.0;
     }
 
     /* Convert to PG return type */
-    Datum *darray = palloc(sizeof(Datum) * n_vals);
-    for (int i = 0; i < n_vals; i++)
+    Datum *darray = palloc(sizeof(Datum) * (n_vals - d));
+    for (int i = 0; i < n_vals - d; i++)
     {
         darray[i] = Float8GetDatum(differenced[i]);
     }
-    ArrayType *pg_differenced = construct_array(darray, n_vals, FLOAT8OID,
+    ArrayType *pg_differenced = construct_array(darray, n_vals - d, FLOAT8OID,
                                                 sizeof(double), FLOAT8PASSBYVAL,
                                                 'd');
     PG_RETURN_ARRAYTYPE_P(pg_differenced);
@@ -148,12 +147,12 @@ arima_integrate(PG_FUNCTION_ARGS)
     }
 
     /* Convert to PG return type */
-    Datum *darray = palloc(sizeof(Datum) * n_diff);
-    for (int i = 0; i < n_diff; i++)
+    Datum *darray = palloc(sizeof(Datum) * (n_diff + d));
+    for (int i = 0; i < n_diff + d; i++)
     {
         darray[i] = Float8GetDatum(integrated[i]);
     }
-    ArrayType *pg_integrated = construct_array(darray, n_diff, FLOAT8OID,
+    ArrayType *pg_integrated = construct_array(darray, n_diff + d, FLOAT8OID,
                                                sizeof(double), FLOAT8PASSBYVAL,
                                                'd');
     PG_RETURN_ARRAYTYPE_P(pg_integrated);
