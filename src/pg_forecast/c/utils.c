@@ -1,5 +1,6 @@
 #include "utils.h"
 
+/* PG API helpers */
 double* pg_array_to_c_double(ArrayType* inp_arr, int* out_n, bool accept_nulls,
                             const char* caller)
 {
@@ -17,4 +18,13 @@ double* pg_array_to_c_double(ArrayType* inp_arr, int* out_n, bool accept_nulls,
             ereport(ERROR, (errmsg("%s: input array contains NULLs", caller)));
     }
     return out_arr;
+}
+
+/* Maths helpers */
+double arr_mean(double *x, int n)
+{
+    double sum = 0.0;
+    for (int i = 0; i < n; i++)
+        sum += x[i];
+    return sum / n;
 }

@@ -366,6 +366,7 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q,
     return return_val;
 }
 
+// TODO: Add support for including the mean as the constant term (c)
 Datum
 arima_optimise(PG_FUNCTION_ARGS)
 {
