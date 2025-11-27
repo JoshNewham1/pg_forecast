@@ -356,11 +356,11 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q,
     if (nlopt_optimize(opt, x, &result) < 0)
     {
         ereport(ERROR,
-        errmsg("NLopt %s failed\n", algorithm_name));
+        errmsg("NLopt %s failed", algorithm_name));
     }
 
     nlopt_destroy(opt);
-    elog(INFO, "Min CSS: %f\n", result);
+    elog(INFO, "Min CSS: %f", result);
 
     opt_result_t return_val = {x, resid};
     return return_val;
@@ -408,7 +408,7 @@ arima_optimise(PG_FUNCTION_ARGS)
     }
     else
     {
-        elog(ERROR, "Invalid optimiser provided: %s\n", arima_method);
+        elog(ERROR, "Invalid optimiser provided: %s", arima_method);
     }
     opt_result = _arima_nlopt(vals, n_vals, p, q, opt_algorithm, arima_method, opt_objective);
 
@@ -418,7 +418,7 @@ arima_optimise(PG_FUNCTION_ARGS)
         double val = opt_result.params[i];
         if (val > 1.0 || val < -1.0)
         {
-            elog(WARNING, "AR/MA model not invertible: phi/theta = %f\n", val);
+            elog(WARNING, "AR/MA model not invertible: phi/theta = %f", val);
         }
     }
 
@@ -507,7 +507,7 @@ static double* _arima_predict(double* values, int n_vals, double* resid, int p,
             // (if not, residual is 0)
             if (t <= k)
             {
-                int idx = n_vals - (k+1-t);
+                int idx = k-t; // resid[0] = residual for x_{t-0}
                 if (idx >= 0) ma = theta[k] * resid[idx];
             }
             fcast += ma;

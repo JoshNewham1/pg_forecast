@@ -224,6 +224,7 @@ BEGIN
 
     -- Fit ARIMA model
     opt_result := arima_optimise(vals, p, q);
+    RAISE DEBUG 'ARIMA model optimised with phi = % and theta = %', opt_result.phi, opt_result.theta;
 
     -- Determine number of values/residuals needed for forecast
     n_vals := array_length(vals, 1);
@@ -232,6 +233,7 @@ BEGIN
 
     -- Generate forecasts
     forecasts := arima_forecast(last_vals, opt_result.residuals, p, q, opt_result.phi, opt_result.theta, horizon);
+    RAISE DEBUG 'ARIMA forecasted with last_vals: %, residuals: %, forecast: %', last_vals, opt_result.residuals, forecasts;
 
     -- Get the last timestamp to build forecast dates
     EXECUTE format(
