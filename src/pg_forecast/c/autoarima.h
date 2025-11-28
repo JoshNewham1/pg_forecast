@@ -9,4 +9,8 @@ typedef struct {
     bool test_passed;
 } kpss_result_t;
 
+double css_loglik(double css, int p, int q, int n_vals);
+double arima_aic(double loglik, int p, int q, int k);
+double arima_aicc(double loglik, int p, int q, int k, int T);
+
 #endif

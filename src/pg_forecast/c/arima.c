@@ -13,16 +13,6 @@
 #include "utils.h"
 #include <nlopt.h>
 
-#define max(a,b) \
-   ({ __typeof__ (a) _a = (a); \
-       __typeof__ (b) _b = (b); \
-     _a > _b ? _a : _b; })
-    
-#define min(a,b) \
-   ({ __typeof__ (a) _a = (a); \
-       __typeof__ (b) _b = (b); \
-     _a <= _b ? _a : _b; })
-
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(arima_difference);

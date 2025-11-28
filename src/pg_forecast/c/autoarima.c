@@ -7,8 +7,9 @@
 #include "funcapi.h"
 
 PG_FUNCTION_INFO_V1(kpss);
+PG_FUNCTION_INFO_V1(aicc);
 
-#include <stdio.h>
+#define _USE_MATH_DEFINES
 #include <math.h>
 #include "autoarima.h"
 #include "utils.h"
@@ -157,4 +158,64 @@ kpss(PG_FUNCTION_ARGS)
     result = HeapTupleGetDatum(tuple);
     ReleaseTupleDesc(tupdesc);
     PG_RETURN_DATUM(result);
+}
+
+/* AICc (Information Criterion for selection) */
+double css_loglik(double css, int p, int q, int T)
+{
+    double sigma2 = css / T;
+    // Conditional Gaussian ARMA likelihood
+    double loglik = -0.5 * T * (log(2*M_PI) + log(sigma2) + 1.0);
+    return loglik;
+}
+
+double arima_aic(double loglik, int p, int q, int k)
+{
+    int num_params = p + q + k + 1;
+    return -2.0 * loglik + 2.0 * num_params;
+}
+
+/*
+    Calculates the corrected Akaike's Information Criterion (AICc)
+    https://otexts.com/fpp3/arima-estimation.html
+
+    css    - Conditional Sum of Squares value
+    p, q   - ARIMA constants
+    k      - 0 if no constant used, 1 otherwise
+    n_vals - num of values the model was fitted with
+*/
+double arima_aicc(double css, int p, int q, int k, int n_vals)
+{
+    int ncond = max(p, q);
+    int T = n_vals - ncond;
+    if (T <= 0) return NAN;
+
+    double loglik = css_loglik(css, p, q, T);
+    elog(DEBUG1, "Log likelihood: %f", loglik);
+
+    int num_params = p + q + k + 1;
+
+    double aic = arima_aic(loglik, p, q, k);
+    elog(DEBUG1, "AIC: %f", aic);
+
+    double correction =
+        (2.0 * num_params * (num_params + 1)) /
+        (n_vals - num_params - 1.0);
+
+    return aic + correction;
+}
+
+Datum
+aicc(PG_FUNCTION_ARGS)
+{
+    /* Get arguments */
+    float8 css = PG_GETARG_FLOAT8(0);
+    int32 p = PG_GETARG_INT32(1);
+    int32 q = PG_GETARG_INT32(2);
+    int32 k = PG_GETARG_INT32(3);
+    int32 n_vals = PG_GETARG_INT32(4);
+
+    double aicc = arima_aicc(css, p, q, k, n_vals);
+
+    PG_RETURN_FLOAT8(aicc);
 }
