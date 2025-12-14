@@ -374,7 +374,7 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool in
     nlopt_set_lower_bounds(opt, lb);
     nlopt_set_upper_bounds(opt, ub);
 
-    // Initial guess - all parameters are 0.1
+    // Initial guess - all parameters are 0.1, and intercept is mean
     double *x = palloc(sizeof(double) * n_params);
     for (int i = 0; i < n_params; i++) x[i] = 0.1;
     if (include_c)
@@ -511,7 +511,7 @@ arima_optimise(PG_FUNCTION_ARGS)
 
 /* Forecasting values */
 static double* _arima_predict(double* values, int n_vals, double* resid, int p,
-                              int q, double* phi, double* theta, unsigned int horizon)
+                              int q, double c, double* phi, double* theta, unsigned int horizon)
 {
     double* yhat = palloc0(horizon * sizeof(double));
     double fcast, ar, ma;
@@ -547,7 +547,7 @@ static double* _arima_predict(double* values, int n_vals, double* resid, int p,
             }
             fcast += ma;
         }
-        yhat[t] = fcast;
+        yhat[t] = fcast + c; // Add intercept if provided
     }
     return yhat;
 }
@@ -560,9 +560,10 @@ arima_forecast(PG_FUNCTION_ARGS)
     ArrayType *resid_arr  = PG_GETARG_ARRAYTYPE_P(1);
     int32 p = PG_GETARG_INT32(2);
     int32 q = PG_GETARG_INT32(3);
-    ArrayType *phi_arr  = PG_GETARG_ARRAYTYPE_P(4);
-    ArrayType *theta_arr  = PG_GETARG_ARRAYTYPE_P(5);
-    int32 horizon = PG_GETARG_INT32(6);
+    float8 c = PG_GETARG_FLOAT8(4);
+    ArrayType *phi_arr  = PG_GETARG_ARRAYTYPE_P(5);
+    ArrayType *theta_arr  = PG_GETARG_ARRAYTYPE_P(6);
+    int32 horizon = PG_GETARG_INT32(7);
 
     /* Validate arguments */
     if (ARR_NDIM(vals_arr) != 1 || ARR_NDIM(resid_arr) != 1 || ARR_NDIM(phi_arr) != 1 || ARR_NDIM(theta_arr) != 1)
@@ -584,7 +585,7 @@ arima_forecast(PG_FUNCTION_ARGS)
     double *theta = pg_array_to_c_double(theta_arr, &n_theta, false, "arima_forecast");
 
     /* Predict */
-    double* yhat = _arima_predict(vals, n_vals, resid, p, q, phi, theta, horizon);
+    double* yhat = _arima_predict(vals, n_vals, resid, p, q, c, phi, theta, horizon);
 
     /* Convert to PG return type */
     Datum *darray = palloc(sizeof(Datum) * horizon);
