@@ -227,7 +227,7 @@ BEGIN
     END IF;
 
     -- Fit ARIMA model
-    opt_result := arima_optimise(vals, p, q, include_mean, 'Nelder-Mead');
+    opt_result := arima_optimise(vals, p, q, include_mean);
     RAISE DEBUG 'ARIMA model optimised with phi = %, theta = %, c = %', opt_result.phi, opt_result.theta, opt_result.c;
 
     -- Determine number of values/residuals needed for forecast
