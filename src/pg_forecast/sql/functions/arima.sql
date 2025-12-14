@@ -152,7 +152,7 @@ LANGUAGE C STRICT STABLE;
 CREATE TYPE arima_optimise_result AS (
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
-    c DOUBLE PRECISION, -- Intercept (0 if not including mean
+    c DOUBLE PRECISION, -- Intercept (0 if not including mean)
     residuals DOUBLE PRECISION[]
 );
 
