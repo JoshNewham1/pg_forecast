@@ -117,21 +117,6 @@ RETURNS DOUBLE PRECISION
 AS 'MODULE_PATHNAME', 'css_loss'
 LANGUAGE C STRICT VOLATILE;
 
-/*
-SELECT
-    css_loss(
-        vals := array_agg(value ORDER BY t)::double precision[],
-        phi := ARRAY[0.5]::double precision[],
-        theta := ARRAY[0.3]::double precision[],
-        p := 1,
-        q := 1
-    )
-FROM
-    time_series_data
-WHERE
-    series_id = 'TestSeries';
-*/
-
 CREATE FUNCTION arima_difference(
     vals DOUBLE PRECISION[],
     d INT
@@ -153,7 +138,8 @@ CREATE TYPE arima_optimise_result AS (
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
     c DOUBLE PRECISION, -- Intercept (0 if not including mean)
-    residuals DOUBLE PRECISION[]
+    residuals DOUBLE PRECISION[],
+    css DOUBLE PRECISION
 );
 
 CREATE FUNCTION arima_optimise(
@@ -181,7 +167,51 @@ RETURNS DOUBLE PRECISION[]
 AS 'MODULE_PATHNAME', 'arima_forecast'
 LANGUAGE C STRICT STABLE;
 
-CREATE OR REPLACE FUNCTION arima(
+CREATE OR REPLACE FUNCTION arima_train(
+    p INT, -- Number of lagged y_t
+    d INT, -- Number of times to difference
+    q INT, -- Number of lagged residuals
+    source_table TEXT, -- Table/view name
+    date_col TEXT,     -- Timestamp column
+    value_col TEXT,    -- Numerical value column
+    include_mean BOOLEAN DEFAULT TRUE,
+    optimiser TEXT DEFAULT 'L-BFGS'
+)
+RETURNS arima_optimise_result AS $$
+DECLARE
+    ncond INT;
+    vals DOUBLE PRECISION[];
+    opt_result arima_optimise_result;
+BEGIN
+    ncond := GREATEST(p, q);
+
+    -- Aggregate the series into an array
+    EXECUTE format(
+        'SELECT array_agg(%I ORDER BY %I) FROM %I',
+        value_col,
+        date_col,
+        source_table
+    )
+    INTO vals;
+
+    IF vals IS NULL OR array_length(vals, 1) = 0 THEN
+        RAISE EXCEPTION
+            'ARIMA: no data found in % for columns %, %',
+            source_table, date_col, value_col;
+    END IF;
+
+    IF d > 0 THEN
+        vals := arima_difference(vals, d);
+    END IF;
+
+    -- Fit ARIMA model
+    opt_result := arima_optimise(vals, p, q, include_mean, optimiser);
+
+    RETURN opt_result;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION arima_train_and_forecast(
     p INT, -- Number of lagged y_t
     d INT, -- Number of times to difference
     q INT, -- Number of lagged residuals
@@ -189,7 +219,8 @@ CREATE OR REPLACE FUNCTION arima(
     source_table TEXT, -- Table/view name
     date_col TEXT,     -- Timestamp column
     value_col TEXT,    -- Numerical value column
-    include_mean BOOLEAN DEFAULT TRUE
+    include_mean BOOLEAN DEFAULT TRUE,
+    optimiser TEXT DEFAULT 'L-BFGS'
 )
 RETURNS TABLE(date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
 DECLARE
@@ -227,7 +258,7 @@ BEGIN
     END IF;
 
     -- Fit ARIMA model
-    opt_result := arima_optimise(vals, p, q, include_mean);
+    opt_result := arima_optimise(vals, p, q, include_mean, optimiser);
     RAISE DEBUG 'ARIMA model optimised with phi = %, theta = %, c = %', opt_result.phi, opt_result.theta, opt_result.c;
 
     -- Determine number of values/residuals needed for forecast

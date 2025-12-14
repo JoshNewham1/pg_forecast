@@ -391,13 +391,11 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool in
     }
 
     nlopt_destroy(opt);
-    elog(INFO, "Min CSS: %f", result);
 
-    opt_result_t return_val = {x, resid};
+    opt_result_t return_val = {x, resid, result};
     return return_val;
 }
 
-// TODO: Add support for including the mean as the constant term (c)
 Datum
 arima_optimise(PG_FUNCTION_ARGS)
 {
@@ -414,7 +412,7 @@ arima_optimise(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errmsg("vals must be a 1-D array")));
     }
-    if (p < 1 || q < 1)
+    if (p < 0 || q < 0)
     {
         ereport(ERROR,
                 (errmsg("p and q must be positive integers")));
@@ -460,8 +458,8 @@ arima_optimise(PG_FUNCTION_ARGS)
 
     /* Convert to arima_optimise_result return type */
     TupleDesc tupdesc;
-    Datum values[4];
-    bool nulls[4] = {false, false, false, false};
+    Datum values[5];
+    bool nulls[5] = {false, false, false, false, false};
     HeapTuple tuple;
     Datum result;
     Oid type_oid = get_call_result_type(fcinfo, NULL, &tupdesc);
@@ -501,6 +499,9 @@ arima_optimise(PG_FUNCTION_ARGS)
     }
     ArrayType *resid_converted = construct_array(resid_array, q, FLOAT8OID, sizeof(double), FLOAT8PASSBYVAL, 'd');
     values[3] = PointerGetDatum(resid_converted);
+
+    // CSS
+    values[4] = Float8GetDatum(opt_result.css);
 
     tuple = heap_form_tuple(tupdesc, values, nulls);
     result = HeapTupleGetDatum(tuple);

@@ -17,6 +17,7 @@ typedef struct {
 typedef struct {
     double *params;
     double *resid;
+    double css;
 } opt_result_t;
 
 #endif

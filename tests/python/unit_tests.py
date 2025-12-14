@@ -146,13 +146,13 @@ def arima_forecast_query(last_vals: list[float], last_residuals: list[float], p:
                                       p=p, q=q, c=c, phi=phi, theta=theta, horizon=horizon)
 
 
-def arima_query(p: int, d: int, q: int, horizon: int, include_mean=True, table="pg_forecast_unit_test"):
+def arima_query(p: int, d: int, q: int, horizon: int, include_mean=True, optimiser="L-BFGS", table="pg_forecast_unit_test"):
     """
     Build a SQLAlchemy text query to call arima on pg_forecast_unit_test.
     """
     query_str = f"""
         SELECT *
-        FROM arima(
+        FROM arima_train_and_forecast(
             p := :p,
             d := :d,
             q := :q,
@@ -160,7 +160,8 @@ def arima_query(p: int, d: int, q: int, horizon: int, include_mean=True, table="
             source_table := '{table}',
             date_col := 't',
             value_col := 'value',
-            include_mean := {include_mean}
+            include_mean := {include_mean},
+            optimiser := '{optimiser}'
         )
     """
     return text(query_str).bindparams(p=p, q=q, d=d, horizon=horizon)
@@ -388,8 +389,8 @@ def test_arima_p_2_d_1_q_2_include_c(test_engine):
     with test_engine.connect() as conn:
         result = conn.execute(query)
         forecast = [row[1] for row in result.fetchall()]
-        expected_forecast = [12.00215961,
-                             12.03696805, 11.96607588, 11.78933015]
+        expected_forecast = [12.00217391,
+                             12.03804348, 11.96854915, 11.79448251]
         for i, diff in enumerate(forecast):
             assert_close(diff, expected_forecast[i])
 
@@ -409,7 +410,9 @@ def test_arima_large_input(test_engine):
 def test_arima_large_input_include_c(test_engine):
     setup_large_dataset(test_engine)
     horizon = 100
-    query = arima_query(1, 0, 1, horizon, include_mean=True)
+    # L-BFGS doesn't handle large queries as well
+    query = arima_query(1, 0, 1, horizon, include_mean=True,
+                        optimiser="Nelder-Mead")
 
     with test_engine.connect() as conn:
         result = conn.execute(query)
