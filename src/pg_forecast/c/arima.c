@@ -425,7 +425,6 @@ arima_optimise(PG_FUNCTION_ARGS)
     /* Call optimiser */
     double (*opt_objective)(unsigned, const double *, double *, void *);
     nlopt_algorithm opt_algorithm;
-    int n_params = p + q + include_c;
     opt_result_t opt_result;
 
     if (strcmp(arima_method, "Nelder-Mead") == 0)
@@ -445,16 +444,6 @@ arima_optimise(PG_FUNCTION_ARGS)
     opt_result = _arima_nlopt(vals, n_vals, p, q, include_c, opt_algorithm, arima_method, opt_objective);
 
     double c = include_c ? opt_result.params[p + q] : 0.0;
-
-    /* Warn for risky bounds on phi/theta coefficients */
-    for (int i = 0; i < n_params - include_c; i++)
-    {
-        double val = opt_result.params[i];
-        if (val > 1.0 || val < -1.0)
-        {
-            elog(WARNING, "AR/MA model not invertible: phi/theta = %f", val);
-        }
-    }
 
     /* Convert to arima_optimise_result return type */
     TupleDesc tupdesc;

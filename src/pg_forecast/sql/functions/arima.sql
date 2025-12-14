@@ -261,6 +261,18 @@ BEGIN
     opt_result := arima_optimise(vals, p, q, include_mean, optimiser);
     RAISE DEBUG 'ARIMA model optimised with phi = %, theta = %, c = %', opt_result.phi, opt_result.theta, opt_result.c;
 
+    -- Warn for risky bounds on phi/theta coefficients
+    FOR i IN 0..p LOOP
+        IF opt_result.phi[i] <= -1.0 OR opt_result.phi[i] >= 1.0 THEN
+            RAISE WARNING 'AR model not invertible - phi[%] = %', i, opt_result.phi[i];
+        END IF;
+    END LOOP;
+    FOR i IN 0..q LOOP
+        IF opt_result.theta[i] <= -1.0 OR opt_result.theta[i] >= 1.0 THEN
+            RAISE WARNING 'AR model not invertible - theta[%] = %', i, opt_result.theta[i];
+        END IF;
+    END LOOP;
+
     -- Determine number of values/residuals needed for forecast
     n_vals := array_length(vals, 1);
     last_idx := n_vals - ncond + 1;
