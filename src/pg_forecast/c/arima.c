@@ -272,6 +272,7 @@ double css(double *vals, double *phi, double *theta, int p, int q, bool include_
         if (p>0) pfree(dphi);
         for (int k = 0; k < q; k++) pfree(dtheta[k]);
         if (q>0) pfree(dtheta);
+        if (include_c) pfree(dc);
     }
     return ssq;
 }
@@ -345,7 +346,7 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool in
                                 nlopt_algorithm algorithm, const char* algorithm_name,
                                 double (*objective)(unsigned, const double*, double*, void*))
 {
-    int n_params = p + q + include_c;
+    int n_params = p + q + (include_c ? 1 : 0);
     nlopt_opt opt = nlopt_create(algorithm, n_params);
     double* resid = palloc(n_vals * sizeof(double));
 

@@ -160,7 +160,7 @@ CREATE FUNCTION arima_optimise(
     vals DOUBLE PRECISION[],
     p INT,
     q INT,
-    include_c BOOLEAN DEFAULT FALSE,
+    include_c BOOLEAN DEFAULT TRUE,
     method TEXT DEFAULT 'L-BFGS' -- 'Nelder-Mead', 'L-BFGS'
 )
 RETURNS arima_optimise_result

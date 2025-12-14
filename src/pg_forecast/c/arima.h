@@ -1,3 +1,5 @@
+#include <stdbool.h>
+
 #ifndef ARIMA_H
 #define ARIMA_H
 
