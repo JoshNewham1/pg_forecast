@@ -157,7 +157,7 @@ arima_integrate(PG_FUNCTION_ARGS)
   If the gradient isn't required, leave `grad` = NULL
   If the gradient is required, leave enough space for p+q values
 */
-double css(double *vals, double *phi, double *theta, int p, int q, double c, int n_vals, double* grad, double* resid)
+double css(double *vals, double *phi, double *theta, int p, int q, bool include_c, double c, int n_vals, double* grad, double* resid)
 {
     int ncond = max(p, q);
     memset(resid, 0, n_vals * sizeof(double));
@@ -166,7 +166,7 @@ double css(double *vals, double *phi, double *theta, int p, int q, double c, int
 
     if (grad != NULL)
     {
-        memset(grad, 0, (p + q) * sizeof(double));
+        memset(grad, 0, (p + q + include_c) * sizeof(double));
         dphi = palloc(sizeof(double*) * p);
         for (int k = 0; k < p; k++)
         {
@@ -240,6 +240,11 @@ double css(double *vals, double *phi, double *theta, int p, int q, double c, int
                     grad[p + k] += 2.0 * tmp * dtheta[k][t];
                 }
             }
+
+            if (include_c && isfinite(tmp))
+            {
+                grad[p + q] += -2.0 * tmp;
+            }
         }
     }
     // Free derivative arrays
@@ -291,7 +296,7 @@ css_loss(PG_FUNCTION_ARGS)
     
     /* CSS logic */
     double* resid = palloc(n_vals * sizeof(double));
-    PG_RETURN_FLOAT8(css(vals, phi, theta, p, q, 0.0, n_vals, NULL, resid));
+    PG_RETURN_FLOAT8(css(vals, phi, theta, p, q, false, 0.0, n_vals, NULL, resid));
 }
 
 /* ARIMA optimisation */
@@ -299,11 +304,12 @@ static double _arima_objective_no_grad(unsigned n, const double *x, double *grad
 {
     css_data_t *d = (css_data_t *)data;
     double *phi = (double *)x;
+    double c = d->include_c ? x[d->p + d->q] : 0.0;
     double* theta = (double *)(x + d->p);
     double* resid = (double *)(d->resid);
 
     // Gradient is not required by Nelder-Mead algorithm
-    return css(d->vals, phi, theta, d->p, d->q, d->c, d->n_vals, NULL, resid);
+    return css(d->vals, phi, theta, d->p, d->q, d->include_c, c, d->n_vals, NULL, resid);
 }
 
 static double _arima_objective_grad(unsigned n, const double *x, double *grad, void *data)
@@ -311,20 +317,21 @@ static double _arima_objective_grad(unsigned n, const double *x, double *grad, v
     css_data_t *d = (css_data_t *)data;
     double *phi = (double *)x;
     double* theta = (double *)(x + d->p);
+    double c = d->include_c ? x[d->p + d->q] : 0.0;
     double* resid = (double *)(d->resid);
     
-    return css(d->vals, phi, theta, d->p, d->q, d->c, d->n_vals, grad, resid);
+    return css(d->vals, phi, theta, d->p, d->q, d->include_c, c, d->n_vals, grad, resid);
 }
 
-static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, double c,
+static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool include_c,
                                 nlopt_algorithm algorithm, const char* algorithm_name,
                                 double (*objective)(unsigned, const double*, double*, void*))
 {
-    int n_params = p + q;
+    int n_params = p + q + include_c;
     nlopt_opt opt = nlopt_create(algorithm, n_params);
     double* resid = palloc(n_vals * sizeof(double));
 
-    css_data_t data = {vals, n_vals, p, q, c, resid};
+    css_data_t data = {vals, n_vals, p, q, include_c, resid};
     nlopt_set_min_objective(opt, objective, &data);
 
     // Lower and upper bounds (stationarity assumed to be enforced)
@@ -335,12 +342,21 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, double 
         lb[i] = ARIMA_OPTIMISER_MIN_BOUND;
         ub[i] = ARIMA_OPTIMISER_MAX_BOUND;
     }
+    if (include_c)
+    {
+        lb[p + q] = -100.0;
+        ub[p + q] = 100.0;
+    }
     nlopt_set_lower_bounds(opt, lb);
     nlopt_set_upper_bounds(opt, ub);
 
     // Initial guess - all parameters are 0.1
     double *x = palloc(sizeof(double) * n_params);
     for (int i = 0; i < n_params; i++) x[i] = 0.1;
+    if (include_c)
+    {
+        x[p + q] = arr_mean(vals, n_vals);
+    }
 
     double result;
     if (nlopt_optimize(opt, x, &result) < 0)
@@ -365,7 +381,6 @@ arima_optimise(PG_FUNCTION_ARGS)
     int32 p = PG_GETARG_INT32(1);
     int32 q = PG_GETARG_INT32(2);
     bool include_c = PG_GETARG_BOOL(3);
-    double c = 0.0;
     char* arima_method = text_to_cstring(PG_GETARG_TEXT_P(4));
 
     /* Validate arguments */
@@ -384,17 +399,12 @@ arima_optimise(PG_FUNCTION_ARGS)
     int n_vals;
     double* vals = pg_array_to_c_double(vals_arr, &n_vals, false, "arima_optimise");
 
-    /* Handle constant term */
-    if (include_c)
-    {
-        c = arr_mean(vals, n_vals);
-    }
-
     /* Call optimiser */
     double (*opt_objective)(unsigned, const double *, double *, void *);
     nlopt_algorithm opt_algorithm;
-    int n_params = p + q;
+    int n_params = p + q + include_c;
     opt_result_t opt_result;
+
     if (strcmp(arima_method, "Nelder-Mead") == 0)
     {
         opt_objective = _arima_objective_no_grad;
@@ -409,10 +419,12 @@ arima_optimise(PG_FUNCTION_ARGS)
     {
         elog(ERROR, "Invalid optimiser provided: %s", arima_method);
     }
-    opt_result = _arima_nlopt(vals, n_vals, p, q, c, opt_algorithm, arima_method, opt_objective);
+    opt_result = _arima_nlopt(vals, n_vals, p, q, include_c, opt_algorithm, arima_method, opt_objective);
 
-    /* Warn for risky bounds */
-    for (int i = 0; i < n_params; i++)
+    double c = include_c ? opt_result.params[p + q] : 0.0;
+
+    /* Warn for risky bounds on phi/theta coefficients */
+    for (int i = 0; i < n_params - include_c; i++)
     {
         double val = opt_result.params[i];
         if (val > 1.0 || val < -1.0)
