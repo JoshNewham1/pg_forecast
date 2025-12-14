@@ -381,6 +381,19 @@ def test_arima_p_2_d_0_q_2_include_c(test_engine):
             assert_close(diff, expected_forecast[i])
 
 
+def test_arima_p_2_d_1_q_2_include_c(test_engine):
+    setup_basic_dataset(test_engine)
+    query = arima_query(2, 1, 2, 4, include_mean=True)
+
+    with test_engine.connect() as conn:
+        result = conn.execute(query)
+        forecast = [row[1] for row in result.fetchall()]
+        expected_forecast = [12.00215961,
+                             12.03696805, 11.96607588, 11.78933015]
+        for i, diff in enumerate(forecast):
+            assert_close(diff, expected_forecast[i])
+
+
 def test_arima_large_input(test_engine):
     setup_large_dataset(test_engine)
     horizon = 100
