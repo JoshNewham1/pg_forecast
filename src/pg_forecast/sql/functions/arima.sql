@@ -152,6 +152,7 @@ LANGUAGE C STRICT STABLE;
 CREATE TYPE arima_optimise_result AS (
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
+    constant DOUBLE PRECISION,
     residuals DOUBLE PRECISION[]
 );
 
@@ -159,6 +160,7 @@ CREATE FUNCTION arima_optimise(
     vals DOUBLE PRECISION[],
     p INT,
     q INT,
+    include_c BOOLEAN DEFAULT FALSE,
     method TEXT DEFAULT 'L-BFGS' -- 'Nelder-Mead', 'L-BFGS'
 )
 RETURNS arima_optimise_result
