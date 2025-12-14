@@ -360,11 +360,16 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool in
         lb[i] = ARIMA_OPTIMISER_MIN_BOUND;
         ub[i] = ARIMA_OPTIMISER_MAX_BOUND;
     }
-    // TODO: Make these dynamic
+
     if (include_c)
     {
-        lb[p + q] = -100.0;
-        ub[p + q] = 100.0;
+        // Scale bounds to be symmetric around mean
+        double mean = arr_mean(vals, n_vals);
+        double abs_mean = fabs(mean);
+        double bound = fmax(10.0 * abs_mean, 1.0);  // At least +/-1.0
+        
+        lb[p + q] = -bound;
+        ub[p + q] = bound;
     }
     nlopt_set_lower_bounds(opt, lb);
     nlopt_set_upper_bounds(opt, ub);
