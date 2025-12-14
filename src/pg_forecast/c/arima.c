@@ -163,6 +163,7 @@ double css(double *vals, double *phi, double *theta, int p, int q, bool include_
     memset(resid, 0, n_vals * sizeof(double));
     double ssq = 0.0;
     double **dphi, **dtheta = NULL;
+    double *dc = NULL;
 
     if (grad != NULL)
     {
@@ -176,6 +177,10 @@ double css(double *vals, double *phi, double *theta, int p, int q, bool include_
         for (int k = 0; k < q; k++)
         {
             dtheta[k] = palloc0(sizeof(double) * n_vals);
+        }
+        if (include_c)
+        {
+            dc = palloc0(sizeof(double) * n_vals);
         }
     }
 
@@ -240,10 +245,23 @@ double css(double *vals, double *phi, double *theta, int p, int q, bool include_
                     grad[p + k] += 2.0 * tmp * dtheta[k][t];
                 }
             }
-
+            
+            // e_t = y_t - c - sum phi_i*y_{t-i} - sum theta_j*e_{t-j}
+            // de_t/dc = -1 - sum theta_j * (de_{t-j}/dc)
+            // By the chain rule as the past residuals e_{t-j} also depend on c
             if (include_c && isfinite(tmp))
             {
-                grad[p + q] += -2.0 * tmp;
+                double d = -1.0;
+                // Add MA contribution
+                for (int j = 0; j < max_ma; j++)
+                {
+                    d -= theta[j] * dc[t-j-1];
+                }
+                dc[t] = d;
+                if (isfinite(d))
+                {
+                    grad[p + q] += 2.0 * tmp * dc[t];
+                }
             }
         }
     }
@@ -342,6 +360,7 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool in
         lb[i] = ARIMA_OPTIMISER_MIN_BOUND;
         ub[i] = ARIMA_OPTIMISER_MAX_BOUND;
     }
+    // TODO: Make these dynamic
     if (include_c)
     {
         lb[p + q] = -100.0;
