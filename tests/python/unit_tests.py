@@ -125,7 +125,7 @@ def arima_integrate_query(d: int, series_id=None):
     return text(query_str)
 
 
-def arima_forecast_query(last_vals: list[float], last_residuals: list[float], p: int, q: int, phi: list[float], theta: list[float], horizon: int):
+def arima_forecast_query(last_vals: list[float], last_residuals: list[float], p: int, q: int, c: float, phi: list[float], theta: list[float], horizon: int):
     """
     Build a SQLAlchemy text query to call arima on pg_forecast_unit_test.
     """
@@ -136,16 +136,17 @@ def arima_forecast_query(last_vals: list[float], last_residuals: list[float], p:
                 :lastresids,
                 :p,
                 :q,
+                :c,
                 :phi,
                 :theta,
                 :horizon
             )
     """
     return text(query_str).bindparams(lastvals=last_vals, lastresids=last_residuals,
-                                      p=p, q=q, phi=phi, theta=theta, horizon=horizon)
+                                      p=p, q=q, c=c, phi=phi, theta=theta, horizon=horizon)
 
 
-def arima_query(p: int, d: int, q: int, horizon: int, table="pg_forecast_unit_test"):
+def arima_query(p: int, d: int, q: int, horizon: int, include_mean=True, table="pg_forecast_unit_test"):
     """
     Build a SQLAlchemy text query to call arima on pg_forecast_unit_test.
     """
@@ -158,7 +159,8 @@ def arima_query(p: int, d: int, q: int, horizon: int, table="pg_forecast_unit_te
             horizon := :horizon,
             source_table := '{table}',
             date_col := 't',
-            value_col := 'value'
+            value_col := 'value',
+            include_mean := {include_mean}
         )
     """
     return text(query_str).bindparams(p=p, q=q, d=d, horizon=horizon)
@@ -316,7 +318,7 @@ def test_arima_integrate_d_2(test_engine):
 
 def test_arima_forecast_p_2_q_2(test_engine):
     setup_basic_dataset(test_engine)
-    query = arima_forecast_query([11.7, 11.9], [-0.016511328, -0.035082334], 2, 2, [
+    query = arima_forecast_query([11.7, 11.9], [-0.016511328, -0.035082334], 2, 2, 0.0, [
                                  0.914982910934596, 0.113555903738228], [2.062502180358700, 0.710978584599870], 4)
 
     with test_engine.connect() as conn:
@@ -330,7 +332,7 @@ def test_arima_forecast_p_2_q_2(test_engine):
 
 def test_arima_p_2_d_0_q_2(test_engine):
     setup_basic_dataset(test_engine)
-    query = arima_query(2, 0, 2, 4)
+    query = arima_query(2, 0, 2, 4, include_mean=False)
 
     with test_engine.connect() as conn:
         result = conn.execute(query)
@@ -343,7 +345,7 @@ def test_arima_p_2_d_0_q_2(test_engine):
 
 def test_arima_p_2_d_1_q_2(test_engine):
     setup_basic_dataset(test_engine)
-    query = arima_query(2, 1, 2, 4)
+    query = arima_query(2, 1, 2, 4, include_mean=False)
 
     with test_engine.connect() as conn:
         result = conn.execute(query)
@@ -356,7 +358,7 @@ def test_arima_p_2_d_1_q_2(test_engine):
 
 def test_arima_p_2_d_2_q_2(test_engine):
     setup_basic_dataset(test_engine)
-    query = arima_query(2, 2, 2, 4)
+    query = arima_query(2, 2, 2, 4, include_mean=False)
 
     with test_engine.connect() as conn:
         result = conn.execute(query)
@@ -366,10 +368,48 @@ def test_arima_p_2_d_2_q_2(test_engine):
             assert_close(diff, expected_forecast[i])
 
 
+def test_arima_p_2_d_0_q_2_include_c(test_engine):
+    setup_basic_dataset(test_engine)
+    query = arima_query(2, 0, 2, 4, include_mean=True)
+
+    with test_engine.connect() as conn:
+        result = conn.execute(query)
+        forecast = [row[1] for row in result.fetchall()]
+        expected_forecast = [12.11508753,
+                             12.25959515, 12.41700061, 12.52258105]
+        for i, diff in enumerate(forecast):
+            assert_close(diff, expected_forecast[i])
+
+
+def test_arima_p_2_d_1_q_2_include_c(test_engine):
+    setup_basic_dataset(test_engine)
+    query = arima_query(2, 1, 2, 4, include_mean=True)
+
+    with test_engine.connect() as conn:
+        result = conn.execute(query)
+        forecast = [row[1] for row in result.fetchall()]
+        expected_forecast = [12.00215961,
+                             12.03696805, 11.96607588, 11.78933015]
+        for i, diff in enumerate(forecast):
+            assert_close(diff, expected_forecast[i])
+
+
 def test_arima_large_input(test_engine):
     setup_large_dataset(test_engine)
     horizon = 100
-    query = arima_query(2, 1, 2, horizon)
+    query = arima_query(2, 1, 2, horizon, include_mean=False)
+
+    with test_engine.connect() as conn:
+        result = conn.execute(query)
+        forecast = [row[1] for row in result.fetchall()]
+        assert len(forecast) == horizon and all_different(
+            forecast) and increasing(forecast)
+
+
+def test_arima_large_input_include_c(test_engine):
+    setup_large_dataset(test_engine)
+    horizon = 100
+    query = arima_query(1, 0, 1, horizon, include_mean=True)
 
     with test_engine.connect() as conn:
         result = conn.execute(query)

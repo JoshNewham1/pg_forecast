@@ -152,6 +152,7 @@ LANGUAGE C STRICT STABLE;
 CREATE TYPE arima_optimise_result AS (
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION, -- Intercept (0 if not including mean)
     residuals DOUBLE PRECISION[]
 );
 
@@ -159,6 +160,7 @@ CREATE FUNCTION arima_optimise(
     vals DOUBLE PRECISION[],
     p INT,
     q INT,
+    include_c BOOLEAN DEFAULT TRUE,
     method TEXT DEFAULT 'L-BFGS' -- 'Nelder-Mead', 'L-BFGS'
 )
 RETURNS arima_optimise_result
@@ -170,6 +172,7 @@ CREATE FUNCTION arima_forecast(
     last_residuals DOUBLE PRECISION[], -- Last max(p, q) residuals
     p INT,
     q INT,
+    c DOUBLE PRECISION, -- Intercept (0 if not including mean)
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
     horizon INT
@@ -185,7 +188,8 @@ CREATE OR REPLACE FUNCTION arima(
     horizon INT,
     source_table TEXT, -- Table/view name
     date_col TEXT,     -- Timestamp column
-    value_col TEXT     -- Numerical value column
+    value_col TEXT,    -- Numerical value column
+    include_mean BOOLEAN DEFAULT TRUE
 )
 RETURNS TABLE(date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
 DECLARE
@@ -223,8 +227,8 @@ BEGIN
     END IF;
 
     -- Fit ARIMA model
-    opt_result := arima_optimise(vals, p, q);
-    RAISE DEBUG 'ARIMA model optimised with phi = % and theta = %', opt_result.phi, opt_result.theta;
+    opt_result := arima_optimise(vals, p, q, include_mean);
+    RAISE DEBUG 'ARIMA model optimised with phi = %, theta = %, c = %', opt_result.phi, opt_result.theta, opt_result.c;
 
     -- Determine number of values/residuals needed for forecast
     n_vals := array_length(vals, 1);
@@ -232,7 +236,7 @@ BEGIN
     last_vals := vals[last_idx : n_vals];
 
     -- Generate forecasts
-    forecasts := arima_forecast(last_vals, opt_result.residuals, p, q, opt_result.phi, opt_result.theta, horizon);
+    forecasts := arima_forecast(last_vals, opt_result.residuals, p, q, opt_result.c, opt_result.phi, opt_result.theta, horizon);
     RAISE DEBUG 'ARIMA forecasted with last_vals: %, residuals: %, forecast: %', last_vals, opt_result.residuals, forecasts;
 
     -- Get the last timestamp to build forecast dates

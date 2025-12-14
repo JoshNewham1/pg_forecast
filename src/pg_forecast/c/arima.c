@@ -157,16 +157,17 @@ arima_integrate(PG_FUNCTION_ARGS)
   If the gradient isn't required, leave `grad` = NULL
   If the gradient is required, leave enough space for p+q values
 */
-double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, double* grad, double* resid)
+double css(double *vals, double *phi, double *theta, int p, int q, bool include_c, double c, int n_vals, double* grad, double* resid)
 {
     int ncond = max(p, q);
     memset(resid, 0, n_vals * sizeof(double));
     double ssq = 0.0;
     double **dphi, **dtheta = NULL;
+    double *dc = NULL;
 
     if (grad != NULL)
     {
-        memset(grad, 0, (p + q) * sizeof(double));
+        memset(grad, 0, (p + q + include_c) * sizeof(double));
         dphi = palloc(sizeof(double*) * p);
         for (int k = 0; k < p; k++)
         {
@@ -177,11 +178,15 @@ double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, d
         {
             dtheta[k] = palloc0(sizeof(double) * n_vals);
         }
+        if (include_c)
+        {
+            dc = palloc0(sizeof(double) * n_vals);
+        }
     }
 
     for (int t = ncond; t < n_vals; t++)
     {
-        double tmp = vals[t];
+        double tmp = vals[t] - c;
 
         // AR part: subtract phi_j * y_{t-j-1}
         for (int j = 0; j < p; j++)
@@ -240,6 +245,24 @@ double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, d
                     grad[p + k] += 2.0 * tmp * dtheta[k][t];
                 }
             }
+            
+            // e_t = y_t - c - sum phi_i*y_{t-i} - sum theta_j*e_{t-j}
+            // de_t/dc = -1 - sum theta_j * (de_{t-j}/dc)
+            // By the chain rule as the past residuals e_{t-j} also depend on c
+            if (include_c && isfinite(tmp))
+            {
+                double d = -1.0;
+                // Add MA contribution
+                for (int j = 0; j < max_ma; j++)
+                {
+                    d -= theta[j] * dc[t-j-1];
+                }
+                dc[t] = d;
+                if (isfinite(d))
+                {
+                    grad[p + q] += 2.0 * tmp * dc[t];
+                }
+            }
         }
     }
     // Free derivative arrays
@@ -249,6 +272,7 @@ double css(double *vals, double *phi, double *theta, int p, int q, int n_vals, d
         if (p>0) pfree(dphi);
         for (int k = 0; k < q; k++) pfree(dtheta[k]);
         if (q>0) pfree(dtheta);
+        if (include_c) pfree(dc);
     }
     return ssq;
 }
@@ -291,7 +315,7 @@ css_loss(PG_FUNCTION_ARGS)
     
     /* CSS logic */
     double* resid = palloc(n_vals * sizeof(double));
-    PG_RETURN_FLOAT8(css(vals, phi, theta, p, q, n_vals, NULL, resid));
+    PG_RETURN_FLOAT8(css(vals, phi, theta, p, q, false, 0.0, n_vals, NULL, resid));
 }
 
 /* ARIMA optimisation */
@@ -299,11 +323,12 @@ static double _arima_objective_no_grad(unsigned n, const double *x, double *grad
 {
     css_data_t *d = (css_data_t *)data;
     double *phi = (double *)x;
+    double c = d->include_c ? x[d->p + d->q] : 0.0;
     double* theta = (double *)(x + d->p);
     double* resid = (double *)(d->resid);
 
     // Gradient is not required by Nelder-Mead algorithm
-    return css(d->vals, phi, theta, d->p, d->q, d->n_vals, NULL, resid);
+    return css(d->vals, phi, theta, d->p, d->q, d->include_c, c, d->n_vals, NULL, resid);
 }
 
 static double _arima_objective_grad(unsigned n, const double *x, double *grad, void *data)
@@ -311,20 +336,21 @@ static double _arima_objective_grad(unsigned n, const double *x, double *grad, v
     css_data_t *d = (css_data_t *)data;
     double *phi = (double *)x;
     double* theta = (double *)(x + d->p);
+    double c = d->include_c ? x[d->p + d->q] : 0.0;
     double* resid = (double *)(d->resid);
     
-    return css(d->vals, phi, theta, d->p, d->q, d->n_vals, grad, resid);
+    return css(d->vals, phi, theta, d->p, d->q, d->include_c, c, d->n_vals, grad, resid);
 }
 
-static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q,
+static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool include_c,
                                 nlopt_algorithm algorithm, const char* algorithm_name,
                                 double (*objective)(unsigned, const double*, double*, void*))
 {
-    int n_params = p + q;
+    int n_params = p + q + (include_c ? 1 : 0);
     nlopt_opt opt = nlopt_create(algorithm, n_params);
     double* resid = palloc(n_vals * sizeof(double));
 
-    css_data_t data = {vals, n_vals, p, q, resid};
+    css_data_t data = {vals, n_vals, p, q, include_c, resid};
     nlopt_set_min_objective(opt, objective, &data);
 
     // Lower and upper bounds (stationarity assumed to be enforced)
@@ -335,12 +361,27 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q,
         lb[i] = ARIMA_OPTIMISER_MIN_BOUND;
         ub[i] = ARIMA_OPTIMISER_MAX_BOUND;
     }
+
+    if (include_c)
+    {
+        // Scale bounds to be symmetric around mean
+        double mean = arr_mean(vals, n_vals);
+        double abs_mean = fabs(mean);
+        double bound = fmax(10.0 * abs_mean, 1.0);  // At least +/-1.0
+        
+        lb[p + q] = -bound;
+        ub[p + q] = bound;
+    }
     nlopt_set_lower_bounds(opt, lb);
     nlopt_set_upper_bounds(opt, ub);
 
-    // Initial guess - all parameters are 0.1
+    // Initial guess - all parameters are 0.1, and intercept is mean
     double *x = palloc(sizeof(double) * n_params);
     for (int i = 0; i < n_params; i++) x[i] = 0.1;
+    if (include_c)
+    {
+        x[p + q] = arr_mean(vals, n_vals);
+    }
 
     double result;
     if (nlopt_optimize(opt, x, &result) < 0)
@@ -364,7 +405,8 @@ arima_optimise(PG_FUNCTION_ARGS)
     ArrayType *vals_arr  = PG_GETARG_ARRAYTYPE_P(0);
     int32 p = PG_GETARG_INT32(1);
     int32 q = PG_GETARG_INT32(2);
-    char* arima_method = text_to_cstring(PG_GETARG_TEXT_P(3));
+    bool include_c = PG_GETARG_BOOL(3);
+    char* arima_method = text_to_cstring(PG_GETARG_TEXT_P(4));
 
     /* Validate arguments */
     if (ARR_NDIM(vals_arr) != 1)
@@ -385,8 +427,9 @@ arima_optimise(PG_FUNCTION_ARGS)
     /* Call optimiser */
     double (*opt_objective)(unsigned, const double *, double *, void *);
     nlopt_algorithm opt_algorithm;
-    int n_params = p + q;
+    int n_params = p + q + include_c;
     opt_result_t opt_result;
+
     if (strcmp(arima_method, "Nelder-Mead") == 0)
     {
         opt_objective = _arima_objective_no_grad;
@@ -401,10 +444,12 @@ arima_optimise(PG_FUNCTION_ARGS)
     {
         elog(ERROR, "Invalid optimiser provided: %s", arima_method);
     }
-    opt_result = _arima_nlopt(vals, n_vals, p, q, opt_algorithm, arima_method, opt_objective);
+    opt_result = _arima_nlopt(vals, n_vals, p, q, include_c, opt_algorithm, arima_method, opt_objective);
 
-    /* Warn for risky bounds */
-    for (int i = 0; i < n_params; i++)
+    double c = include_c ? opt_result.params[p + q] : 0.0;
+
+    /* Warn for risky bounds on phi/theta coefficients */
+    for (int i = 0; i < n_params - include_c; i++)
     {
         double val = opt_result.params[i];
         if (val > 1.0 || val < -1.0)
@@ -415,8 +460,8 @@ arima_optimise(PG_FUNCTION_ARGS)
 
     /* Convert to arima_optimise_result return type */
     TupleDesc tupdesc;
-    Datum values[3];
-    bool nulls[3];
+    Datum values[4];
+    bool nulls[4] = {false, false, false, false};
     HeapTuple tuple;
     Datum result;
     Oid type_oid = get_call_result_type(fcinfo, NULL, &tupdesc);
@@ -435,7 +480,6 @@ arima_optimise(PG_FUNCTION_ARGS)
     }
     ArrayType *phi_converted = construct_array(phi_array, p, FLOAT8OID, sizeof(double), FLOAT8PASSBYVAL, 'd');
     values[0] = PointerGetDatum(phi_converted);
-    nulls[0] = false;
 
     // Theta array
     Datum *theta_array = palloc(sizeof(Datum) * q);
@@ -445,7 +489,9 @@ arima_optimise(PG_FUNCTION_ARGS)
     }
     ArrayType *theta_converted = construct_array(theta_array, q, FLOAT8OID, sizeof(double), FLOAT8PASSBYVAL, 'd');
     values[1] = PointerGetDatum(theta_converted);
-    nulls[1] = false;
+
+    // Constant term
+    values[2] = Float8GetDatum(c);
 
     // Residuals array
     Datum *resid_array = palloc(sizeof(Datum) * q);
@@ -454,8 +500,7 @@ arima_optimise(PG_FUNCTION_ARGS)
         resid_array[i] = Float8GetDatum(opt_result.resid[n_vals-i-1]);
     }
     ArrayType *resid_converted = construct_array(resid_array, q, FLOAT8OID, sizeof(double), FLOAT8PASSBYVAL, 'd');
-    values[2] = PointerGetDatum(resid_converted);
-    nulls[2] = false;
+    values[3] = PointerGetDatum(resid_converted);
 
     tuple = heap_form_tuple(tupdesc, values, nulls);
     result = HeapTupleGetDatum(tuple);
@@ -467,7 +512,7 @@ arima_optimise(PG_FUNCTION_ARGS)
 
 /* Forecasting values */
 static double* _arima_predict(double* values, int n_vals, double* resid, int p,
-                              int q, double* phi, double* theta, unsigned int horizon)
+                              int q, double c, double* phi, double* theta, unsigned int horizon)
 {
     double* yhat = palloc0(horizon * sizeof(double));
     double fcast, ar, ma;
@@ -503,7 +548,7 @@ static double* _arima_predict(double* values, int n_vals, double* resid, int p,
             }
             fcast += ma;
         }
-        yhat[t] = fcast;
+        yhat[t] = fcast + c; // Add intercept if provided
     }
     return yhat;
 }
@@ -516,9 +561,10 @@ arima_forecast(PG_FUNCTION_ARGS)
     ArrayType *resid_arr  = PG_GETARG_ARRAYTYPE_P(1);
     int32 p = PG_GETARG_INT32(2);
     int32 q = PG_GETARG_INT32(3);
-    ArrayType *phi_arr  = PG_GETARG_ARRAYTYPE_P(4);
-    ArrayType *theta_arr  = PG_GETARG_ARRAYTYPE_P(5);
-    int32 horizon = PG_GETARG_INT32(6);
+    float8 c = PG_GETARG_FLOAT8(4);
+    ArrayType *phi_arr  = PG_GETARG_ARRAYTYPE_P(5);
+    ArrayType *theta_arr  = PG_GETARG_ARRAYTYPE_P(6);
+    int32 horizon = PG_GETARG_INT32(7);
 
     /* Validate arguments */
     if (ARR_NDIM(vals_arr) != 1 || ARR_NDIM(resid_arr) != 1 || ARR_NDIM(phi_arr) != 1 || ARR_NDIM(theta_arr) != 1)
@@ -540,7 +586,7 @@ arima_forecast(PG_FUNCTION_ARGS)
     double *theta = pg_array_to_c_double(theta_arr, &n_theta, false, "arima_forecast");
 
     /* Predict */
-    double* yhat = _arima_predict(vals, n_vals, resid, p, q, phi, theta, horizon);
+    double* yhat = _arima_predict(vals, n_vals, resid, p, q, c, phi, theta, horizon);
 
     /* Convert to PG return type */
     Datum *darray = palloc(sizeof(Datum) * horizon);
