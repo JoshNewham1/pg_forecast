@@ -12,3 +12,9 @@ To view debug messages from psql:
 ```sql
 SET client_min_messages = 'debug5';
 ```
+
+To build and install the plugin:
+
+```bash
+sudo make install && sudo make clean && sudo -u postgres psql -d DB_NAME -c "DROP EXTENSION pg_forecast; CREATE EXTENSION pg_forecast;"
+```
