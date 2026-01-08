@@ -3,8 +3,6 @@
 #ifndef ARIMA_H
 #define ARIMA_H
 
-double css(double *vals, double *phi, double *theta, int p, int q, bool include_c, double c, int n_vals, double* grad, double* resid);
-
 typedef struct {
     double *vals;
     int n_vals;
@@ -19,5 +17,17 @@ typedef struct {
     double *resid;
     double css;
 } opt_result_t;
+
+typedef struct {
+    int n; // Number of data points
+    int p;
+    int q;
+    double css;
+    double *y_lags;
+    double *e_lags;
+} arima_inc_state_t;
+
+double css(double *vals, double *phi, double *theta, int p, int q, bool include_c, double c, int n_vals, double* grad, double* resid);
+arima_inc_state_t* css_incremental(arima_inc_state_t *state, double* phi, double* theta, double y_t);
 
 #endif

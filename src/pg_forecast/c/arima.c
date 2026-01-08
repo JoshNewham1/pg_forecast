@@ -18,6 +18,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(arima_difference);
 PG_FUNCTION_INFO_V1(arima_integrate);
 PG_FUNCTION_INFO_V1(css_loss);
+PG_FUNCTION_INFO_V1(css_loss_incremental);
 PG_FUNCTION_INFO_V1(arima_optimise);
 PG_FUNCTION_INFO_V1(arima_forecast);
 
@@ -155,14 +156,14 @@ arima_integrate(PG_FUNCTION_ARGS)
 /* 
   Calculates conditional sum of squares (CSS) and optionally the gradient
   If the gradient isn't required, leave `grad` = NULL
-  If the gradient is required, leave enough space for p+q values
+  If the gradient is required, initialise `grad` to hold p+q values
 */
 double css(double *vals, double *phi, double *theta, int p, int q, bool include_c, double c, int n_vals, double* grad, double* resid)
 {
     int ncond = max(p, q);
     memset(resid, 0, n_vals * sizeof(double));
     double ssq = 0.0;
-    double **dphi, **dtheta = NULL;
+    double **dphi = NULL, **dtheta = NULL;
     double *dc = NULL;
 
     if (grad != NULL)
@@ -277,6 +278,53 @@ double css(double *vals, double *phi, double *theta, int p, int q, bool include_
     return ssq;
 }
 
+arima_inc_state_t* css_incremental(arima_inc_state_t *state, double* phi, double* theta, double y_t)
+{
+    double e_t = y_t;
+    int p = state->p;
+    int q = state->q;
+
+    // AR part
+    for (int j = 0; j < p; j++)
+    {
+        e_t -= phi[j] * state->y_lags[j];
+    }
+
+    // MA part
+    for (int j = 0; j < q; j++)
+    {
+        e_t -= theta[j] * state->e_lags[j];
+    }
+
+    if (isfinite(e_t))
+    {
+        state->css = e_t * e_t;
+    }
+    state->n++;
+
+    /* 
+        Shift lag arrays forwards one (overwriting last element)
+        and add y_t and e_t to front
+    */
+    if (p > 0)
+    {
+        memmove(&state->y_lags[1], // Dest
+                &state->y_lags[0], // Source
+                sizeof(double) * (p - 1)); // Copy first p-1 entries
+        state->y_lags[0] = y_t;
+    }
+
+    if (q > 0)
+    {
+        memmove(&state->e_lags[1], // Dest
+                &state->e_lags[0], // Source
+                sizeof(double) * (q - 1)); // Copy first q-1 entries
+        state->e_lags[0] = e_t;
+    }
+
+    return state;
+}
+
 Datum
 css_loss(PG_FUNCTION_ARGS)
 {
@@ -316,6 +364,38 @@ css_loss(PG_FUNCTION_ARGS)
     /* CSS logic */
     double* resid = palloc(n_vals * sizeof(double));
     PG_RETURN_FLOAT8(css(vals, phi, theta, p, q, false, 0.0, n_vals, NULL, resid));
+}
+
+Datum
+css_loss_incremental(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0))
+        ereport(ERROR, (errmsg("CSS state must not be NULL")));
+    
+    ArrayType *phi_arr, *theta_arr;
+    float8 y_t = PG_GETARG_FLOAT8(1);
+    phi_arr = PG_GETARG_ARRAYTYPE_P(2);
+    theta_arr = PG_GETARG_ARRAYTYPE_P(3);
+
+    arima_inc_state_t *state = (arima_inc_state_t *) PG_GETARG_POINTER(0);
+    double *phi = (double *) ARR_DATA_PTR(phi_arr);
+    double *theta = (double *) ARR_DATA_PTR(theta_arr);
+
+    int n_phi   = ArrayGetNItems(ARR_NDIM(phi_arr), ARR_DIMS(phi_arr));
+    int n_theta = ArrayGetNItems(ARR_NDIM(theta_arr), ARR_DIMS(theta_arr));
+    if (n_phi != state->p)
+    {
+        ereport(ERROR,
+                (errmsg("phi arr must have p elements")));
+    }
+    if (n_theta != state->q)
+    {
+        ereport(ERROR,
+                (errmsg("theta arr must have q elements")));
+    }
+
+    state = css_incremental(state, phi, theta, y_t);
+    PG_RETURN_POINTER(state);
 }
 
 /* ARIMA optimisation */
