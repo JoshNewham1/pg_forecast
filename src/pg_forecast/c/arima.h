@@ -19,7 +19,7 @@ typedef struct {
 } opt_result_t;
 
 typedef struct {
-    int n; // Number of data points
+    int t; // Current time index
     int p;
     int q;
     double css;
@@ -28,6 +28,5 @@ typedef struct {
 } arima_inc_state_t;
 
 double css(double *vals, double *phi, double *theta, int p, int q, bool include_c, double c, int n_vals, double* grad, double* resid);
-arima_inc_state_t* css_incremental(arima_inc_state_t *state, double* phi, double* theta, double y_t);
 
 #endif

@@ -4,3 +4,4 @@
 **/dataset
 **/data
 src/pg_forecast/sql/pg_forecast--*.sql
+.vscode/

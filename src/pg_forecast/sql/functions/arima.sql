@@ -195,3 +195,28 @@ BEGIN
     END LOOP;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION css_incremental_transition(
+    state INTERNAL,
+    y DOUBLE PRECISION,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[]
+)
+RETURNS INTERNAL
+AS 'MODULE_PATHNAME', 'css_incremental_transition'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION css_incremental_final(state INTERNAL)
+RETURNS DOUBLE PRECISION
+AS 'MODULE_PATHNAME', 'css_incremental_final'
+LANGUAGE C IMMUTABLE;
+
+CREATE AGGREGATE css_incremental(
+    y DOUBLE PRECISION,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[]
+) (
+    SFUNC = css_incremental_transition,
+    STYPE = INTERNAL, -- Initialisation handled by C
+    FINALFUNC = css_incremental_final
+);
