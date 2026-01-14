@@ -324,15 +324,15 @@ static arima_inc_state_t* css_incremental(arima_inc_state_t *state, double* phi,
     int max_ma = min(state->t - ncond, q);
     if (max_ma > 0)
     {
-        for (int j = 0; j < q; j++)
+        for (int j = 0; j < max_ma; j++)
         {
             e_t -= theta[j] * state->e_lags[j];
         }
     }
 
+    // Skip first ncond terms
     if (state->t >= ncond)
     {
-        state->e_lags[0] = e_t;
         state->css += e_t * e_t;
     }
     state->t++;
@@ -351,15 +351,17 @@ static arima_inc_state_t* css_incremental(arima_inc_state_t *state, double* phi,
 
     if (q > 0)
     {
-        memmove(&state->e_lags[1], // Dest
-                &state->e_lags[0], // Source
-                sizeof(double) * (q - 1)); // Copy first q-1 entries
+        for (int j = 0; j < q - 1; j++)
+        {
+            state->e_lags[j + 1] = state->e_lags[j];
+        }
+
+        // Store current residual at the front
         state->e_lags[0] = e_t;
     }
 
     return state;
 }
-
 static arima_inc_state_t* css_incremental_init(int p, int q)
 {
     arima_inc_state_t *state = palloc0(sizeof(arima_inc_state_t));
