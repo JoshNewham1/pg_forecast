@@ -87,6 +87,26 @@ def css_loss_query(phi: list[float], theta: list[float], p: int, q: int, series_
     """
     return text(query_str)
 
+def css_incremental_query(phi: list[float], theta: list[float], series_id=None):
+    """
+    Build a SQLAlchemy text query to call css_incremental aggregate
+    on pg_forecast_unit_test.
+    """
+    where_clause = f"WHERE series_id = '{series_id}'" if series_id else ""
+    phi_array = ", ".join(map(str, phi))
+    theta_array = ", ".join(map(str, theta))
+
+    query_str = f"""
+        SELECT
+            (css_incremental(value,
+                ARRAY[{phi_array}]::double precision[],
+                ARRAY[{theta_array}]::double precision[]
+            )).css
+        FROM pg_forecast_unit_test
+        {where_clause};
+    """
+    return text(query_str)
+
 
 def arima_difference_query(d: int, series_id=None):
     """
@@ -199,6 +219,40 @@ def increasing(arr):
             return False
     return True
 
+def assert_css_matches_incremental(
+    test_engine,
+    phi,
+    theta,
+    p,
+    q,
+    series_id,
+    tolerance=1e-6
+):
+    css_query = css_loss_query(
+        phi=phi,
+        theta=theta,
+        p=p,
+        q=q,
+        series_id=series_id
+    )
+
+    inc_query = css_incremental_query(
+        phi=phi,
+        theta=theta,
+        series_id=series_id
+    )
+
+    with test_engine.connect() as conn:
+        css_value = conn.execute(css_query).scalar()
+        inc_value = conn.execute(inc_query).scalar()
+
+    assert_close(
+        inc_value,
+        css_value,
+        tolerance=tolerance,
+        name="css_incremental vs css_loss"
+    )
+
 
 def setup_basic_dataset(test_engine):
     with test_engine.connect() as conn:
@@ -267,6 +321,55 @@ def test_css_loss_p_2_q_2(test_engine):
     with test_engine.connect() as conn:
         result = conn.execute(query).scalar()
     assert_close(result, 23.0322)
+
+def test_css_incremental_matches_css_loss_p_1_q_1(test_engine):
+    setup_basic_dataset(test_engine)
+
+    assert_css_matches_incremental(
+        test_engine=test_engine,
+        phi=[0.5],
+        theta=[0.3],
+        p=1,
+        q=1,
+        series_id="TestSeries"
+    )
+
+def test_css_incremental_matches_css_loss_p_2_q_1(test_engine):
+    setup_basic_dataset(test_engine)
+
+    assert_css_matches_incremental(
+        test_engine=test_engine,
+        phi=[0.5, 0.5],
+        theta=[0.3],
+        p=2,
+        q=1,
+        series_id="TestSeries"
+    )
+
+def test_css_incremental_matches_css_loss_p_2_q_2(test_engine):
+    setup_basic_dataset(test_engine)
+
+    assert_css_matches_incremental(
+        test_engine=test_engine,
+        phi=[0.5, 0.25],
+        theta=[0.3, 0.5],
+        p=2,
+        q=2,
+        series_id="TestSeries"
+    )
+
+def test_css_incremental_matches_css_loss_large_input(test_engine):
+    setup_large_dataset(test_engine)
+
+    assert_css_matches_incremental(
+        test_engine=test_engine,
+        phi=[0.9],
+        theta=[0.4],
+        p=1,
+        q=1,
+        series_id="BigSeries",
+        tolerance=1e-4  # slightly looser for large accumulation
+    )
 
 
 def test_arima_difference_d_1(test_engine):

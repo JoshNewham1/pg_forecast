@@ -20,6 +20,19 @@ double* pg_array_to_c_double(ArrayType* inp_arr, int* out_n, bool accept_nulls,
     return out_arr;
 }
 
+ArrayType* build_float8_array(double* arr, int size)
+{
+    Datum *darray = palloc(sizeof(Datum) * size);
+    for (int i = 0; i < size; i++)
+    {
+        darray[i] = Float8GetDatum(arr[i]);
+    }
+    ArrayType *pg_arr = construct_array(darray, size, FLOAT8OID,
+                                        sizeof(double), FLOAT8PASSBYVAL,
+                                        'd');
+    return pg_arr;
+}
+
 /* Maths helpers */
 double arr_mean(double *x, int n)
 {

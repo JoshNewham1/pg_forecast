@@ -196,6 +196,15 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE TYPE css_incremental_state AS (
+    t INT,
+    p INT,
+    q INT,
+    y_lags DOUBLE PRECISION[],
+    e_lags DOUBLE PRECISION[],
+    css DOUBLE PRECISION
+);
+
 CREATE FUNCTION css_incremental_transition(
     state INTERNAL,
     y DOUBLE PRECISION,
@@ -207,7 +216,7 @@ AS 'MODULE_PATHNAME', 'css_incremental_transition'
 LANGUAGE C IMMUTABLE;
 
 CREATE FUNCTION css_incremental_final(state INTERNAL)
-RETURNS DOUBLE PRECISION
+RETURNS css_incremental_state
 AS 'MODULE_PATHNAME', 'css_incremental_final'
 LANGUAGE C IMMUTABLE;
 

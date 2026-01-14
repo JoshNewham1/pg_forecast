@@ -10,6 +10,8 @@
 double* pg_array_to_c_double(ArrayType* inp_arr, int* out_n, bool accept_nulls,
                             const char* caller);
 
+ArrayType* build_float8_array(double* arr, int size);
+
 /* Maths helpers */
 double arr_mean(double *x, int n);
 #define max(a,b) \

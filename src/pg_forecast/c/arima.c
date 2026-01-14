@@ -68,14 +68,7 @@ arima_difference(PG_FUNCTION_ARGS)
     }
 
     /* Convert to PG return type */
-    Datum *darray = palloc(sizeof(Datum) * (n_vals - d));
-    for (int i = 0; i < n_vals - d; i++)
-    {
-        darray[i] = Float8GetDatum(vals[i]);
-    }
-    ArrayType *pg_differenced = construct_array(darray, n_vals - d, FLOAT8OID,
-                                                sizeof(double), FLOAT8PASSBYVAL,
-                                                'd');
+    ArrayType *pg_differenced = build_float8_array(vals, n_vals - d);
     PG_RETURN_ARRAYTYPE_P(pg_differenced);
 }
 
@@ -142,14 +135,7 @@ arima_integrate(PG_FUNCTION_ARGS)
     }
 
     /* Convert to PG return type */
-    Datum *darray = palloc(sizeof(Datum) * (n_diff + d));
-    for (int i = 0; i < n_diff + d; i++)
-    {
-        darray[i] = Float8GetDatum(integrated[i]);
-    }
-    ArrayType *pg_integrated = construct_array(darray, n_diff + d, FLOAT8OID,
-                                               sizeof(double), FLOAT8PASSBYVAL,
-                                               'd');
+    ArrayType *pg_integrated = build_float8_array(integrated, n_diff + d);
     PG_RETURN_ARRAYTYPE_P(pg_integrated);
 }
 
@@ -440,7 +426,22 @@ Datum
 css_incremental_final(PG_FUNCTION_ARGS)
 {
     arima_inc_state_t *state = (arima_inc_state_t *) PG_GETARG_POINTER(0);
-    PG_RETURN_FLOAT8(state->css);
+    TupleDesc tupdesc;
+    Datum values[6];
+    bool nulls[6] = {false};
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        elog(ERROR, "return type must be composite");
+
+    values[0] = Int32GetDatum(state->t);
+    values[1] = Int32GetDatum(state->p);
+    values[2] = Int32GetDatum(state->q);
+    values[3] = PointerGetDatum(build_float8_array(state->y_lags, state->p));
+    values[4] = PointerGetDatum(build_float8_array(state->e_lags, state->q));
+    values[5] = Float8GetDatum(state->css);
+
+    HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
+    PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
 
 /* ARIMA optimisation */
@@ -704,13 +705,6 @@ arima_forecast(PG_FUNCTION_ARGS)
     double* yhat = _arima_predict(vals, n_vals, resid, p, q, c, phi, theta, horizon);
 
     /* Convert to PG return type */
-    Datum *darray = palloc(sizeof(Datum) * horizon);
-    for (int i = 0; i < horizon; i++)
-    {
-        darray[i] = Float8GetDatum(yhat[i]);
-    }
-    ArrayType *pg_yhat = construct_array(darray, horizon, FLOAT8OID,
-                                        sizeof(double), FLOAT8PASSBYVAL,
-                                        'd');
+    ArrayType *pg_yhat = build_float8_array(yhat, horizon);
     PG_RETURN_ARRAYTYPE_P(pg_yhat);
 }
