@@ -48,7 +48,9 @@ CREATE OR REPLACE FUNCTION autoarima_train(
     date_col TEXT,     -- Timestamp column
     value_col TEXT     -- Numerical value column
 )
-RETURNS autoarima_rec AS $$
+RETURNS autoarima_rec
+SECURITY DEFINER
+AS $$
 DECLARE
     MAX_DIFF CONSTANT INT := 2;
     MAX_KPSS_TRIES CONSTANT INT := 3;
@@ -67,7 +69,11 @@ DECLARE
     model_aicc DOUBLE PRECISION;
     rec_current autoarima_rec;
     best_aicc DOUBLE PRECISION := 'Infinity';
+    v_model_id INT;
+    rec_state RECORD;
+    v_incremental_state css_incremental_state;
 BEGIN
+    PERFORM set_config('search_path', 'public,pg_temp', true);
     -- Aggregate the series into an array
     EXECUTE format(
         'SELECT array_agg(%I ORDER BY %I) FROM %I',
@@ -174,19 +180,27 @@ BEGIN
                 WHERE t.p = v_p AND t.d = v_d AND t.q = v_q
             );
 
-            trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, include_c);
-            n_params := autoarima_param_count(v_p, v_q, include_c);
-            model_aicc := aicc(trained.css, v_p, v_q, n_params, n_vals);
+            BEGIN
+                trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, include_c);
+                RAISE DEBUG 'AutoARIMA: Trained ARIMA(%, %, %) with CSS %', v_p, v_d, v_q, trained.css;
+                n_params := autoarima_param_count(v_p, v_q, include_c);
+                model_aicc := aicc(trained.css, v_p, v_q, n_params, n_vals);
 
-            INSERT INTO tmp_autoarima (
-                p, d, q, c, phi, theta, css, aicc
-            ) VALUES (
-                v_p, v_d, v_q, trained.c, trained.phi, trained.theta, trained.css, model_aicc
-            );
+                INSERT INTO tmp_autoarima (
+                    p, d, q, c, phi, theta, css, aicc
+                ) VALUES (
+                    v_p, v_d, v_q, trained.c, trained.phi, trained.theta, trained.css, model_aicc
+                );
 
-            IF model_aicc < best_aicc THEN
-                best_aicc := model_aicc;
-            END IF;
+                IF model_aicc < best_aicc THEN
+                    best_aicc := model_aicc;
+                END IF;
+            -- Skip if training failed
+            EXCEPTION
+                WHEN OTHERS THEN
+                RAISE DEBUG 'AutoARIMA: Skipping ARIMA(%, %, %) due to error: %',
+                    v_p, v_d, v_q, SQLERRM;
+            END;
         END LOOP;
 
         -- Train with/without constant
@@ -215,6 +229,44 @@ BEGIN
         ORDER BY aicc
         LIMIT 1;
     END LOOP;
+
+    -- Create entry in models & stats tables to incrementally update CSS
+    INSERT INTO models(model_type, input_table, date_column, value_column)
+    VALUES (
+        'autoarima'::model,
+        source_table,
+        date_col,
+        value_col
+    )
+    ON CONFLICT (model_type, input_table, date_column, value_column)
+    DO UPDATE SET model_type = models.model_type  -- No op
+    RETURNING id
+    INTO v_model_id;
+
+    -- Get starting incremental state (from every value in the table)
+    EXECUTE format(
+        'SELECT (css_incremental(%I, %L, %L) OVER (ORDER BY %I)) AS s
+        FROM %I
+        GROUP BY %I
+        ORDER BY %I DESC
+        LIMIT 1',
+
+        value_col,
+        rec_current.phi,
+        rec_current.theta,
+        date_col,
+        source_table,
+        date_col,
+        date_col
+    )
+    INTO rec_state;
+    v_incremental_state := rec_state.s;
+    
+    INSERT INTO model_css_stats(model_id, phi, theta, is_active, incremental_state)
+    VALUES (v_model_id, rec_current.phi, rec_current.theta, TRUE, v_incremental_state)
+    ON CONFLICT (model_id, phi, theta)
+    DO UPDATE
+    SET is_active = TRUE, incremental_state = v_incremental_state;
 
     RAISE NOTICE 'AutoARIMA: Best model found ARIMA(%,%,%) with CSS % and AICc %',
     rec_current.p, rec_current.d, rec_current.q, rec_current.css, rec_current.aicc;

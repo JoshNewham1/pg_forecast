@@ -1,5 +1,5 @@
 # In-DB Forecasting extension
-comment = ''
+comment = 'Efficient, incremental time series forecasting extension'
 default_version = '1.0'
 module_pathname = '$libdir/pg_forecast'
 relocatable = false
