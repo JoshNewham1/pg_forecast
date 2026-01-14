@@ -35,7 +35,7 @@ CREATE TYPE autoarima_rec AS (
 );
 
 -- Helper function to calculate number of parameters
-CREATE FUNCTION autoarima_param_count(p INT, q INT, include_c BOOLEAN)
+CREATE OR REPLACE FUNCTION autoarima_param_count(p INT, q INT, include_c BOOLEAN)
 RETURNS INT AS $$
 BEGIN
     RETURN p + q + CASE WHEN include_c THEN 1 ELSE 0 END;
@@ -70,9 +70,9 @@ DECLARE
     rec_current autoarima_rec;
     best_aicc DOUBLE PRECISION := 'Infinity';
     v_model_id INT;
-    rec_state RECORD;
     v_incremental_state css_incremental_state;
 BEGIN
+    -- Safety precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
     -- Aggregate the series into an array
     EXECUTE format(
@@ -244,23 +244,7 @@ BEGIN
     INTO v_model_id;
 
     -- Get starting incremental state (from every value in the table)
-    EXECUTE format(
-        'SELECT (css_incremental(%I, %L, %L) OVER (ORDER BY %I)) AS s
-        FROM %I
-        GROUP BY %I
-        ORDER BY %I DESC
-        LIMIT 1',
-
-        value_col,
-        rec_current.phi,
-        rec_current.theta,
-        date_col,
-        source_table,
-        date_col,
-        date_col
-    )
-    INTO rec_state;
-    v_incremental_state := rec_state.s;
+    v_incremental_state := css_incremental_helper(source_table, value_col, date_col, rec_current.phi, rec_current.theta);
     
     INSERT INTO model_arima_stats(model_id, phi, theta, d, is_active, incremental_state)
     VALUES (v_model_id, rec_current.phi, rec_current.theta, rec_current.d, TRUE, v_incremental_state)

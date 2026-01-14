@@ -196,6 +196,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Incremental update logic
 CREATE TYPE css_incremental_state AS (
     t INT,
     p INT,
@@ -240,3 +241,134 @@ CREATE TABLE model_arima_stats(
     incremental_state css_incremental_state NOT NULL,
     UNIQUE (model_id, phi, theta)
 );
+
+CREATE OR REPLACE FUNCTION css_incremental_helper(
+    source_table TEXT,
+    value_col TEXT,
+    date_col TEXT,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[]
+)
+RETURNS css_incremental_state AS $$
+DECLARE
+    rec_state RECORD;
+BEGIN
+    EXECUTE format(
+        'SELECT (css_incremental(%I, %L, %L) OVER (ORDER BY %I)) AS s
+         FROM %I
+         GROUP BY %I
+         ORDER BY %I DESC
+         LIMIT 1',
+        value_col,
+        phi,
+        theta,
+        date_col,
+        source_table,
+        date_col,
+        date_col
+    ) INTO rec_state;
+    RETURN rec_state.s;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE arima_vertices (
+    arima_id INT NOT NULL REFERENCES model_arima_stats(id),
+    vertex_id INT NOT NULL,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    incremental_state css_incremental_state NOT NULL,
+    PRIMARY KEY (arima_id, vertex_id)
+);
+
+-- Create Simplex vertices for incremental bound checking
+CREATE OR REPLACE FUNCTION arima_create_simplex_vertices(
+    centre_id INT, -- ID of model to target (centre vector) in model_arima_stats
+    tolerance DOUBLE PRECISION DEFAULT 0.05 -- 0.05 empirically found by Rosenthal & Lehner
+)
+RETURNS VOID
+SECURITY DEFINER
+AS $$
+DECLARE
+    rec_centre RECORD;
+    rec_vertex RECORD;
+    v_d INT;
+    i INT;
+    v_phi DOUBLE PRECISION[];
+    v_theta DOUBLE PRECISION[];
+    v_phi_new DOUBLE PRECISION[];
+    v_theta_new DOUBLE PRECISION[];
+    rec_state RECORD;
+    v_state_new css_incremental_state;
+    v_dist_from_origin DOUBLE PRECISION;
+    v_scale_factor DOUBLE PRECISION;
+BEGIN
+    -- Safety precaution for SECURITY DEFINER
+    PERFORM set_config('search_path', 'public,pg_temp', true);
+
+    -- Find centre point
+    SELECT
+        m.input_table,
+        m.value_column,
+        m.date_column,
+        s.*
+    INTO rec_centre
+    FROM model_arima_stats s
+    INNER JOIN models m ON m.id = s.model_id
+    WHERE s.id = centre_id AND s.is_active = TRUE;
+
+    -- Clear old vertices
+    DELETE FROM arima_vertices
+    WHERE arima_id = centre_id;
+
+    IF rec_centre IS NULL THEN
+        RAISE EXCEPTION 'Could not create vertices for ARIMA ID %', centre_id;
+        RETURN;
+    END IF;
+
+    v_d := cardinality(rec_centre.phi) + cardinality(rec_centre.theta);
+    v_phi = rec_centre.phi;
+    v_theta := rec_centre.theta;
+
+    -- Create the first d vertices (add +/- tolerance to all dimensions)
+    FOR i IN 1..v_d LOOP
+        v_phi_new := rec_centre.phi;
+        v_theta_new := rec_centre.theta;
+
+        IF i <= cardinality(rec_centre.phi) THEN
+            v_phi_new[i] := v_phi[i] + (CASE WHEN v_phi[i] >= 0 THEN tolerance ELSE -tolerance END);
+        ELSE
+            v_theta_new[i - cardinality(v_phi)] := v_theta[i - cardinality(v_phi)] + 
+                (CASE WHEN v_theta[i - cardinality(v_phi)] >= 0 THEN tolerance ELSE -tolerance END);
+        END IF;
+
+        v_state_new := css_incremental_helper(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new);
+
+        INSERT INTO arima_vertices(arima_id, vertex_id, phi, theta, incremental_state)
+        VALUES (centre_id, i, v_phi_new, v_theta_new, v_state_new);
+    END LOOP;
+
+    -- Add (d+1)th vertex
+    -- Norm of the centre vector
+    SELECT sqrt(SUM(val^2)) INTO v_dist_from_origin 
+    FROM (SELECT unnest(v_phi || v_theta) as val) s;
+
+    -- Scale toward origin so the distance from centre is tolerance
+    -- new_vector = centre * (1 - tol/dist)
+    IF v_dist_from_origin > tolerance THEN
+        v_scale_factor := 1.0 - (tolerance / v_dist_from_origin);
+    ELSE
+        v_scale_factor := 0.5; -- Fallback for near-zero vectors
+    END IF;
+
+    SELECT array_agg(val * v_scale_factor) INTO v_phi_new 
+    FROM unnest(v_phi) val;
+    
+    SELECT array_agg(val * v_scale_factor) INTO v_theta_new 
+    FROM unnest(v_theta) val;
+
+    v_state_new := css_incremental_helper(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new);
+
+    INSERT INTO arima_vertices(arima_id, vertex_id, phi, theta, incremental_state)
+    VALUES (centre_id, v_d+1, v_phi_new, v_theta_new, v_state_new);
+END;
+$$ LANGUAGE plpgsql;
