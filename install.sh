@@ -7,8 +7,8 @@ if [ -z "$INDB_VENV" ]; then
 fi
 
 # Install TFB Python dependencies
-pip install virtualenv
-python3 -m virtualenv "$INDB_VENV.venv"
+pip install venv
+python3 -m venv "$INDB_VENV.venv"
 source "$INDB_VENV.venv/bin/activate"
 pip install -r requirements.txt
 
