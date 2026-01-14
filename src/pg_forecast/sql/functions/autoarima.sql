@@ -262,11 +262,10 @@ BEGIN
     INTO rec_state;
     v_incremental_state := rec_state.s;
     
-    INSERT INTO model_css_stats(model_id, phi, theta, is_active, incremental_state)
-    VALUES (v_model_id, rec_current.phi, rec_current.theta, TRUE, v_incremental_state)
+    INSERT INTO model_arima_stats(model_id, phi, theta, d, is_active, incremental_state)
+    VALUES (v_model_id, rec_current.phi, rec_current.theta, rec_current.d, TRUE, v_incremental_state)
     ON CONFLICT (model_id, phi, theta)
-    DO UPDATE
-    SET is_active = TRUE, incremental_state = v_incremental_state;
+    DO UPDATE SET incremental_state = v_incremental_state;
 
     RAISE NOTICE 'AutoARIMA: Best model found ARIMA(%,%,%) with CSS % and AICc %',
     rec_current.p, rec_current.d, rec_current.q, rec_current.css, rec_current.aicc;

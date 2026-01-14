@@ -230,11 +230,12 @@ CREATE AGGREGATE css_incremental(
     FINALFUNC = css_incremental_final
 );
 
-CREATE TABLE model_css_stats(
+CREATE TABLE model_arima_stats(
     id BIGSERIAL PRIMARY KEY,
     model_id INT NOT NULL REFERENCES models(id),
     phi DOUBLE PRECISION[] NOT NULL,
     theta DOUBLE PRECISION[] NOT NULL,
+    d INT NOT NULL,
     is_active BOOLEAN NOT NULL,
     incremental_state css_incremental_state NOT NULL,
     UNIQUE (model_id, phi, theta)
