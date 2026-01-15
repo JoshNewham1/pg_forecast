@@ -250,7 +250,9 @@ BEGIN
     INTO v_arima_id;
 
     -- Generate simplex vertices for bounds checking
-    PERFORM arima_create_simplex_vertices(v_arima_id);
+    IF NOT arima_has_vertices(v_arima_id) THEN
+        PERFORM arima_create_simplex_vertices(v_arima_id);
+    END IF;
 
     -- Register trigger on table
     EXECUTE format('

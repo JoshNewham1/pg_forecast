@@ -259,6 +259,7 @@ def assert_css_matches_incremental(
 def setup_basic_dataset(test_engine):
     with test_engine.connect() as conn:
         conn.execute(text("""
+        TRUNCATE TABLE pg_forecast_unit_test;
         INSERT INTO pg_forecast_unit_test (t, series_id, value) VALUES
         ('2023-01-01 00:00:00', 'TestSeries', 10.0), -- x_1
         ('2023-01-02 00:00:00', 'TestSeries', 10.5), -- x_2
@@ -605,6 +606,7 @@ def test_autoarima_finds_low_loss_model(test_engine):
     with test_engine.connect() as conn:
         # Generate an AR(1) process: x_t = 0.8 * x_{t-1} + noise
         conn.execute(text("""
+            SELECT remove_forecast('autoarima', 'pg_forecast_unit_test', 't', 'value');
             TRUNCATE TABLE pg_forecast_unit_test;
             INSERT INTO pg_forecast_unit_test (t, series_id, value)
             SELECT 
@@ -650,6 +652,7 @@ def test_autoarima_trigger_on_outliers(test_engine):
         # 1. Train the initial model
         # This populates models and model_arima_stats
         train_result = conn.execute(text("""
+            SELECT remove_forecast('autoarima', 'pg_forecast_unit_test', 't', 'value');
             SELECT p, d, q, c, phi, theta 
             FROM autoarima_train(4, 'pg_forecast_unit_test', 't', 'value');
         """)).fetchone()
@@ -662,6 +665,8 @@ def test_autoarima_trigger_on_outliers(test_engine):
         parent_model_id = conn.execute(text("""
             SELECT model_get_id('autoarima', 'pg_forecast_unit_test', 't', 'value')
         """)).scalar()
+
+        print(f"model: {parent_model_id}, phi: {phi}, theta: {theta}, d: {d}, c: {c}")
 
         initial_arima_id = conn.execute(text("""
             SELECT arima_get_active_id(:mid, :phi, :theta, :d, :c)

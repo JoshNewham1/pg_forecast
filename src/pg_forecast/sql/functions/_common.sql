@@ -74,3 +74,34 @@ BEGIN
     RETURN rec_result.id;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION remove_forecast(
+    model_type model,
+    input_table TEXT,
+    date_column TEXT,
+    value_column TEXT
+)
+RETURNS BOOLEAN
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_deleted_id BIGINT;
+BEGIN
+    -- Safety precaution for SECURITY DEFINER
+    PERFORM set_config('search_path', 'public,pg_temp', true);
+
+    EXECUTE format(
+        'DELETE FROM models
+        WHERE model_type = %L AND input_table = %L AND date_column = %L AND value_column = %L
+        RETURNING id',
+        
+        model_type, input_table, date_column, value_column
+    ) INTO v_deleted_id;
+
+    IF v_deleted_id IS NOT NULL THEN
+        RETURN TRUE;
+    ELSE
+        RETURN FALSE;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;

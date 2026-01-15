@@ -259,7 +259,7 @@ CREATE AGGREGATE css_incremental(
 
 CREATE TABLE model_arima_stats(
     id BIGSERIAL PRIMARY KEY,
-    model_id INT NOT NULL REFERENCES models(id),
+    model_id INT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
     phi DOUBLE PRECISION[] NOT NULL,
     theta DOUBLE PRECISION[] NOT NULL,
     d INT NOT NULL,
@@ -330,13 +330,38 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TABLE arima_vertices (
-    arima_id BIGINT NOT NULL REFERENCES model_arima_stats(id),
+    arima_id BIGINT NOT NULL REFERENCES model_arima_stats(id) ON DELETE CASCADE,
     vertex_id INT NOT NULL,
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
     incremental_state css_incremental_state NOT NULL,
     PRIMARY KEY (arima_id, vertex_id)
 );
+
+CREATE OR REPLACE FUNCTION arima_has_vertices(
+    arima_id BIGINT
+)
+RETURNS BOOLEAN
+SECURITY DEFINER
+AS $$
+DECLARE
+    rec_result RECORD;
+BEGIN
+    -- Safety precaution for SECURITY DEFINER
+    PERFORM set_config('search_path', 'public,pg_temp', true);
+
+    EXECUTE format(
+        'SELECT 1 AS result
+        FROM arima_vertices
+        WHERE arima_id = %L
+        LIMIT 1',
+        
+        arima_id
+    ) INTO rec_result;
+
+    RETURN rec_result.result IS NOT NULL;
+END;
+$$ LANGUAGE plpgsql;
 
 -- Create Simplex vertices for incremental bound checking
 CREATE OR REPLACE FUNCTION arima_create_simplex_vertices(
@@ -374,14 +399,14 @@ BEGIN
     INNER JOIN models m ON m.id = s.model_id
     WHERE s.id = centre_id AND s.is_active = TRUE;
 
-    -- Clear old vertices
-    DELETE FROM arima_vertices
-    WHERE arima_id = centre_id;
-
     IF rec_centre IS NULL THEN
         RAISE EXCEPTION 'Could not create vertices for ARIMA ID %', centre_id;
         RETURN;
     END IF;
+
+    -- Clear old vertices
+    DELETE FROM arima_vertices
+    WHERE arima_id = rec_centre.id;
 
     v_d := cardinality(rec_centre.phi) + cardinality(rec_centre.theta);
     v_phi = rec_centre.phi;
