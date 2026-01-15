@@ -19,7 +19,8 @@ PG_FUNCTION_INFO_V1(arima_difference);
 PG_FUNCTION_INFO_V1(arima_integrate);
 PG_FUNCTION_INFO_V1(css_loss);
 PG_FUNCTION_INFO_V1(css_incremental_transition);
-PG_FUNCTION_INFO_V1(css_incremental_final);
+PG_FUNCTION_INFO_V1(_css_incremental_transition);
+PG_FUNCTION_INFO_V1(_css_incremental_final);
 PG_FUNCTION_INFO_V1(arima_optimise);
 PG_FUNCTION_INFO_V1(arima_forecast);
 
@@ -362,6 +363,23 @@ static arima_inc_state_t* css_incremental(arima_inc_state_t *state, double* phi,
 
     return state;
 }
+
+static Datum _css_incremental_build_record(arima_inc_state_t *state, TupleDesc tupdesc)
+{
+    Datum values[6];
+    bool nulls[6] = {false};
+
+    values[0] = Int32GetDatum(state->t);
+    values[1] = Int32GetDatum(state->p);
+    values[2] = Int32GetDatum(state->q);
+    values[3] = PointerGetDatum(build_float8_array(state->y_lags, state->p));
+    values[4] = PointerGetDatum(build_float8_array(state->e_lags, state->q));
+    values[5] = Float8GetDatum(state->css);
+
+    HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
+    return HeapTupleGetDatum(tuple);
+}
+
 static arima_inc_state_t* css_incremental_init(int p, int q)
 {
     arima_inc_state_t *state = palloc0(sizeof(arima_inc_state_t));
@@ -385,6 +403,74 @@ static arima_inc_state_t* css_incremental_init(int p, int q)
 
 Datum
 css_incremental_transition(PG_FUNCTION_ARGS)
+{
+    HeapTupleHeader tup_header = PG_GETARG_HEAPTUPLEHEADER(0); // css_incremental_state arg
+    Oid tup_type = HeapTupleHeaderGetTypeId(tup_header);
+    int tup_typmod = HeapTupleHeaderGetTypMod(tup_header);
+    TupleDesc tupdesc = lookup_rowtype_tupdesc(tup_type, tup_typmod);
+    HeapTupleData tup_data;
+    tup_data.t_len = HeapTupleHeaderGetDatumLength(tup_header);
+    tup_data.t_data = tup_header;
+
+    /*
+        Get all values from the css_incremental_state record
+        and put into a struct
+    */
+    bool is_null;
+    int t = DatumGetInt32(heap_getattr(&tup_data, 1, tupdesc, &is_null));
+    if (is_null) ereport(ERROR, (errmsg("css_incremental: t cannot be NULL")));
+    int p = DatumGetInt32(heap_getattr(&tup_data, 2, tupdesc, &is_null));
+    if (is_null) ereport(ERROR, (errmsg("css_incremental: p cannot be NULL")));
+    int q = DatumGetInt32(heap_getattr(&tup_data, 3, tupdesc, &is_null));
+    if (is_null) ereport(ERROR, (errmsg("css_incremental: q cannot be NULL")));
+
+    ArrayType *y_lags_arr = DatumGetArrayTypeP(heap_getattr(&tup_data, 4, tupdesc, &is_null));
+    if (is_null) ereport(ERROR, (errmsg("css_incremental: y_lags cannot be NULL")));
+    ArrayType *e_lags_arr = DatumGetArrayTypeP(heap_getattr(&tup_data, 5, tupdesc, &is_null));
+    if (is_null) ereport(ERROR, (errmsg("css_incremental: e_lags cannot be NULL")));
+    double *y_lags = (double *) ARR_DATA_PTR(y_lags_arr);
+    double *e_lags = (double *) ARR_DATA_PTR(e_lags_arr);
+
+    double css = DatumGetFloat8(heap_getattr(&tup_data, 6, tupdesc, &is_null));
+    if (is_null) ereport(ERROR, (errmsg("css_incremental: css cannot be NULL")));
+    
+    arima_inc_state_t *state = palloc0(sizeof(arima_inc_state_t));
+    state->t = t;
+    state->p = p;
+    state->q = q;
+    state->css = css;
+    state->y_lags = y_lags;
+    state->e_lags = e_lags;
+
+    // Fetch other args (y, phi, theta)
+    ArrayType *phi_arr, *theta_arr;
+    float8 y_t = PG_GETARG_FLOAT8(1);
+    phi_arr = PG_GETARG_ARRAYTYPE_P(2);
+    theta_arr = PG_GETARG_ARRAYTYPE_P(3);
+    double *phi = (double *) ARR_DATA_PTR(phi_arr);
+    double *theta = (double *) ARR_DATA_PTR(theta_arr);
+
+    int n_phi   = ArrayGetNItems(ARR_NDIM(phi_arr), ARR_DIMS(phi_arr));
+    int n_theta = ArrayGetNItems(ARR_NDIM(theta_arr), ARR_DIMS(theta_arr));
+    if (n_phi != p)
+    {
+        ereport(ERROR,
+                (errmsg("phi arr must have p elements")));
+    }
+    if (n_theta != q)
+    {
+        ereport(ERROR,
+                (errmsg("theta arr must have q elements")));
+    }
+
+    state = css_incremental(state, phi, theta, y_t);
+
+    ReleaseTupleDesc(tupdesc);
+    PG_RETURN_DATUM(_css_incremental_build_record(state, tupdesc));
+}
+
+Datum
+_css_incremental_transition(PG_FUNCTION_ARGS)
 {
     ArrayType *phi_arr, *theta_arr;
     float8 y_t = PG_GETARG_FLOAT8(1);
@@ -425,25 +511,15 @@ css_incremental_transition(PG_FUNCTION_ARGS)
 }
 
 Datum
-css_incremental_final(PG_FUNCTION_ARGS)
+_css_incremental_final(PG_FUNCTION_ARGS)
 {
     arima_inc_state_t *state = (arima_inc_state_t *) PG_GETARG_POINTER(0);
     TupleDesc tupdesc;
-    Datum values[6];
-    bool nulls[6] = {false};
 
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         elog(ERROR, "return type must be composite");
 
-    values[0] = Int32GetDatum(state->t);
-    values[1] = Int32GetDatum(state->p);
-    values[2] = Int32GetDatum(state->q);
-    values[3] = PointerGetDatum(build_float8_array(state->y_lags, state->p));
-    values[4] = PointerGetDatum(build_float8_array(state->e_lags, state->q));
-    values[5] = Float8GetDatum(state->css);
-
-    HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
-    PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+    PG_RETURN_DATUM(_css_incremental_build_record(state, tupdesc));
 }
 
 /* ARIMA optimisation */

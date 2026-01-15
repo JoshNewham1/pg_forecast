@@ -244,7 +244,7 @@ BEGIN
     INTO v_model_id;
 
     -- Get starting incremental state (from every value in the table)
-    v_incremental_state := css_incremental_helper(source_table, value_col, date_col, rec_current.phi, rec_current.theta);
+    v_incremental_state := css_incremental_full_table(source_table, value_col, date_col, rec_current.phi, rec_current.theta);
     
     INSERT INTO model_arima_stats(model_id, phi, theta, d, is_active, incremental_state)
     VALUES (v_model_id, rec_current.phi, rec_current.theta, rec_current.d, TRUE, v_incremental_state)

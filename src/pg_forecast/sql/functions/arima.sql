@@ -207,18 +207,28 @@ CREATE TYPE css_incremental_state AS (
 );
 
 CREATE FUNCTION css_incremental_transition(
+    state css_incremental_state,
+    y DOUBLE PRECISION,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[]
+)
+RETURNS css_incremental_state
+AS 'MODULE_PATHNAME', 'css_incremental_transition'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION _css_incremental_transition(
     state INTERNAL,
     y DOUBLE PRECISION,
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[]
 )
 RETURNS INTERNAL
-AS 'MODULE_PATHNAME', 'css_incremental_transition'
+AS 'MODULE_PATHNAME', '_css_incremental_transition'
 LANGUAGE C IMMUTABLE;
 
-CREATE FUNCTION css_incremental_final(state INTERNAL)
+CREATE FUNCTION _css_incremental_final(state INTERNAL)
 RETURNS css_incremental_state
-AS 'MODULE_PATHNAME', 'css_incremental_final'
+AS 'MODULE_PATHNAME', '_css_incremental_final'
 LANGUAGE C IMMUTABLE;
 
 CREATE AGGREGATE css_incremental(
@@ -226,9 +236,9 @@ CREATE AGGREGATE css_incremental(
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[]
 ) (
-    SFUNC = css_incremental_transition,
+    SFUNC = _css_incremental_transition,
     STYPE = INTERNAL, -- Initialisation handled by C
-    FINALFUNC = css_incremental_final
+    FINALFUNC = _css_incremental_final
 );
 
 CREATE TABLE model_arima_stats(
@@ -242,7 +252,7 @@ CREATE TABLE model_arima_stats(
     UNIQUE (model_id, phi, theta)
 );
 
-CREATE OR REPLACE FUNCTION css_incremental_helper(
+CREATE OR REPLACE FUNCTION css_incremental_full_table(
     source_table TEXT,
     value_col TEXT,
     date_col TEXT,
@@ -341,7 +351,7 @@ BEGIN
                 (CASE WHEN v_theta[i - cardinality(v_phi)] >= 0 THEN tolerance ELSE -tolerance END);
         END IF;
 
-        v_state_new := css_incremental_helper(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new);
+        v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new);
 
         INSERT INTO arima_vertices(arima_id, vertex_id, phi, theta, incremental_state)
         VALUES (centre_id, i, v_phi_new, v_theta_new, v_state_new);
@@ -366,7 +376,7 @@ BEGIN
     SELECT array_agg(val * v_scale_factor) INTO v_theta_new 
     FROM unnest(v_theta) val;
 
-    v_state_new := css_incremental_helper(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new);
+    v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new);
 
     INSERT INTO arima_vertices(arima_id, vertex_id, phi, theta, incremental_state)
     VALUES (centre_id, v_d+1, v_phi_new, v_theta_new, v_state_new);
