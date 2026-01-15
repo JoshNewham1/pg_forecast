@@ -3,7 +3,8 @@ CREATE FUNCTION css_loss(
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
     p INT,
-    q INT
+    q INT,
+    c DOUBLE PRECISION DEFAULT 0.0 -- Constant term, leave as 0 if not required
 )
 RETURNS DOUBLE PRECISION
 AS 'MODULE_PATHNAME', 'css_loss'
@@ -67,7 +68,8 @@ CREATE OR REPLACE FUNCTION arima_train(
     date_col TEXT,     -- Timestamp column
     value_col TEXT,    -- Numerical value column
     include_mean BOOLEAN DEFAULT TRUE,
-    optimiser TEXT DEFAULT 'L-BFGS'
+    silent_error BOOLEAN DEFAULT FALSE,
+    optimiser TEXT DEFAULT 'Nelder-Mead'
 )
 RETURNS arima_optimise_result AS $$
 DECLARE
@@ -97,7 +99,18 @@ BEGIN
     END IF;
 
     -- Fit ARIMA model
-    opt_result := arima_optimise(arr_vals, p, q, include_mean, optimiser);
+    BEGIN
+        opt_result := arima_optimise(arr_vals, p, q, include_mean, optimiser);
+    EXCEPTION
+        WHEN OTHERS THEN
+        IF silent_error THEN
+            RAISE DEBUG 'train_arima: Failed to train ARMA(%, %) due to error: %',
+                p, q, SQLERRM;
+            opt_result := ('{}', '{}', 0.0, '{}', 'Infinity'::double precision)::arima_optimise_result;
+        ELSE
+            RAISE EXCEPTION 'train_arima: Failed to train ARMA(%, %) due to error: %', p, q, SQLERRM;
+        END IF;
+    END;
 
     RETURN opt_result;
 END;
@@ -210,7 +223,8 @@ CREATE FUNCTION css_incremental_transition(
     state css_incremental_state,
     y DOUBLE PRECISION,
     phi DOUBLE PRECISION[],
-    theta DOUBLE PRECISION[]
+    theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION DEFAULT 0.0 -- 0 if no constant term required
 )
 RETURNS css_incremental_state
 AS 'MODULE_PATHNAME', 'css_incremental_transition'
@@ -220,7 +234,8 @@ CREATE FUNCTION _css_incremental_transition(
     state INTERNAL,
     y DOUBLE PRECISION,
     phi DOUBLE PRECISION[],
-    theta DOUBLE PRECISION[]
+    theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION DEFAULT 0.0 -- 0 if no constant term required
 )
 RETURNS INTERNAL
 AS 'MODULE_PATHNAME', '_css_incremental_transition'
@@ -234,7 +249,8 @@ LANGUAGE C IMMUTABLE;
 CREATE AGGREGATE css_incremental(
     y DOUBLE PRECISION,
     phi DOUBLE PRECISION[],
-    theta DOUBLE PRECISION[]
+    theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION
 ) (
     SFUNC = _css_incremental_transition,
     STYPE = INTERNAL, -- Initialisation handled by C
@@ -247,31 +263,63 @@ CREATE TABLE model_arima_stats(
     phi DOUBLE PRECISION[] NOT NULL,
     theta DOUBLE PRECISION[] NOT NULL,
     d INT NOT NULL,
+    c DOUBLE PRECISION DEFAULT 0.0,
     is_active BOOLEAN NOT NULL,
     incremental_state css_incremental_state NOT NULL,
-    UNIQUE (model_id, phi, theta)
+    UNIQUE (model_id, phi, theta, d, c)
 );
+
+-- Used in unit tests to verify that a model has retrained
+CREATE OR REPLACE FUNCTION arima_get_active_id(
+    model_id BIGINT,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    d INT,
+    c DOUBLE PRECISION DEFAULT 0.0
+)
+RETURNS BIGINT
+SECURITY DEFINER
+AS $$
+DECLARE
+    rec_result RECORD;
+BEGIN
+    -- Safety precaution for SECURITY DEFINER
+    PERFORM set_config('search_path', 'public,pg_temp', true);
+
+    EXECUTE format(
+        'SELECT id
+        FROM model_arima_stats
+        WHERE model_id = %L AND phi = %L AND theta = %L AND d = %L AND c = %L AND is_active = TRUE
+        LIMIT 1',
+        
+        model_id, phi, theta, d, c
+    ) INTO rec_result;
+
+    RETURN rec_result.id;
+END;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION css_incremental_full_table(
     source_table TEXT,
     value_col TEXT,
     date_col TEXT,
     phi DOUBLE PRECISION[],
-    theta DOUBLE PRECISION[]
+    theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION DEFAULT 0 -- 0 if no constant term required
 )
 RETURNS css_incremental_state AS $$
 DECLARE
     rec_state RECORD;
 BEGIN
     EXECUTE format(
-        'SELECT (css_incremental(%I, %L, %L) OVER (ORDER BY %I)) AS s
+        'SELECT (css_incremental(%I, %L, %L, %L) OVER (ORDER BY %I)) AS s
          FROM %I
-         GROUP BY %I
          ORDER BY %I DESC
          LIMIT 1',
         value_col,
         phi,
         theta,
+        c,
         date_col,
         source_table,
         date_col,
@@ -282,7 +330,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TABLE arima_vertices (
-    arima_id INT NOT NULL REFERENCES model_arima_stats(id),
+    arima_id BIGINT NOT NULL REFERENCES model_arima_stats(id),
     vertex_id INT NOT NULL,
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
@@ -292,7 +340,7 @@ CREATE TABLE arima_vertices (
 
 -- Create Simplex vertices for incremental bound checking
 CREATE OR REPLACE FUNCTION arima_create_simplex_vertices(
-    centre_id INT, -- ID of model to target (centre vector) in model_arima_stats
+    centre_id BIGINT, -- ID of model to target (centre vector) in model_arima_stats
     tolerance DOUBLE PRECISION DEFAULT 0.05 -- 0.05 empirically found by Rosenthal & Lehner
 )
 RETURNS VOID
@@ -351,7 +399,7 @@ BEGIN
                 (CASE WHEN v_theta[i - cardinality(v_phi)] >= 0 THEN tolerance ELSE -tolerance END);
         END IF;
 
-        v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new);
+        v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new, rec_centre.c);
 
         INSERT INTO arima_vertices(arima_id, vertex_id, phi, theta, incremental_state)
         VALUES (centre_id, i, v_phi_new, v_theta_new, v_state_new);
@@ -370,15 +418,109 @@ BEGIN
         v_scale_factor := 0.5; -- Fallback for near-zero vectors
     END IF;
 
-    SELECT array_agg(val * v_scale_factor) INTO v_phi_new 
+    SELECT COALESCE(array_agg(val * v_scale_factor), '{}') INTO v_phi_new 
     FROM unnest(v_phi) val;
     
-    SELECT array_agg(val * v_scale_factor) INTO v_theta_new 
+    SELECT COALESCE(array_agg(val * v_scale_factor), '{}') INTO v_theta_new 
     FROM unnest(v_theta) val;
 
-    v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new);
+    v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new, rec_centre.c);
 
     INSERT INTO arima_vertices(arima_id, vertex_id, phi, theta, incremental_state)
     VALUES (centre_id, v_d+1, v_phi_new, v_theta_new, v_state_new);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Update model loss when new record inserted
+CREATE OR REPLACE FUNCTION arima_update_model(
+    target_model_id BIGINT,
+    new_y DOUBLE PRECISION
+)
+RETURNS VOID
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_breach_detected BOOLEAN;
+    rec_model RECORD;
+BEGIN
+    -- Safety precaution for SECURITY DEFINER
+    PERFORM set_config('search_path', 'public,pg_temp', true);
+
+    SELECT m.*, a.id AS arima_id INTO rec_model 
+    FROM models m 
+    INNER JOIN model_arima_stats a ON m.id = a.model_id AND a.is_active = TRUE
+    WHERE m.id = target_model_id;
+
+    DROP TABLE IF EXISTS tmp_updated_states;
+    CREATE TEMP TABLE tmp_updated_states ON COMMIT DROP AS (
+        SELECT
+            s.vertex_id,
+            (css_incremental_transition(s.state, new_y, s.phi, s.theta)) AS new_state
+        FROM (
+            -- Combine centre vector and simplex vertices
+            SELECT NULL AS vertex_id, s.phi, s.theta, s.incremental_state AS state FROM model_arima_stats s
+            WHERE s.model_id = target_model_id AND s.is_active = TRUE
+            UNION ALL
+            SELECT v.vertex_id, v.phi, v.theta, v.incremental_state AS state FROM arima_vertices v
+            WHERE v.arima_id = rec_model.arima_id
+        ) s
+    );
+    
+    WITH comparison AS (
+        SELECT 
+            (SELECT (new_state).css FROM tmp_updated_states WHERE vertex_id IS NULL) as centre_css,
+            MIN((new_state).css) FILTER (WHERE vertex_id IS NOT NULL) as min_vertex_css
+        FROM tmp_updated_states
+    )
+    SELECT (min_vertex_css < centre_css) INTO v_breach_detected FROM comparison;
+
+    IF v_breach_detected THEN
+        -- Mark current model inactive and retrain
+        UPDATE model_arima_stats
+        SET is_active = FALSE
+        WHERE id = rec_model.arima_id;
+
+        RAISE NOTICE 'Retraining AutoARIMA model as loss dropped below threshold';
+        PERFORM autoarima_train(rec_model.horizon, rec_model.input_table, rec_model.date_column, rec_model.value_column);
+    ELSE
+        -- Update the stored states with the new values calculated in the CTE
+        -- Centre vector
+        UPDATE model_arima_stats m
+        SET incremental_state = u.new_state
+        FROM tmp_updated_states u
+        WHERE m.model_id = target_model_id AND u.vertex_id IS NULL;
+
+        -- Simplex vertices
+        UPDATE arima_vertices v
+        SET incremental_state = u.new_state
+        FROM tmp_updated_states u
+        WHERE v.arima_id = rec_model.arima_id AND v.vertex_id = u.vertex_id;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION trg_autoarima_on_insert()
+RETURNS TRIGGER 
+SECURITY DEFINER
+AS $$
+DECLARE
+    rec_model RECORD;
+    v_new_val DOUBLE PRECISION;
+BEGIN
+    -- Safety precaution for SECURITY DEFINER
+    PERFORM set_config('search_path', 'public,pg_temp', true);
+
+    SELECT id, value_column FROM models
+    INTO rec_model
+    WHERE input_table = TG_TABLE_NAME AND model_type = 'autoarima';
+
+    -- Dynamically get the value from the NEW record using the column name stored in the model
+    EXECUTE format('SELECT ($1).%I', rec_model.value_column) 
+    USING NEW 
+    INTO v_new_val;
+
+    PERFORM arima_update_model(rec_model.id, v_new_val);
+
+    RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;

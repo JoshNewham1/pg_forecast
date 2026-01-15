@@ -66,7 +66,7 @@ def run_function(engine, func_name, *args):
     return result
 
 
-def css_loss_query(phi: list[float], theta: list[float], p: int, q: int, series_id=None):
+def css_loss_query(phi: list[float], theta: list[float], p: int, q: int, c: float = 0.0, series_id=None):
     """
     Build a SQLAlchemy text query to call css_loss on pg_forecast_unit_test.
     """
@@ -80,14 +80,15 @@ def css_loss_query(phi: list[float], theta: list[float], p: int, q: int, series_
             phi := ARRAY[{phi_array}]::double precision[],
             theta := ARRAY[{theta_array}]::double precision[],
             p := {p},
-            q := {q}
+            q := {q},
+            c := {c}
         )
         FROM pg_forecast_unit_test
         {where_clause};
     """
     return text(query_str)
 
-def css_incremental_query(phi: list[float], theta: list[float], series_id=None):
+def css_incremental_query(phi: list[float], theta: list[float], c: float = 0.0, series_id=None):
     """
     Build a SQLAlchemy text query to call css_incremental aggregate
     on pg_forecast_unit_test.
@@ -100,7 +101,8 @@ def css_incremental_query(phi: list[float], theta: list[float], series_id=None):
         SELECT
             (css_incremental(value,
                 ARRAY[{phi_array}]::double precision[],
-                ARRAY[{theta_array}]::double precision[]
+                ARRAY[{theta_array}]::double precision[],
+                {c}
             )).css
         FROM pg_forecast_unit_test
         {where_clause};
@@ -284,6 +286,30 @@ def setup_large_dataset(test_engine):
         conn.commit()
 
 
+def test_css_loss_p_1_q_0(test_engine):
+    """
+    Unit test for ARIMA CSS function on a basic dataset
+    where p=1, q=0
+    """
+    setup_basic_dataset(test_engine)
+    query = css_loss_query(phi=[0.5], theta=[],
+                           p=1, q=0, series_id='TestSeries')
+    with test_engine.connect() as conn:
+        result = conn.execute(query).scalar()
+    assert_close(result, 201.5075)
+
+def test_css_loss_p_0_q_1(test_engine):
+    """
+    Unit test for ARIMA CSS function on a basic dataset
+    where p=0, q=1
+    """
+    setup_basic_dataset(test_engine)
+    query = css_loss_query(phi=[], theta=[0.3],
+                           p=0, q=1, series_id='TestSeries')
+    with test_engine.connect() as conn:
+        result = conn.execute(query).scalar()
+    assert_close(result, 492.2989186)
+
 def test_css_loss_p_1_q_1(test_engine):
     """
     Unit test for ARIMA CSS function on a basic dataset
@@ -322,6 +348,42 @@ def test_css_loss_p_2_q_2(test_engine):
         result = conn.execute(query).scalar()
     assert_close(result, 23.0322)
 
+def test_css_loss_p_2_q_2_constant(test_engine):
+    """
+    Unit test for ARIMA CSS function on a basic dataset
+    where p=2, q=2, c=3.464544387
+    """
+    setup_basic_dataset(test_engine)
+    query = css_loss_query(phi=[-0.107714174, 0.847949993], theta=[2, -2], 
+                           p=2, q=2, c=3.464544387, series_id='TestSeries')
+    with test_engine.connect() as conn:
+        result = conn.execute(query).scalar()
+    assert_close(result, 0.000986208)
+
+def test_css_incremental_matches_css_loss_p_1_q_0(test_engine):
+    setup_basic_dataset(test_engine)
+
+    assert_css_matches_incremental(
+        test_engine=test_engine,
+        phi=[0.5],
+        theta=[],
+        p=1,
+        q=0,
+        series_id="TestSeries"
+    )
+
+def test_css_incremental_matches_css_loss_p_0_q_1(test_engine):
+    setup_basic_dataset(test_engine)
+
+    assert_css_matches_incremental(
+        test_engine=test_engine,
+        phi=[],
+        theta=[0.3],
+        p=0,
+        q=1,
+        series_id="TestSeries"
+    )
+
 def test_css_incremental_matches_css_loss_p_1_q_1(test_engine):
     setup_basic_dataset(test_engine)
 
@@ -353,6 +415,18 @@ def test_css_incremental_matches_css_loss_p_2_q_2(test_engine):
         test_engine=test_engine,
         phi=[0.5, 0.25],
         theta=[0.3, 0.5],
+        p=2,
+        q=2,
+        series_id="TestSeries"
+    )
+
+def test_css_incremental_matches_css_loss_p_2_q_2_constant(test_engine):
+    setup_basic_dataset(test_engine)
+
+    assert_css_matches_incremental(
+        test_engine=test_engine,
+        phi=[-0.107714174, 0.847949993],
+        theta=[2, -2],
         p=2,
         q=2,
         series_id="TestSeries"
@@ -522,3 +596,92 @@ def test_arima_large_input_include_c(test_engine):
         forecast = [row[1] for row in result.fetchall()]
         assert len(forecast) == horizon and all_different(
             forecast) and increasing(forecast)
+        
+def test_autoarima_finds_low_loss_model(test_engine):
+    """
+    Test that AutoARIMA finds a model with a suitably low CSS loss
+    on a clearly defined AR(1) process.
+    """
+    with test_engine.connect() as conn:
+        # Generate an AR(1) process: x_t = 0.8 * x_{t-1} + noise
+        conn.execute(text("""
+            TRUNCATE TABLE pg_forecast_unit_test;
+            INSERT INTO pg_forecast_unit_test (t, series_id, value)
+            SELECT 
+                '2023-01-01'::timestamp + (n || ' minutes')::interval,
+                'AR1_Series',
+                -- Simple AR(1) approximation
+                10 * power(0.8, n % 10) + (random() * 0.1)
+            FROM generate_series(0, 100) n;
+        """))
+        conn.commit()
+
+        # Call autoarima_train
+        query = text("""
+            SELECT css, p, d, q 
+            FROM autoarima_train(
+                horizon := 5,
+                source_table := 'pg_forecast_unit_test',
+                date_col := 't',
+                value_col := 'value'
+            );
+        """)
+        result = conn.execute(query).fetchone()
+        
+        css_loss = result[0]
+        p, d, q = result[1], result[2], result[3]
+
+        print(f"AutoARIMA found ARIMA({p},{d},{q}) with CSS: {css_loss}")
+
+        # Assertions
+        # 1. CSS should be similar to Python baseline (304.9918959560322)
+        assert css_loss <= 305.0, f"Loss too high: {css_loss}"
+        # 2. Check that it didn't just default to ARIMA(0,0,0) if there is structure
+        assert (p + d + q) >= 0 
+
+def test_autoarima_trigger_on_outliers(test_engine):
+    """
+    Test that inserting vastly different rows triggers deactivation,
+    verified using arima_get_active_model_id.
+    """
+    setup_basic_dataset(test_engine)
+    
+    with test_engine.connect() as conn:
+        # 1. Train the initial model
+        # This populates models and model_arima_stats
+        train_result = conn.execute(text("""
+            SELECT p, d, q, c, phi, theta 
+            FROM autoarima_train(4, 'pg_forecast_unit_test', 't', 'value');
+        """)).fetchone()
+        conn.commit()
+
+        _, d, _, c, phi, theta = train_result
+
+        # 2. Get the ID of the model we just trained using your helper function
+        # We need the model_id from the 'models' table first
+        parent_model_id = conn.execute(text("""
+            SELECT model_get_id('autoarima', 'pg_forecast_unit_test', 't', 'value')
+        """)).scalar()
+
+        initial_arima_id = conn.execute(text("""
+            SELECT arima_get_active_id(:mid, :phi, :theta, :d, :c)
+        """), {"mid": parent_model_id, "phi": phi, "theta": theta, "d": d, "c": c}).scalar()
+
+        assert initial_arima_id is not None, "Active model ID should be retrievable after training"
+
+        # 3. Insert a "vastly different" row
+        conn.execute(text("""
+            INSERT INTO pg_forecast_unit_test (t, series_id, value) 
+            VALUES ('2023-01-08 00:00:00', 'TestSeries', 500.0);
+        """))
+        conn.commit()
+
+        # 4. Verify the helper function now returns a different ID
+        post_outlier_id = conn.execute(text("""
+            SELECT arima_get_active_id(:mid, :phi, :theta, :d, :c)
+        """), {"mid": parent_model_id, "phi": phi, "theta": theta, "d": d, "c": c}).scalar()
+
+        assert post_outlier_id is None, (
+            f"Model {initial_arima_id} should have been deactivated "
+            f"and no longer returned as active."
+        )

@@ -276,9 +276,10 @@ css_loss(PG_FUNCTION_ARGS)
     ArrayType *theta_arr = PG_GETARG_ARRAYTYPE_P(2);
     int32 p = PG_GETARG_INT32(3);
     int32 q = PG_GETARG_INT32(4);
+    float8 c = PG_GETARG_FLOAT8(5);
 
     /* Validate arguments */
-    if (ARR_NDIM(vals_arr) != 1 || ARR_NDIM(phi_arr) != 1 || ARR_NDIM(theta_arr) != 1)
+    if (ARR_NDIM(vals_arr) > 1 || ARR_NDIM(phi_arr) > 1 || ARR_NDIM(theta_arr) > 1)
     {
         ereport(ERROR,
                 (errmsg("vals, phi and theta must be 1-D arrays")));
@@ -305,12 +306,12 @@ css_loss(PG_FUNCTION_ARGS)
     
     /* CSS logic */
     double* resid = palloc(n_vals * sizeof(double));
-    PG_RETURN_FLOAT8(css(vals, phi, theta, p, q, false, 0.0, n_vals, NULL, resid));
+    PG_RETURN_FLOAT8(css(vals, phi, theta, p, q, false, c, n_vals, NULL, resid));
 }
 
-static arima_inc_state_t* css_incremental(arima_inc_state_t *state, double* phi, double* theta, double y_t)
+static arima_inc_state_t* css_incremental(arima_inc_state_t *state, double* phi, double* theta, double y_t, double c)
 {
-    double e_t = y_t;
+    double e_t = y_t - c;
     int p = state->p;
     int q = state->q;
     int ncond = max(p, q);
@@ -388,15 +389,8 @@ static arima_inc_state_t* css_incremental_init(int p, int q)
     state->p = p;
     state->q = q;
     state->css = 0.0;
-
-    if (p > 0)
-    {
-        state->y_lags = palloc0(sizeof(double) * p);
-    }
-    if (q > 0)
-    {
-        state->e_lags = palloc0(sizeof(double) * q);
-    }
+    state->y_lags = palloc0(sizeof(double) * (p == 0 ? 1 : p));
+    state->e_lags = palloc0(sizeof(double) * (q == 0 ? 1 : q));
 
     return state;
 }
@@ -442,11 +436,12 @@ css_incremental_transition(PG_FUNCTION_ARGS)
     state->y_lags = y_lags;
     state->e_lags = e_lags;
 
-    // Fetch other args (y, phi, theta)
+    // Fetch other args (y, c, phi, theta)
     ArrayType *phi_arr, *theta_arr;
     float8 y_t = PG_GETARG_FLOAT8(1);
     phi_arr = PG_GETARG_ARRAYTYPE_P(2);
     theta_arr = PG_GETARG_ARRAYTYPE_P(3);
+    float8 c = PG_GETARG_FLOAT8(4);
     double *phi = (double *) ARR_DATA_PTR(phi_arr);
     double *theta = (double *) ARR_DATA_PTR(theta_arr);
 
@@ -463,7 +458,7 @@ css_incremental_transition(PG_FUNCTION_ARGS)
                 (errmsg("theta arr must have q elements")));
     }
 
-    state = css_incremental(state, phi, theta, y_t);
+    state = css_incremental(state, phi, theta, y_t, c);
 
     ReleaseTupleDesc(tupdesc);
     PG_RETURN_DATUM(_css_incremental_build_record(state, tupdesc));
@@ -476,6 +471,7 @@ _css_incremental_transition(PG_FUNCTION_ARGS)
     float8 y_t = PG_GETARG_FLOAT8(1);
     phi_arr = PG_GETARG_ARRAYTYPE_P(2);
     theta_arr = PG_GETARG_ARRAYTYPE_P(3);
+    float8 c = PG_GETARG_FLOAT8(4);
 
     arima_inc_state_t *state;
     if (PG_ARGISNULL(0))
@@ -506,7 +502,7 @@ _css_incremental_transition(PG_FUNCTION_ARGS)
                 (errmsg("theta arr must have q elements")));
     }
 
-    state = css_incremental(state, phi, theta, y_t);
+    state = css_incremental(state, phi, theta, y_t, c);
     PG_RETURN_POINTER(state);
 }
 

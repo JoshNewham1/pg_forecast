@@ -18,5 +18,5 @@ SET client_min_messages = 'debug5';
 To build and install the plugin from source:
 
 ```bash
-sudo make install && sudo make clean && sudo -u postgres psql -d DB_NAME -c "DROP EXTENSION IF EXISTS pg_forecast; CREATE EXTENSION pg_forecast;"
+sudo make install && sudo make clean && sudo -u postgres psql -d DB_NAME -c "DROP EXTENSION IF EXISTS pg_forecast CASCADE; CREATE EXTENSION pg_forecast;"
 ```

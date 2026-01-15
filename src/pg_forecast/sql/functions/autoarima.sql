@@ -69,7 +69,8 @@ DECLARE
     model_aicc DOUBLE PRECISION;
     rec_current autoarima_rec;
     best_aicc DOUBLE PRECISION := 'Infinity';
-    v_model_id INT;
+    v_model_id BIGINT;
+    v_arima_id BIGINT;
     v_incremental_state css_incremental_state;
 BEGIN
     -- Safety precaution for SECURITY DEFINER
@@ -116,7 +117,7 @@ BEGIN
             (0, 0), (2, 2), (1, 0), (0, 1)
         ) AS m(p, q)
     LOOP
-        trained := arima_train(rec_candidate.p, v_d, rec_candidate.q, source_table, date_col, value_col, include_c);
+        trained := arima_train(rec_candidate.p, v_d, rec_candidate.q, source_table, date_col, value_col, include_c, TRUE);
         n_params := autoarima_param_count(rec_candidate.p, rec_candidate.q, include_c);
         model_aicc := aicc(trained.css, rec_candidate.p, rec_candidate.q, n_params, n_vals);
 
@@ -136,7 +137,7 @@ BEGIN
 
     -- If d <= 1, ARIMA(0, d, 0) without a constant is also fitted
     IF v_d <= 1 THEN
-        trained := arima_train(0, v_d, 0, source_table, date_col, value_col, FALSE);
+        trained := arima_train(0, v_d, 0, source_table, date_col, value_col, FALSE, TRUE);
         n_params := 0;
         model_aicc := aicc(trained.css, 0, 0, n_params, n_vals);
 
@@ -180,34 +181,28 @@ BEGIN
                 WHERE t.p = v_p AND t.d = v_d AND t.q = v_q
             );
 
-            BEGIN
-                trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, include_c);
-                RAISE DEBUG 'AutoARIMA: Trained ARIMA(%, %, %) with CSS %', v_p, v_d, v_q, trained.css;
-                n_params := autoarima_param_count(v_p, v_q, include_c);
-                model_aicc := aicc(trained.css, v_p, v_q, n_params, n_vals);
+            trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, include_c, TRUE);
+            n_params := autoarima_param_count(v_p, v_q, include_c);
+            model_aicc := aicc(trained.css, v_p, v_q, n_params, n_vals);
+            RAISE DEBUG 'AutoARIMA: Trained ARIMA(%, %, %) with CSS % and AICc %', v_p, v_d, v_q, trained.css, model_aicc;
 
-                INSERT INTO tmp_autoarima (
-                    p, d, q, c, phi, theta, css, aicc
-                ) VALUES (
-                    v_p, v_d, v_q, trained.c, trained.phi, trained.theta, trained.css, model_aicc
-                );
+            INSERT INTO tmp_autoarima (
+                p, d, q, c, phi, theta, css, aicc
+            ) VALUES (
+                v_p, v_d, v_q, trained.c, trained.phi, trained.theta, trained.css, model_aicc
+            );
 
-                IF model_aicc < best_aicc THEN
-                    best_aicc := model_aicc;
-                END IF;
-            -- Skip if training failed
-            EXCEPTION
-                WHEN OTHERS THEN
-                RAISE DEBUG 'AutoARIMA: Skipping ARIMA(%, %, %) due to error: %',
-                    v_p, v_d, v_q, SQLERRM;
-            END;
+            IF model_aicc < best_aicc THEN
+                best_aicc := model_aicc;
+                RAISE DEBUG 'AutoARIMA: New best AICc found, ARIMA(%, %, %)', v_p, v_d, v_q;
+            END IF;
         END LOOP;
 
         -- Train with/without constant
         v_p := rec_current.p;
         v_q := rec_current.q;
 
-        trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, NOT include_c);
+        trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, NOT include_c, TRUE);
         n_params := autoarima_param_count(v_p, v_q, NOT include_c);
         model_aicc := aicc(trained.css, v_p, v_q, n_params, n_vals);
 
@@ -217,26 +212,27 @@ BEGIN
             v_p, v_d, v_q, trained.c, trained.phi, trained.theta, trained.css, model_aicc
         );
 
-        IF model_aicc < best_aicc THEN
-            best_aicc := model_aicc;
-        ELSE
-            EXIT; -- No improvement, terminate loop
-        END IF;
-
         SELECT *
         INTO rec_current
         FROM tmp_autoarima
         ORDER BY aicc
         LIMIT 1;
+
+        IF model_aicc < best_aicc THEN
+            best_aicc := model_aicc;
+        ELSE
+            EXIT; -- No improvement, terminate loop
+        END IF;
     END LOOP;
 
     -- Create entry in models & stats tables to incrementally update CSS
-    INSERT INTO models(model_type, input_table, date_column, value_column)
+    INSERT INTO models("model_type", "input_table", "date_column", "value_column", "horizon")
     VALUES (
         'autoarima'::model,
         source_table,
         date_col,
-        value_col
+        value_col,
+        horizon
     )
     ON CONFLICT (model_type, input_table, date_column, value_column)
     DO UPDATE SET model_type = models.model_type  -- No op
@@ -244,12 +240,26 @@ BEGIN
     INTO v_model_id;
 
     -- Get starting incremental state (from every value in the table)
-    v_incremental_state := css_incremental_full_table(source_table, value_col, date_col, rec_current.phi, rec_current.theta);
+    v_incremental_state := css_incremental_full_table(source_table, value_col, date_col, rec_current.phi, rec_current.theta, rec_current.c);
     
-    INSERT INTO model_arima_stats(model_id, phi, theta, d, is_active, incremental_state)
-    VALUES (v_model_id, rec_current.phi, rec_current.theta, rec_current.d, TRUE, v_incremental_state)
-    ON CONFLICT (model_id, phi, theta)
-    DO UPDATE SET incremental_state = v_incremental_state;
+    INSERT INTO model_arima_stats(model_id, phi, theta, d, c, is_active, incremental_state)
+    VALUES (v_model_id, rec_current.phi, rec_current.theta, rec_current.d, rec_current.c, TRUE, v_incremental_state)
+    ON CONFLICT (model_id, phi, theta, d, c)
+    DO UPDATE SET incremental_state = v_incremental_state
+    RETURNING id
+    INTO v_arima_id;
+
+    -- Generate simplex vertices for bounds checking
+    PERFORM arima_create_simplex_vertices(v_arima_id);
+
+    -- Register trigger on table
+    EXECUTE format('
+        CREATE OR REPLACE TRIGGER autoarima_on_insert_%I
+        AFTER INSERT ON %I
+        FOR EACH ROW
+        EXECUTE FUNCTION trg_autoarima_on_insert();', 
+        source_table, source_table
+    );
 
     RAISE NOTICE 'AutoARIMA: Best model found ARIMA(%,%,%) with CSS % and AICc %',
     rec_current.p, rec_current.d, rec_current.q, rec_current.css, rec_current.aicc;
