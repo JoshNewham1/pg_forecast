@@ -40,7 +40,9 @@ CREATE FUNCTION arima_optimise(
     p INT,
     q INT,
     include_c BOOLEAN DEFAULT TRUE,
-    method TEXT DEFAULT 'L-BFGS' -- 'Nelder-Mead', 'L-BFGS'
+    method TEXT DEFAULT 'L-BFGS', -- 'Nelder-Mead', 'L-BFGS'
+    phi_guesses DOUBLE PRECISION[] DEFAULT '{}',
+    theta_guesses DOUBLE PRECISION[] DEFAULT '{}'
 )
 RETURNS arima_optimise_result
 AS 'MODULE_PATHNAME', 'arima_optimise'
@@ -69,7 +71,7 @@ CREATE OR REPLACE FUNCTION arima_train(
     value_col TEXT,    -- Numerical value column
     include_mean BOOLEAN DEFAULT TRUE,
     silent_error BOOLEAN DEFAULT FALSE,
-    optimiser TEXT DEFAULT 'Nelder-Mead'
+    optimiser TEXT DEFAULT NULL
 )
 RETURNS arima_optimise_result AS $$
 DECLARE
@@ -100,7 +102,12 @@ BEGIN
 
     -- Fit ARIMA model
     BEGIN
-        opt_result := arima_optimise(arr_vals, p, q, include_mean, optimiser);
+        IF optimiser IS NULL THEN
+            opt_result := arima_optimise(arr_vals, p, q, include_mean, 'L-BFGS');
+            opt_result := arima_optimise(arr_vals, p, q, include_mean, 'Nelder-Mead', opt_result.phi, opt_result.theta);
+        ELSE
+            opt_result := arima_optimise(arr_vals, p, q, include_mean, optimiser);
+        END IF;
     EXCEPTION
         WHEN OTHERS THEN
         IF silent_error THEN

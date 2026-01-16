@@ -543,6 +543,7 @@ static double _arima_objective_grad(unsigned n, const double *x, double *grad, v
 }
 
 static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool include_c,
+                                double* phi_guess, double* theta_guess,
                                 nlopt_algorithm algorithm, const char* algorithm_name,
                                 double (*objective)(unsigned, const double*, double*, void*))
 {
@@ -575,9 +576,17 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool in
     nlopt_set_lower_bounds(opt, lb);
     nlopt_set_upper_bounds(opt, ub);
 
-    // Initial guess - all parameters are 0.1, and intercept is mean
+    // Initial guess - phi/theta are 0.1 or set to provided values, and intercept is mean
     double *x = palloc(sizeof(double) * n_params);
-    for (int i = 0; i < n_params; i++) x[i] = 0.1;
+    if (phi_guess != NULL && theta_guess != NULL)
+    {
+        for (int i = 0; i < p; i++) x[i] = phi_guess[i];
+        for (int j = 0; j < q; j++) x[p+j] = theta_guess[j];
+    }
+    else
+    {
+        for (int i = 0; i < n_params; i++) x[i] = 0.1;
+    }
     if (include_c)
     {
         x[p + q] = arr_mean(vals, n_vals);
@@ -605,6 +614,8 @@ arima_optimise(PG_FUNCTION_ARGS)
     int32 q = PG_GETARG_INT32(2);
     bool include_c = PG_GETARG_BOOL(3);
     char* arima_method = text_to_cstring(PG_GETARG_TEXT_P(4));
+    ArrayType *phi_guess_arr = PG_GETARG_ARRAYTYPE_P(5);
+    ArrayType *theta_guess_arr = PG_GETARG_ARRAYTYPE_P(6);
 
     /* Validate arguments */
     if (ARR_NDIM(vals_arr) != 1)
@@ -619,8 +630,17 @@ arima_optimise(PG_FUNCTION_ARGS)
     }
 
     /* Convert psql array to C array */
-    int n_vals;
+    int n_vals, n_phi_guess, n_theta_guess;
+    double* phi_guess = NULL;
+    double* theta_guess = NULL;
     double* vals = pg_array_to_c_double(vals_arr, &n_vals, false, "arima_optimise");
+    if (!PG_ARGISNULL(5) && !PG_ARGISNULL(6) && ARR_NDIM(phi_guess_arr) == 1 && ARR_NDIM(theta_guess_arr) == 1)
+    {
+        phi_guess = pg_array_to_c_double(phi_guess_arr, &n_phi_guess, false, "arima_optimise");
+        theta_guess = pg_array_to_c_double(theta_guess_arr, &n_theta_guess, false, "arima_optimise");
+        if (n_phi_guess != p) ereport(ERROR, (errmsg("phi_guess must be p elements")));
+        if (n_theta_guess != q) ereport(ERROR, (errmsg("theta_guess must be q elements")));
+    }
 
     /* Call optimiser */
     double (*opt_objective)(unsigned, const double *, double *, void *);
@@ -641,7 +661,7 @@ arima_optimise(PG_FUNCTION_ARGS)
     {
         elog(ERROR, "Invalid optimiser provided: %s", arima_method);
     }
-    opt_result = _arima_nlopt(vals, n_vals, p, q, include_c, opt_algorithm, arima_method, opt_objective);
+    opt_result = _arima_nlopt(vals, n_vals, p, q, include_c, phi_guess, theta_guess, opt_algorithm, arima_method, opt_objective);
 
     double c = include_c ? opt_result.params[p + q] : 0.0;
 
