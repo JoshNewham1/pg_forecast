@@ -235,7 +235,7 @@ double css(double *vals, double *phi, double *theta, int p, int q, bool include_
                     grad[p + k] += 2.0 * tmp * dtheta[k][t];
                 }
             }
-            
+
             // e_t = y_t - c - sum phi_i*y_{t-i} - sum theta_j*e_{t-j}
             // de_t/dc = -1 - sum theta_j * (de_{t-j}/dc)
             // By the chain rule as the past residuals e_{t-j} also depend on c
@@ -542,6 +542,126 @@ static double _arima_objective_grad(unsigned n, const double *x, double *grad, v
     return css(d->vals, phi, theta, d->p, d->q, d->include_c, c, d->n_vals, grad, resid);
 }
 
+/**
+ * Compute autocovariances up to lag p
+ */
+static void autocovariance(const double *x, int n, int p, double *gamma)
+{
+    double mean = 0.0;
+    for (int i = 0; i < n; i++)
+        mean += x[i];
+    mean /= n;
+
+    for (int k = 0; k <= p; k++)
+    {
+        gamma[k] = 0.0;
+        for (int i = 0; i < n - k; i++)
+            gamma[k] += (x[i] - mean) * (x[i + k] - mean);
+        gamma[k] /= n;
+    }
+}
+
+/**
+ * Solve Yule-Walker equations for AR(p) coefficients
+ * Returns array of length p (must be freed by caller)
+ */
+static double* yule_walker(const double *x, int n, int p)
+{
+    double *gamma = (double*)palloc((p + 1) * sizeof(double));
+    double *phi = (double*)palloc(p * sizeof(double));
+    double *rhs = (double*)palloc(p * sizeof(double));
+
+    autocovariance(x, n, p, gamma);
+
+    // Set up the Toeplitz matrix (only need gamma[0..p-1])
+    double *R = (double*)palloc(p * p * sizeof(double));
+    for (int i = 0; i < p; i++)
+    {
+        for (int j = 0; j < p; j++)
+        {
+            R[i * p + j] = gamma[abs(i - j)];
+        }
+        rhs[i] = gamma[i + 1];
+    }
+
+    // Solve R * phi = rhs using naive Gaussian elimination
+    for (int i = 0; i < p; i++)
+    {
+        // pivot
+        double pivot = R[i * p + i];
+        if (fabs(pivot) < 1e-12) pivot = 1e-12;  // avoid div by zero
+        for (int j = i; j < p; j++)
+            R[i * p + j] /= pivot;
+        rhs[i] /= pivot;
+
+        // eliminate
+        for (int k = i + 1; k < p; k++)
+        {
+            double factor = R[k * p + i];
+            for (int j = i; j < p; j++)
+                R[k * p + j] -= factor * R[i * p + j];
+            rhs[k] -= factor * rhs[i];
+        }
+    }
+
+    // back-substitution
+    for (int i = p - 1; i >= 0; i--)
+    {
+        phi[i] = rhs[i];
+        for (int j = i + 1; j < p; j++)
+            phi[i] -= R[i * p + j] * phi[j];
+    }
+
+    pfree(gamma);
+    pfree(rhs);
+    pfree(R);
+
+    return phi;
+}
+
+/**
+ * Compute residuals: e_t = x_t - AR_model(x_t)
+ */
+static void compute_residuals(const double *x, int n, const double *phi, int p, double c, double *res)
+{
+    for (int t = 0; t < n; t++)
+    {
+        double pred = c;
+        for (int i = 1; i <= p; i++) 
+        {
+            if (t - i >= 0)
+            {
+                pred += phi[i - 1] * x[t - i];
+            }
+        }
+        res[t] = x[t] - pred;
+    }
+}
+
+/**
+ * Initialize MA(q) coefficients using AR approximation on residuals
+ * Returns array of length q (must be freed by caller)
+ */
+static double* ma_initial_guess(const double *x, int n, int p, int q, double c)
+{
+    if (q == 0) return NULL;
+
+    double *phi = NULL;
+    if (p > 0) phi = yule_walker(x, n, p);
+
+    double *res = (double*)palloc(n * sizeof(double));
+
+    compute_residuals(x, n, phi ? phi : NULL, p, c, res);
+
+    // Fit AR(q) on residuals => treat as MA(q) initial guess
+    double *theta = yule_walker(res, n, q);
+
+    pfree(res);
+    if (phi) pfree(phi);
+
+    return theta;
+}
+
 static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool include_c,
                                 nlopt_algorithm algorithm, const char* algorithm_name,
                                 double (*objective)(unsigned, const double*, double*, void*))
@@ -577,10 +697,23 @@ static opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool in
 
     // Initial guess - all parameters are 0.1, and intercept is mean
     double *x = palloc(sizeof(double) * n_params);
-    for (int i = 0; i < n_params; i++) x[i] = 0.1;
+    double mean = arr_mean(vals, n_vals);
+
+    if (p > 0)
+    {
+        double *phi_init = yule_walker(vals, n_vals, p);
+        for (int i = 0; i < p; i++) x[i] = phi_init[i];
+        pfree(phi_init);
+    }
+    if (q > 0)
+    {
+        double *theta_init = ma_initial_guess(vals, n_vals, p, q, mean);
+        for (int i = 0; i < q; i++) x[p+i] = theta_init[i];
+        pfree(theta_init);
+    }
     if (include_c)
     {
-        x[p + q] = arr_mean(vals, n_vals);
+        x[p + q] = mean;
     }
 
     double result;
@@ -636,6 +769,11 @@ arima_optimise(PG_FUNCTION_ARGS)
     {
         opt_objective = _arima_objective_grad;
         opt_algorithm = NLOPT_LD_LBFGS;
+    }
+    else if (strcmp(arima_method, "Subplex") == 0)
+    {
+        opt_objective = _arima_objective_grad;
+        opt_algorithm = NLOPT_LN_SBPLX;
     }
     else
     {

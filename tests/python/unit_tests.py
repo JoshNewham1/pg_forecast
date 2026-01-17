@@ -168,7 +168,7 @@ def arima_forecast_query(last_vals: list[float], last_residuals: list[float], p:
                                       p=p, q=q, c=c, phi=phi, theta=theta, horizon=horizon)
 
 
-def arima_query(p: int, d: int, q: int, horizon: int, include_mean=True, optimiser="L-BFGS", table="pg_forecast_unit_test"):
+def arima_query(p: int, d: int, q: int, horizon: int, include_mean=True, optimiser="Nelder-Mead", table="pg_forecast_unit_test"):
     """
     Build a SQLAlchemy text query to call arima on pg_forecast_unit_test.
     """
