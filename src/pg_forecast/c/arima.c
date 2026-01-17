@@ -235,7 +235,7 @@ double css(double *vals, double *phi, double *theta, int p, int q, bool include_
                     grad[p + k] += 2.0 * tmp * dtheta[k][t];
                 }
             }
-            
+
             // e_t = y_t - c - sum phi_i*y_{t-i} - sum theta_j*e_{t-j}
             // de_t/dc = -1 - sum theta_j * (de_{t-j}/dc)
             // By the chain rule as the past residuals e_{t-j} also depend on c
@@ -769,6 +769,11 @@ arima_optimise(PG_FUNCTION_ARGS)
     {
         opt_objective = _arima_objective_grad;
         opt_algorithm = NLOPT_LD_LBFGS;
+    }
+    else if (strcmp(arima_method, "Subplex") == 0)
+    {
+        opt_objective = _arima_objective_grad;
+        opt_algorithm = NLOPT_LN_SBPLX;
     }
     else
     {
