@@ -7,5 +7,6 @@ CREATE TABLE models(
     date_column TEXT NOT NULL,
     value_column TEXT NOT NULL,
     horizon INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (model_type, input_table, date_column, value_column)
 );

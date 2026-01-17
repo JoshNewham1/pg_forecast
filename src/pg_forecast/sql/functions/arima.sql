@@ -32,6 +32,7 @@ CREATE TABLE model_arima_stats(
     c DOUBLE PRECISION DEFAULT 0.0,
     is_active BOOLEAN NOT NULL,
     incremental_state css_incremental_state NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (model_id, phi, theta, d, c)
 );
 
