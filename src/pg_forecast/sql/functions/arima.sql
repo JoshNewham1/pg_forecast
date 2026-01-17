@@ -1,3 +1,53 @@
+/* -------------------------------------------------------------------------
+ * Types
+ * ------------------------------------------------------------------------- */
+
+CREATE TYPE arima_optimise_result AS (
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION, -- Intercept (0 if not including mean)
+    residuals DOUBLE PRECISION[],
+    css DOUBLE PRECISION
+);
+
+CREATE TYPE css_incremental_state AS (
+    t INT,
+    p INT,
+    q INT,
+    y_lags DOUBLE PRECISION[],
+    e_lags DOUBLE PRECISION[],
+    css DOUBLE PRECISION
+);
+
+/* -------------------------------------------------------------------------
+ * Tables
+ * ------------------------------------------------------------------------- */
+
+CREATE TABLE model_arima_stats(
+    id BIGSERIAL PRIMARY KEY,
+    model_id INT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    phi DOUBLE PRECISION[] NOT NULL,
+    theta DOUBLE PRECISION[] NOT NULL,
+    d INT NOT NULL,
+    c DOUBLE PRECISION DEFAULT 0.0,
+    is_active BOOLEAN NOT NULL,
+    incremental_state css_incremental_state NOT NULL,
+    UNIQUE (model_id, phi, theta, d, c)
+);
+
+CREATE TABLE arima_vertices (
+    arima_id BIGINT NOT NULL REFERENCES model_arima_stats(id) ON DELETE CASCADE,
+    vertex_id INT NOT NULL,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    incremental_state css_incremental_state NOT NULL,
+    PRIMARY KEY (arima_id, vertex_id)
+);
+
+/* -------------------------------------------------------------------------
+ * C Functions
+ * ------------------------------------------------------------------------- */
+
 CREATE FUNCTION css_loss(
     vals DOUBLE PRECISION[],
     phi DOUBLE PRECISION[],
@@ -27,14 +77,6 @@ RETURNS DOUBLE PRECISION[]
 AS 'MODULE_PATHNAME', 'arima_integrate'
 LANGUAGE C STRICT STABLE;
 
-CREATE TYPE arima_optimise_result AS (
-    phi DOUBLE PRECISION[],
-    theta DOUBLE PRECISION[],
-    c DOUBLE PRECISION, -- Intercept (0 if not including mean)
-    residuals DOUBLE PRECISION[],
-    css DOUBLE PRECISION
-);
-
 CREATE FUNCTION arima_optimise(
     vals DOUBLE PRECISION[],
     p INT,
@@ -60,6 +102,52 @@ RETURNS DOUBLE PRECISION[]
 AS 'MODULE_PATHNAME', 'arima_forecast'
 LANGUAGE C STRICT STABLE;
 
+CREATE FUNCTION css_incremental_transition(
+    state css_incremental_state,
+    y DOUBLE PRECISION,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION DEFAULT 0.0 -- 0 if no constant term required
+)
+RETURNS css_incremental_state
+AS 'MODULE_PATHNAME', 'css_incremental_transition'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION _css_incremental_transition(
+    state INTERNAL,
+    y DOUBLE PRECISION,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION DEFAULT 0.0 -- 0 if no constant term required
+)
+RETURNS INTERNAL
+AS 'MODULE_PATHNAME', '_css_incremental_transition'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION _css_incremental_final(state INTERNAL)
+RETURNS css_incremental_state
+AS 'MODULE_PATHNAME', '_css_incremental_final'
+LANGUAGE C IMMUTABLE;
+
+/* -------------------------------------------------------------------------
+ * Aggregates
+ * ------------------------------------------------------------------------- */
+
+CREATE AGGREGATE css_incremental(
+    y DOUBLE PRECISION,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION
+) (
+    SFUNC = _css_incremental_transition,
+    STYPE = INTERNAL, -- Initialisation handled by C
+    FINALFUNC = _css_incremental_final
+);
+
+/* -------------------------------------------------------------------------
+ * PL/pgSQL Functions
+ * ------------------------------------------------------------------------- */
+
 CREATE OR REPLACE FUNCTION arima_train(
     p INT, -- Number of lagged y_t
     d INT, -- Number of times to difference
@@ -80,19 +168,7 @@ BEGIN
     v_ncond := GREATEST(p, q);
 
     -- Aggregate the series into an array
-    EXECUTE format(
-        'SELECT array_agg(%I ORDER BY %I) FROM %I',
-        value_col,
-        date_col,
-        source_table
-    )
-    INTO arr_vals;
-
-    IF arr_vals IS NULL OR array_length(arr_vals, 1) = 0 THEN
-        RAISE EXCEPTION
-            'ARIMA: no data found in % for columns %, %',
-            source_table, date_col, value_col;
-    END IF;
+    arr_vals := arima_series(source_table, date_col, value_col);
 
     IF d > 0 THEN
         arr_vals := arima_difference(arr_vals, d);
@@ -143,19 +219,7 @@ BEGIN
     v_ncond := GREATEST(p, q);
 
     -- Aggregate the series into an array
-    EXECUTE format(
-        'SELECT array_agg(%I ORDER BY %I) FROM %I',
-        value_col,
-        date_col,
-        source_table
-    )
-    INTO arr_vals;
-
-    IF arr_vals IS NULL OR array_length(arr_vals, 1) = 0 THEN
-        RAISE EXCEPTION
-            'ARIMA: no data found in % for columns %, %',
-            source_table, date_col, value_col;
-    END IF;
+    arr_vals := arima_series(source_table, date_col, value_col);
 
     IF d > 0 THEN
         arr_initial_vals := arr_vals[1:d];
@@ -209,67 +273,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Incremental update logic
-CREATE TYPE css_incremental_state AS (
-    t INT,
-    p INT,
-    q INT,
-    y_lags DOUBLE PRECISION[],
-    e_lags DOUBLE PRECISION[],
-    css DOUBLE PRECISION
-);
-
-CREATE FUNCTION css_incremental_transition(
-    state css_incremental_state,
-    y DOUBLE PRECISION,
-    phi DOUBLE PRECISION[],
-    theta DOUBLE PRECISION[],
-    c DOUBLE PRECISION DEFAULT 0.0 -- 0 if no constant term required
-)
-RETURNS css_incremental_state
-AS 'MODULE_PATHNAME', 'css_incremental_transition'
-LANGUAGE C IMMUTABLE;
-
-CREATE FUNCTION _css_incremental_transition(
-    state INTERNAL,
-    y DOUBLE PRECISION,
-    phi DOUBLE PRECISION[],
-    theta DOUBLE PRECISION[],
-    c DOUBLE PRECISION DEFAULT 0.0 -- 0 if no constant term required
-)
-RETURNS INTERNAL
-AS 'MODULE_PATHNAME', '_css_incremental_transition'
-LANGUAGE C IMMUTABLE;
-
-CREATE FUNCTION _css_incremental_final(state INTERNAL)
-RETURNS css_incremental_state
-AS 'MODULE_PATHNAME', '_css_incremental_final'
-LANGUAGE C IMMUTABLE;
-
-CREATE AGGREGATE css_incremental(
-    y DOUBLE PRECISION,
-    phi DOUBLE PRECISION[],
-    theta DOUBLE PRECISION[],
-    c DOUBLE PRECISION
-) (
-    SFUNC = _css_incremental_transition,
-    STYPE = INTERNAL, -- Initialisation handled by C
-    FINALFUNC = _css_incremental_final
-);
-
-CREATE TABLE model_arima_stats(
-    id BIGSERIAL PRIMARY KEY,
-    model_id INT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
-    phi DOUBLE PRECISION[] NOT NULL,
-    theta DOUBLE PRECISION[] NOT NULL,
-    d INT NOT NULL,
-    c DOUBLE PRECISION DEFAULT 0.0,
-    is_active BOOLEAN NOT NULL,
-    incremental_state css_incremental_state NOT NULL,
-    UNIQUE (model_id, phi, theta, d, c)
-);
-
--- Used in unit tests to verify that a model has retrained
 CREATE OR REPLACE FUNCTION arima_get_active_id(
     model_id BIGINT,
     phi DOUBLE PRECISION[],
@@ -316,27 +319,13 @@ BEGIN
          FROM %I
          ORDER BY %I DESC
          LIMIT 1',
-        value_col,
-        phi,
-        theta,
-        c,
-        date_col,
-        source_table,
-        date_col,
-        date_col
+
+        value_col, phi, theta, c, date_col,
+        source_table, date_col, date_col
     ) INTO rec_state;
     RETURN rec_state.s;
 END;
 $$ LANGUAGE plpgsql;
-
-CREATE TABLE arima_vertices (
-    arima_id BIGINT NOT NULL REFERENCES model_arima_stats(id) ON DELETE CASCADE,
-    vertex_id INT NOT NULL,
-    phi DOUBLE PRECISION[],
-    theta DOUBLE PRECISION[],
-    incremental_state css_incremental_state NOT NULL,
-    PRIMARY KEY (arima_id, vertex_id)
-);
 
 CREATE OR REPLACE FUNCTION arima_has_vertices(
     arima_id BIGINT
@@ -363,7 +352,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Create Simplex vertices for incremental bound checking
 CREATE OR REPLACE FUNCTION arima_create_simplex_vertices(
     centre_id BIGINT, -- ID of model to target (centre vector) in model_arima_stats
     tolerance DOUBLE PRECISION DEFAULT 0.05 -- 0.05 empirically found by Rosenthal & Lehner
@@ -456,7 +444,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Update model loss when new record inserted
 CREATE OR REPLACE FUNCTION arima_update_model(
     target_model_id BIGINT,
     new_y DOUBLE PRECISION
@@ -523,6 +510,10 @@ BEGIN
     END IF;
 END;
 $$ LANGUAGE plpgsql;
+
+/* -------------------------------------------------------------------------
+ * Triggers
+ * ------------------------------------------------------------------------- */
 
 CREATE OR REPLACE FUNCTION trg_autoarima_on_insert()
 RETURNS TRIGGER 

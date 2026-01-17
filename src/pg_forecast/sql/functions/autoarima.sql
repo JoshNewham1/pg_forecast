@@ -1,8 +1,27 @@
+/* -------------------------------------------------------------------------
+ * Types
+ * ------------------------------------------------------------------------- */
+
 CREATE TYPE kpss_rec AS (
     kpss_val DOUBLE PRECISION,
     crit_val DOUBLE PRECISION,
     test_passed BOOLEAN
 );
+
+CREATE TYPE autoarima_rec AS (
+    p INT,
+    d INT,
+    q INT,
+    c DOUBLE PRECISION,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    css DOUBLE PRECISION,
+    aicc DOUBLE PRECISION
+);
+
+/* -------------------------------------------------------------------------
+ * C Functions
+ * ------------------------------------------------------------------------- */
 
 CREATE FUNCTION kpss(
     vals DOUBLE PRECISION[], -- Ordered array of time-series values
@@ -23,16 +42,9 @@ RETURNS DOUBLE PRECISION
 AS 'MODULE_PATHNAME', 'aicc'
 LANGUAGE C STRICT STABLE;
 
-CREATE TYPE autoarima_rec AS (
-    p INT,
-    d INT,
-    q INT,
-    c DOUBLE PRECISION,
-    phi DOUBLE PRECISION[],
-    theta DOUBLE PRECISION[],
-    css DOUBLE PRECISION,
-    aicc DOUBLE PRECISION
-);
+/* -------------------------------------------------------------------------
+ * PL/pgSQL Functions
+ * ------------------------------------------------------------------------- */
 
 -- Helper function to calculate number of parameters
 CREATE OR REPLACE FUNCTION autoarima_param_count(p INT, q INT, include_c BOOLEAN)
@@ -76,13 +88,7 @@ BEGIN
     -- Safety precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
     -- Aggregate the series into an array
-    EXECUTE format(
-        'SELECT array_agg(%I ORDER BY %I) FROM %I',
-        value_col,
-        date_col,
-        source_table
-    )
-    INTO arr_vals;
+    arr_vals := arima_series(source_table, date_col, value_col);
 
     n_vals := array_length(arr_vals, 1);
 

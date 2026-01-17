@@ -10,19 +10,16 @@
 double* pg_array_to_c_double(ArrayType* inp_arr, int* out_n, bool accept_nulls,
                             const char* caller);
 
+double *get_1d_double_array(ArrayType *arr, int *n, const char *fn);
+
+void check_arima_dims(int p, int q, int n_phi, int n_theta, const char *fn);
+
 ArrayType* build_float8_array(double* arr, int size);
 
 /* Maths helpers */
 double arr_mean(double *x, int n);
-#define max(a,b) \
-   ({ __typeof__ (a) _a = (a); \
-       __typeof__ (b) _b = (b); \
-     _a > _b ? _a : _b; })
-    
-#define min(a,b) \
-   ({ __typeof__ (a) _a = (a); \
-       __typeof__ (b) _b = (b); \
-     _a <= _b ? _a : _b; })
+#define max(a,b) ((a) > (b) ? (a) : (b))
+#define min(a,b) ((a) < (b) ? (a) : (b))
 
 #ifndef M_PI
     #define M_PI (3.14159265358979323846)

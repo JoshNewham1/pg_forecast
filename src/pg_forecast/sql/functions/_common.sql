@@ -14,6 +14,27 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION arima_series(
+    source_table TEXT,
+    date_col TEXT,
+    value_col TEXT
+) RETURNS DOUBLE PRECISION[] AS $$
+DECLARE arr DOUBLE PRECISION[];
+BEGIN
+    EXECUTE format(
+        'SELECT array_agg(%I ORDER BY %I) FROM %I',
+        value_col, date_col, source_table
+    ) INTO arr;
+
+    IF arr IS NULL OR array_length(arr,1) = 0 THEN
+        RAISE EXCEPTION 'ARIMA: no data found in % for columns %, %',
+            source_table, date_col, value_col;
+    END IF;
+
+    RETURN arr;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION pg_forecast(
     model_name TEXT,
     input_table TEXT,
@@ -33,18 +54,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
-CREATE TYPE model AS ENUM ('autoarima');
-
-CREATE TABLE models(
-    id BIGSERIAL PRIMARY KEY,
-    model_type model NOT NULL,
-    input_table TEXT NOT NULL,
-    date_column TEXT NOT NULL,
-    value_column TEXT NOT NULL,
-    horizon INT NOT NULL,
-    UNIQUE (model_type, input_table, date_column, value_column)
-);
 
 -- Used in unit tests to verify that a model has retrained
 CREATE OR REPLACE FUNCTION model_get_id(
