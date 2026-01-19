@@ -87,8 +87,10 @@ DECLARE
 BEGIN
     -- Safety precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
-    -- Aggregate the series into an array
-    arr_vals := arima_series(source_table, date_col, value_col);
+    -- Aggregate the series into an array, dropping NULLs
+    arr_vals := series_to_array(source_table, date_col, value_col, TRUE);
+
+    RAISE NOTICE 'autoarima_train: arr_vals dims: %, length: %, type: %', array_dims(arr_vals), array_length(arr_vals, 1), pg_typeof(arr_vals);
 
     n_vals := array_length(arr_vals, 1);
 
@@ -262,11 +264,11 @@ BEGIN
 
     -- Register trigger on table
     EXECUTE format('
-        CREATE OR REPLACE TRIGGER autoarima_on_insert_%I
+        CREATE OR REPLACE TRIGGER autoarima_on_insert_%I_%I
         AFTER INSERT ON %I
         FOR EACH ROW
         EXECUTE FUNCTION trg_autoarima_on_insert();', 
-        source_table, source_table
+        source_table, value_col, source_table
     );
 
     RAISE NOTICE 'AutoARIMA: Best model found ARIMA(%,%,%) with CSS % and AICc %',

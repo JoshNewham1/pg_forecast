@@ -168,8 +168,8 @@ DECLARE
 BEGIN
     v_ncond := GREATEST(p, q);
 
-    -- Aggregate the series into an array
-    arr_vals := arima_series(source_table, date_col, value_col);
+    -- Aggregate the series into an array, dropping NULLs
+    arr_vals := series_to_array(source_table, date_col, value_col, TRUE);
 
     IF d > 0 THEN
         arr_vals := arima_difference(arr_vals, d);
@@ -219,8 +219,8 @@ DECLARE
 BEGIN
     v_ncond := GREATEST(p, q);
 
-    -- Aggregate the series into an array
-    arr_vals := arima_series(source_table, date_col, value_col);
+    -- Aggregate the series into an array, dropping NULLs
+    arr_vals := series_to_array(source_table, date_col, value_col, TRUE);
 
     IF d > 0 THEN
         arr_initial_vals := arr_vals[1:d];
@@ -445,6 +445,32 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION arima_updated_states(
+    target_model_id BIGINT,
+    new_y DOUBLE PRECISION,
+    arima_id BIGINT,
+    OUT vertex_id BIGINT,
+    OUT new_state css_incremental_state
+)
+RETURNS SETOF RECORD
+LANGUAGE SQL
+AS $$
+    SELECT
+        s.vertex_id,
+        css_incremental_transition(s.state, new_y, s.phi, s.theta) AS new_state
+    FROM (
+        SELECT NULL AS vertex_id, s.phi, s.theta, s.incremental_state AS state
+        FROM model_arima_stats s
+        WHERE s.model_id = target_model_id AND s.is_active = TRUE
+
+        UNION ALL
+
+        SELECT v.vertex_id, v.phi, v.theta, v.incremental_state AS state
+        FROM arima_vertices v
+        WHERE v.arima_id = arima_id
+    ) s
+$$;
+
 CREATE OR REPLACE FUNCTION arima_update_model(
     target_model_id BIGINT,
     new_y DOUBLE PRECISION
@@ -464,28 +490,14 @@ BEGIN
     INNER JOIN model_arima_stats a ON m.id = a.model_id AND a.is_active = TRUE
     WHERE m.id = target_model_id;
 
-    DROP TABLE IF EXISTS tmp_updated_states;
-    CREATE TEMP TABLE tmp_updated_states ON COMMIT DROP AS (
-        SELECT
-            s.vertex_id,
-            (css_incremental_transition(s.state, new_y, s.phi, s.theta)) AS new_state
-        FROM (
-            -- Combine centre vector and simplex vertices
-            SELECT NULL AS vertex_id, s.phi, s.theta, s.incremental_state AS state FROM model_arima_stats s
-            WHERE s.model_id = target_model_id AND s.is_active = TRUE
-            UNION ALL
-            SELECT v.vertex_id, v.phi, v.theta, v.incremental_state AS state FROM arima_vertices v
-            WHERE v.arima_id = rec_model.arima_id
-        ) s
-    );
-    
     WITH comparison AS (
-        SELECT 
-            (SELECT (new_state).css FROM tmp_updated_states WHERE vertex_id IS NULL) as centre_css,
-            MIN((new_state).css) FILTER (WHERE vertex_id IS NOT NULL) as min_vertex_css
-        FROM tmp_updated_states
+        SELECT
+            (SELECT (new_state).css FROM arima_updated_states(target_model_id, new_y, rec_model.arima_id) WHERE vertex_id IS NULL) AS centre_css,
+            (SELECT MIN((new_state).css) FROM arima_updated_states(target_model_id, new_y, rec_model.arima_id) WHERE vertex_id IS NOT NULL) AS min_vertex_css
     )
-    SELECT (min_vertex_css < centre_css) INTO v_breach_detected FROM comparison;
+    SELECT (min_vertex_css < centre_css)
+    INTO v_breach_detected
+    FROM comparison;
 
     IF v_breach_detected THEN
         -- Mark current model inactive and retrain
@@ -500,13 +512,13 @@ BEGIN
         -- Centre vector
         UPDATE model_arima_stats m
         SET incremental_state = u.new_state
-        FROM tmp_updated_states u
+        FROM arima_updated_states(target_model_id, new_y, rec_model.arima_id) u
         WHERE m.model_id = target_model_id AND u.vertex_id IS NULL;
 
         -- Simplex vertices
         UPDATE arima_vertices v
         SET incremental_state = u.new_state
-        FROM tmp_updated_states u
+        FROM arima_updated_states(target_model_id, new_y, rec_model.arima_id) u
         WHERE v.arima_id = rec_model.arima_id AND v.vertex_id = u.vertex_id;
     END IF;
 END;
@@ -530,6 +542,11 @@ BEGIN
     SELECT id, value_column FROM models
     INTO rec_model
     WHERE input_table = TG_TABLE_NAME AND model_type = 'autoarima';
+
+    IF rec_model IS NULL THEN
+        RAISE WARNING 'trg_autoarima_on_insert: Model not found for table %. This should not happen.', TG_TABLE_NAME;
+        RETURN NEW;
+    END IF;
 
     -- Dynamically get the value from the NEW record using the column name stored in the model
     EXECUTE format('SELECT ($1).%I', rec_model.value_column) 

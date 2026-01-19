@@ -52,11 +52,27 @@ def solar_dataset():
 # Utility functions
 
 
-def single_inserts_test(test_engine, dataset, num_inserts, max_avg_insert):
+def setup_forecast_model(conn, model_factory, table_name):
+    # Set up incremental forecasting model
+    model = model_factory()
+    model_name = model.model_name
+    # Map adapter name to SQL enum
+    if model_name == "ARIMA":
+        model_name = "autoarima"
+
+    conn.execute(text(
+        f"SELECT create_forecast('{model_name}', '{table_name}', 'date', 'value', 10)"
+    ))
+    conn.commit()
+    return model_name
+
+
+def single_inserts_test(test_engine, dataset, num_inserts, max_avg_insert, model_factory):
     timings = []
     inserts = 0
+    train_size = 100
+
     with test_engine.connect() as conn:
-        # TODO: Set up incremental forecasting model
         trans = conn.begin()
         conn.execute(
             text(f"""
@@ -68,31 +84,58 @@ def single_inserts_test(test_engine, dataset, num_inserts, max_avg_insert):
         )
         conn.execute(text(f"TRUNCATE TABLE {BASE_TABLE};"))
         trans.commit()
-        # Go through each time-series value in the first series and insert & commit
-        for series_val in dataset:
-            if inserts == num_inserts:
+
+        # Insert training data
+        for _ in range(train_size):
+            try:
+                series_val = next(dataset)
+                timestamp = series_val['start_timestamp'] + \
+                    timedelta(seconds=series_val['time_index'])
+                trans = conn.begin()
+                conn.execute(text(
+                    f"INSERT INTO {BASE_TABLE}(date, value) VALUES ('{timestamp}', {series_val['value']})"))
+                trans.commit()
+            except StopIteration:
                 break
-            trans = conn.begin()
-            timestamp = series_val['start_timestamp'] + \
-                timedelta(seconds=series_val['time_index'])
-            start = time.perf_counter()
+
+        model_name = setup_forecast_model(conn, model_factory, BASE_TABLE)
+
+        try:
+            # Go through each time-series value in the first series and insert & commit
+            for series_val in dataset:
+                if inserts == num_inserts:
+                    break
+                
+                timestamp = series_val['start_timestamp'] + \
+                    timedelta(seconds=series_val['time_index'])
+                
+                start = time.perf_counter()
+                with conn.begin():
+                    conn.execute(text(
+                        f"INSERT INTO {BASE_TABLE}(date, value) VALUES ('{timestamp}', {series_val['value']})"))
+                end = time.perf_counter()
+                
+                timings.append(end - start)
+                inserts += 1
+        finally:
+            if conn.in_transaction():
+                conn.rollback()
             conn.execute(text(
-                f"INSERT INTO {BASE_TABLE}(date, value) VALUES ('{timestamp}', {series_val['value']})"))
-            trans.commit()
-            end = time.perf_counter()
-            timings.append(end - start)
-            inserts += 1
+                f"SELECT remove_forecast('{model_name}'::model, '{BASE_TABLE}', 'date', 'value')"
+            ))
+            conn.commit()
 
     avg_insert = sum(timings) / len(timings)
     logging.info(f"Average insert time (s): {avg_insert}")
     assert avg_insert < max_avg_insert, f"Average insert time ({avg_insert} s) is over an acceptable threshold"
 
 
-def bulk_inserts_test(test_engine, dataset, num_inserts, page_size, max_avg_insert):
+def bulk_inserts_test(test_engine, dataset, num_inserts, page_size, max_avg_insert, model_factory):
     timings = []
     inserts = 0
+    train_size = 100
+
     with test_engine.connect() as conn:
-        # TODO: Set up incremental forecasting model
         trans = conn.begin()
         conn.execute(
             text(f"""
@@ -104,28 +147,56 @@ def bulk_inserts_test(test_engine, dataset, num_inserts, page_size, max_avg_inse
         )
         conn.execute(text(f"TRUNCATE TABLE {BASE_TABLE};"))
         trans.commit()
-        # Go through each time-series value in all series, bulk inserting every PAGE_SIZE records
+
+        # Insert training data
         values = []
-        for series_val in dataset:
-            if inserts == num_inserts:
+        for _ in range(train_size):
+            try:
+                series_val = next(dataset)
+                timestamp = series_val['start_timestamp'] + \
+                    timedelta(seconds=series_val['time_index'])
+                values.append(f"('{timestamp}', {series_val['value']})")
+            except StopIteration:
                 break
-
-            # Parse individual value
-            timestamp = series_val['start_timestamp'] + \
-                timedelta(seconds=series_val['time_index'])
-            values.append(f"('{timestamp}', {series_val['value']})")
-            inserts += 1
-
-            # Every page_size values, bulk insert them and time it
-            if inserts % page_size == 0:
-                trans = conn.begin()
-                start = time.perf_counter()
+        
+        if values:
+            with conn.begin():
                 conn.execute(text(
                     f"INSERT INTO {BASE_TABLE}(date, value) VALUES {','.join(values)}"))
-                trans.commit()
-                end = time.perf_counter()
-                timings.append(end - start)
-                values = []
+            values = []
+
+        model_name = setup_forecast_model(conn, model_factory, BASE_TABLE)
+
+        try:
+            # Go through each time-series value in all series, bulk inserting every PAGE_SIZE records
+            values = []
+            for series_val in dataset:
+                if inserts == num_inserts:
+                    break
+
+                # Parse individual value
+                timestamp = series_val['start_timestamp'] + \
+                    timedelta(seconds=series_val['time_index'])
+                values.append(f"('{timestamp}', {series_val['value']})")
+                inserts += 1
+
+                # Every page_size values, bulk insert them and time it
+                if inserts % page_size == 0:
+                    start = time.perf_counter()
+                    with conn.begin():
+                        conn.execute(text(
+                            f"INSERT INTO {BASE_TABLE}(date, value) VALUES {','.join(values)}"))
+                    end = time.perf_counter()
+                    timings.append(end - start)
+                    values = []
+                    logging.info(f"Page {len(timings)}/{num_inserts//page_size} inserted in {end - start} seconds")
+        finally:
+            if conn.in_transaction():
+                conn.rollback()
+            conn.execute(text(
+                f"SELECT remove_forecast('{model_name}'::model, '{BASE_TABLE}', 'date', 'value')"
+            ))
+            conn.commit()
 
     avg_insert = sum(timings) / len(timings) / page_size
     logging.info(f"Average insert time (s): {avg_insert}")
@@ -135,22 +206,22 @@ def bulk_inserts_test(test_engine, dataset, num_inserts, page_size, max_avg_inse
 @pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_wind_farms_individual(model_factory, test_engine, wind_farms_dataset):
     single_inserts_test(test_engine, wind_farms_dataset,
-                        num_inserts=10_000, max_avg_insert=1)
+                        num_inserts=10_000, max_avg_insert=1, model_factory=model_factory)
 
 
 @pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_wind_farms_batch(model_factory, test_engine, wind_farms_dataset):
     bulk_inserts_test(test_engine, wind_farms_dataset,
-                      num_inserts=1_000_000, page_size=10_000, max_avg_insert=0.01)
+                      num_inserts=1_000_000, page_size=10_000, max_avg_insert=0.01, model_factory=model_factory)
 
 
 @pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_solar_individual(model_factory, test_engine, solar_dataset):
     single_inserts_test(test_engine, solar_dataset,
-                        num_inserts=10_000, max_avg_insert=1)
+                        num_inserts=10_000, max_avg_insert=1, model_factory=model_factory)
 
 
 @pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
 def test_solar_batch(model_factory, test_engine, solar_dataset):
     bulk_inserts_test(test_engine, solar_dataset,
-                      num_inserts=1_000_000, page_size=10_000, max_avg_insert=0.01)
+                      num_inserts=1_000_000, page_size=10_000, max_avg_insert=0.01, model_factory=model_factory)

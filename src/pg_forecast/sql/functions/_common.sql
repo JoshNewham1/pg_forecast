@@ -14,44 +14,74 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION arima_series(
-    source_table TEXT,
-    date_col TEXT,
-    value_col TEXT
-) RETURNS DOUBLE PRECISION[] AS $$
-DECLARE arr DOUBLE PRECISION[];
-BEGIN
-    EXECUTE format(
-        'SELECT array_agg(%I ORDER BY %I) FROM %I',
-        value_col, date_col, source_table
-    ) INTO arr;
-
-    IF arr IS NULL OR array_length(arr,1) = 0 THEN
-        RAISE EXCEPTION 'ARIMA: no data found in % for columns %, %',
-            source_table, date_col, value_col;
-    END IF;
-
-    RETURN arr;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION pg_forecast(
+CREATE OR REPLACE FUNCTION create_forecast(
     model_name TEXT,
     input_table TEXT,
     date_col TEXT,
     value_col TEXT,
     horizon INT
 )
-RETURNS TABLE(date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
+RETURNS BOOLEAN -- Was forecast creation successful
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_result BOOLEAN;
 BEGIN
-    RETURN QUERY EXECUTE format(
-        $f$
-        SELECT
-            CAST('1970-01-01' AS TIMESTAMP) AS date,
-            CAST(1 AS DOUBLE PRECISION) AS forecast_value
-        FROM generate_series(1, %s)
-        $f$, horizon
+    v_result :=
+        CASE model_name
+            WHEN 'autoarima' THEN
+                (SELECT autoarima_train(
+                    horizon,
+                    input_table,
+                    date_col,
+                    value_col
+                )) IS NOT NULL
+            ELSE
+                NULL
+        END;
+
+    IF v_result IS NULL THEN
+        RAISE EXCEPTION '% not supported, please try again', model_name;
+    END IF;
+
+    RETURN v_result;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION remove_forecast(
+    model_type model,
+    input_table TEXT,
+    date_column TEXT,
+    value_column TEXT
+)
+RETURNS BOOLEAN
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_deleted_id BIGINT;
+BEGIN
+    -- Safety precaution for SECURITY DEFINER
+    PERFORM set_config('search_path', 'public,pg_temp', true);
+
+    EXECUTE format(
+        'DELETE FROM models
+        WHERE model_type = %L AND input_table = %L AND date_column = %L AND value_column = %L
+        RETURNING id;',
+        
+        model_type, input_table, date_column, value_column
+    ) INTO v_deleted_id;
+
+    EXECUTE format(
+        'DROP TRIGGER %I_on_insert_%I_%I ON %I;',
+        
+        model_type, input_table, value_column, input_table
     );
+
+    IF v_deleted_id IS NOT NULL THEN
+        RETURN TRUE;
+    ELSE
+        RETURN FALSE;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -84,33 +114,31 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION remove_forecast(
-    model_type model,
-    input_table TEXT,
-    date_column TEXT,
-    value_column TEXT
-)
-RETURNS BOOLEAN
-SECURITY DEFINER
-AS $$
-DECLARE
-    v_deleted_id BIGINT;
+CREATE FUNCTION series_to_array(
+    source_table TEXT,
+    date_col TEXT,
+    value_col TEXT,
+    drop_nulls BOOLEAN DEFAULT FALSE
+) RETURNS DOUBLE PRECISION[] AS $$
+DECLARE arr DOUBLE PRECISION[];
 BEGIN
-    -- Safety precaution for SECURITY DEFINER
-    PERFORM set_config('search_path', 'public,pg_temp', true);
-
-    EXECUTE format(
-        'DELETE FROM models
-        WHERE model_type = %L AND input_table = %L AND date_column = %L AND value_column = %L
-        RETURNING id',
-        
-        model_type, input_table, date_column, value_column
-    ) INTO v_deleted_id;
-
-    IF v_deleted_id IS NOT NULL THEN
-        RETURN TRUE;
+    IF drop_nulls THEN
+        EXECUTE format(
+            'SELECT array_agg(%I ORDER BY %I) FROM %I WHERE %I IS NOT NULL',
+            value_col, date_col, source_table, value_col
+        ) INTO arr;
     ELSE
-        RETURN FALSE;
+        EXECUTE format(
+            'SELECT array_agg(%I ORDER BY %I) FROM %I',
+            value_col, date_col, source_table
+        ) INTO arr;
     END IF;
+
+    IF arr IS NULL OR cardinality(arr) = 0 THEN
+        RAISE EXCEPTION 'ARIMA: no data found in % for columns %, %',
+            source_table, date_col, value_col;
+    END IF;
+
+    RETURN arr;
 END;
 $$ LANGUAGE plpgsql;
