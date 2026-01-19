@@ -72,7 +72,7 @@ BEGIN
     ) INTO v_deleted_id;
 
     EXECUTE format(
-        'DROP TRIGGER %I_on_insert_%I_%I ON %I;',
+        'DROP TRIGGER IF EXISTS %I_on_insert_%I_%I ON %I;',
         
         model_type, input_table, value_column, input_table
     );
