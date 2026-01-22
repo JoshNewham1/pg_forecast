@@ -26,8 +26,8 @@ class InDBModelAdapter(ModelBase):
         self,
         model_name: str,
         model_args: dict = None,
-        train_fn: str = "pg_forecast_train",
-        forecast_fn: str = "pg_forecast",
+        train_fn: str = "create_forecast",
+        forecast_fn: str = "run_forecast",
         base_table: str = "pg_forecast_tfb_eval",
         **kwargs
     ):
@@ -99,9 +99,8 @@ class InDBModelAdapter(ModelBase):
         self._copy_to_db(train_data, self.base_table)
 
         # Run in-DB training
-        args_str = self._format_sql_args(self.model_args)
         with self.engine.begin() as conn:
-            sql = f"SELECT {self.train_fn}('{self._model_name}', '{self.base_table}', '{date_col}', '{value_col}'{args_str});"
+            sql = f"SELECT {self.train_fn}('{self._model_name}', '{self.base_table}', '{date_col}', '{value_col}');"
             conn.execute(text(sql))
 
         return self
@@ -154,8 +153,8 @@ class InDBModelAdapter(ModelBase):
 # Factory generator for different types of model
 def _generate_model_factory(
     model_name: str,
-    train_fn: str = "pg_forecast_train",
-    forecast_fn: str = "pg_forecast",
+    train_fn: str = "create_forecast",
+    forecast_fn: str = "run_forecast",
     model_args: dict = None,
 ) -> Dict:
     """
@@ -204,16 +203,10 @@ def in_db_model_adapter(model_class: type) -> Dict:
 
 # Register models for auto-discovery
 ARIMA = _generate_model_factory(
-    model_name="ARIMA",
-    model_args={}
-)
-
-ETS = _generate_model_factory(
-    model_name="ETS",
+    model_name="autoarima",
     model_args={}
 )
 
 IN_DB_MODELS = [
-    _get_model_info("ARIMA", {}, {}),
-    _get_model_info("ETS", {}, {})
+    _get_model_info("autoarima", {}, {})
 ]
