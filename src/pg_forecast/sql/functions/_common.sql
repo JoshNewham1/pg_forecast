@@ -3,8 +3,7 @@ CREATE OR REPLACE FUNCTION create_forecast(
     model_name TEXT,
     input_table TEXT,
     date_column TEXT,
-    value_column TEXT,
-    horizon INT
+    value_column TEXT
 )
 RETURNS BOOLEAN -- Was forecast creation successful
 LANGUAGE plpgsql
@@ -16,7 +15,6 @@ BEGIN
         CASE model_name
             WHEN 'autoarima' THEN
                 (SELECT autoarima_train(
-                    horizon,
                     input_table,
                     date_column,
                     value_column
@@ -78,7 +76,7 @@ BEGIN
             RAISE WARNING 'run_forecast: no autoarima model found, please run create_forecast first';
             RETURN;
         END IF;
-        
+
         v_opt_result := (rec_model.phi, rec_model.theta, rec_model.c, rec_model.residuals, rec_model.css);
         RETURN QUERY
             SELECT 

@@ -571,7 +571,7 @@ BEGIN
         WHERE id = rec_model.arima_id;
 
         RAISE NOTICE 'Retraining AutoARIMA model as loss dropped below threshold';
-        PERFORM autoarima_train(rec_model.horizon, rec_model.input_table, rec_model.date_column, rec_model.value_column);
+        PERFORM autoarima_train(rec_model.input_table, rec_model.date_column, rec_model.value_column);
     ELSE
         -- Update the stored states with the new values calculated in the CTE
         -- Centre vector

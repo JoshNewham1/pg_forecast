@@ -55,7 +55,6 @@ END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
 CREATE OR REPLACE FUNCTION autoarima_train(
-    horizon INT,
     source_table TEXT, -- Table/view name
     date_col TEXT,     -- Timestamp column
     value_col TEXT     -- Numerical value column
@@ -234,13 +233,12 @@ BEGIN
     END LOOP;
 
     -- Create entry in models & stats tables to incrementally update CSS
-    INSERT INTO models("model_type", "input_table", "date_column", "value_column", "horizon")
+    INSERT INTO models("model_type", "input_table", "date_column", "value_column")
     VALUES (
         'autoarima'::model,
         source_table,
         date_col,
-        value_col,
-        horizon
+        value_col
     )
     ON CONFLICT (model_type, input_table, date_column, value_column)
     DO UPDATE SET model_type = models.model_type  -- No op
@@ -289,7 +287,7 @@ DECLARE
     best_model autoarima_rec;
     include_mean BOOL := TRUE;
 BEGIN
-    best_model := autoarima_train(horizon, source_table, date_col, value_col);
+    best_model := autoarima_train(source_table, date_col, value_col);
     IF best_model.c = 0 THEN
         include_mean := FALSE;
     END IF;

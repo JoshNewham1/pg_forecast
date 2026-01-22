@@ -622,7 +622,6 @@ def test_autoarima_finds_low_loss_model(test_engine):
         query = text("""
             SELECT css, p, d, q 
             FROM autoarima_train(
-                horizon := 5,
                 source_table := 'pg_forecast_unit_test',
                 date_col := 't',
                 value_col := 'value'
@@ -654,7 +653,7 @@ def test_autoarima_trigger_on_outliers(test_engine):
         train_result = conn.execute(text("""
             SELECT remove_forecast('autoarima', 'pg_forecast_unit_test', 't', 'value');
             SELECT p, d, q, c, phi, theta 
-            FROM autoarima_train(4, 'pg_forecast_unit_test', 't', 'value');
+            FROM autoarima_train('pg_forecast_unit_test', 't', 'value');
         """)).fetchone()
         conn.commit()
 
