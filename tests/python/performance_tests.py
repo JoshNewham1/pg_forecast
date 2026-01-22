@@ -2,13 +2,13 @@ from monash.utils import stream_tsf_series, stream_tsf_values
 import pytest
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
-from utils import MODEL_FACTORIES
 import os
 import time
 from datetime import timedelta
 import logging
 
 BASE_TABLE = "pg_forecast_tfb_performance"
+MODELS_TO_TEST = ["autoarima"]
 
 
 @pytest.fixture(scope="session")
@@ -52,22 +52,22 @@ def solar_dataset():
 # Utility functions
 
 
-def setup_forecast_model(conn, model_factory, table_name):
-    # Set up incremental forecasting model
-    model = model_factory()
-    model_name = model.model_name
-    # Map adapter name to SQL enum
-    if model_name == "ARIMA":
-        model_name = "autoarima"
-
+def setup_forecast_model(conn, model_name, table_name):
     conn.execute(text(
         f"SELECT create_forecast('{model_name}', '{table_name}', 'date', 'value', 10)"
     ))
     conn.commit()
     return model_name
 
+def tear_down_forecast_model(conn, model_name, table_name):
+    conn.execute(text(
+        f"SELECT remove_forecast('{model_name}', '{table_name}', 'date', 'value')"
+    ))
+    conn.commit()
+    return model_name
 
-def single_inserts_test(test_engine, dataset, num_inserts, max_avg_insert, model_factory):
+
+def single_inserts_test(test_engine, dataset, num_inserts, max_avg_insert, model_name):
     timings = []
     inserts = 0
     train_size = 100
@@ -98,7 +98,7 @@ def single_inserts_test(test_engine, dataset, num_inserts, max_avg_insert, model
             except StopIteration:
                 break
 
-        model_name = setup_forecast_model(conn, model_factory, BASE_TABLE)
+        setup_forecast_model(conn, model_name, BASE_TABLE)
 
         try:
             # Go through each time-series value in the first series and insert & commit
@@ -120,17 +120,14 @@ def single_inserts_test(test_engine, dataset, num_inserts, max_avg_insert, model
         finally:
             if conn.in_transaction():
                 conn.rollback()
-            conn.execute(text(
-                f"SELECT remove_forecast('{model_name}'::model, '{BASE_TABLE}', 'date', 'value')"
-            ))
-            conn.commit()
+            tear_down_forecast_model(conn, model_name, BASE_TABLE)
 
     avg_insert = sum(timings) / len(timings)
     logging.info(f"Average insert time (s): {avg_insert}")
     assert avg_insert < max_avg_insert, f"Average insert time ({avg_insert} s) is over an acceptable threshold"
 
 
-def bulk_inserts_test(test_engine, dataset, num_inserts, page_size, max_avg_insert, model_factory):
+def bulk_inserts_test(test_engine, dataset, num_inserts, page_size, max_avg_insert, model_name):
     timings = []
     inserts = 0
     train_size = 100
@@ -165,7 +162,7 @@ def bulk_inserts_test(test_engine, dataset, num_inserts, page_size, max_avg_inse
                     f"INSERT INTO {BASE_TABLE}(date, value) VALUES {','.join(values)}"))
             values = []
 
-        model_name = setup_forecast_model(conn, model_factory, BASE_TABLE)
+        setup_forecast_model(conn, model_name, BASE_TABLE)
 
         try:
             # Go through each time-series value in all series, bulk inserting every PAGE_SIZE records
@@ -189,39 +186,39 @@ def bulk_inserts_test(test_engine, dataset, num_inserts, page_size, max_avg_inse
                     end = time.perf_counter()
                     timings.append(end - start)
                     values = []
-                    logging.info(f"Page {len(timings)}/{num_inserts//page_size} inserted in {end - start} seconds")
+                    logging.info(f"Page {len(timings)}/{num_inserts//page_size}: inserted {page_size} records in {end - start} seconds")
         finally:
             if conn.in_transaction():
                 conn.rollback()
-            conn.execute(text(
-                f"SELECT remove_forecast('{model_name}'::model, '{BASE_TABLE}', 'date', 'value')"
-            ))
-            conn.commit()
+            tear_down_forecast_model(conn, model_name, BASE_TABLE)
 
     avg_insert = sum(timings) / len(timings) / page_size
     logging.info(f"Average insert time (s): {avg_insert}")
     assert avg_insert < max_avg_insert, f"Average insert time ({avg_insert} s) is over an acceptable threshold"
 
 
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_wind_farms_individual(model_factory, test_engine, wind_farms_dataset):
+# Test in-DB models
+@pytest.mark.parametrize("model_name", MODELS_TO_TEST)
+def test_wind_farms_individual(model_name, test_engine, wind_farms_dataset):
     single_inserts_test(test_engine, wind_farms_dataset,
-                        num_inserts=10_000, max_avg_insert=1, model_factory=model_factory)
+                        num_inserts=10_000, max_avg_insert=1, model_name=model_name)
 
 
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_wind_farms_batch(model_factory, test_engine, wind_farms_dataset):
+@pytest.mark.parametrize("model_name", MODELS_TO_TEST)
+def test_wind_farms_batch(model_name, test_engine, wind_farms_dataset):
     bulk_inserts_test(test_engine, wind_farms_dataset,
-                      num_inserts=1_000_000, page_size=10_000, max_avg_insert=0.01, model_factory=model_factory)
+                      num_inserts=1_000_000, page_size=10_000, max_avg_insert=0.01, model_name=model_name)
 
 
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_solar_individual(model_factory, test_engine, solar_dataset):
+@pytest.mark.parametrize("model_name", MODELS_TO_TEST)
+def test_solar_individual(model_name, test_engine, solar_dataset):
     single_inserts_test(test_engine, solar_dataset,
-                        num_inserts=10_000, max_avg_insert=1, model_factory=model_factory)
+                        num_inserts=10_000, max_avg_insert=1, model_name=model_name)
 
 
-@pytest.mark.parametrize("model_factory", MODEL_FACTORIES)
-def test_solar_batch(model_factory, test_engine, solar_dataset):
+@pytest.mark.parametrize("model_name", MODELS_TO_TEST)
+def test_solar_batch(model_name, test_engine, solar_dataset):
     bulk_inserts_test(test_engine, solar_dataset,
-                      num_inserts=1_000_000, page_size=10_000, max_avg_insert=0.01, model_factory=model_factory)
+                      num_inserts=1_000_000, page_size=10_000, max_avg_insert=0.01, model_name=model_name)
+
+# Test other solutions
