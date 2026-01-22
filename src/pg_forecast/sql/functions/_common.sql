@@ -1,24 +1,9 @@
 -- Generic
-CREATE OR REPLACE FUNCTION pg_forecast_train(
-    model_name TEXT,
-    table_name TEXT,
-    date_col TEXT,
-    value_col TEXT
-)
-RETURNS VOID
-LANGUAGE plpgsql AS
-$$
-BEGIN
-    -- TODO: Implement one-off model training?
-    RETURN;
-END;
-$$;
-
 CREATE OR REPLACE FUNCTION create_forecast(
     model_name TEXT,
     input_table TEXT,
-    date_col TEXT,
-    value_col TEXT,
+    date_column TEXT,
+    value_column TEXT,
     horizon INT
 )
 RETURNS BOOLEAN -- Was forecast creation successful
@@ -33,8 +18,8 @@ BEGIN
                 (SELECT autoarima_train(
                     horizon,
                     input_table,
-                    date_col,
-                    value_col
+                    date_column,
+                    value_column
                 )) IS NOT NULL
             ELSE
                 NULL
@@ -47,6 +32,77 @@ BEGIN
     RETURN v_result;
 END;
 $$;
+
+CREATE OR REPLACE FUNCTION run_forecast(
+    model_name TEXT,
+    input_table TEXT,
+    date_column TEXT,
+    value_column TEXT,
+    horizon INT,
+    forecast_step INTERVAL DEFAULT '1 day'
+)
+RETURNS TABLE(forecast_date TIMESTAMP, forecast_value DOUBLE PRECISION)
+SECURITY DEFINER
+AS $$
+DECLARE
+    rec_model RECORD;
+    v_opt_result arima_optimise_result;
+BEGIN
+    -- Safety precaution for SECURITY DEFINER
+    PERFORM set_config('search_path', 'public,pg_temp', true);
+    
+    IF forecast_step IS NULL THEN
+        -- TODO: Estimate step from data
+        forecast_step := '1 day'::interval;
+    END IF;
+
+    IF model_name = 'autoarima' THEN
+        -- Get params and hyperparams for forecasting
+        EXECUTE format(
+            'SELECT 
+                m.id,
+                a.d, a.c, 
+                a.phi, a.theta, 
+                (a.incremental_state).p,
+                (a.incremental_state).q,
+                (a.incremental_state).e_lags AS residuals,
+                (a.incremental_state).css
+            FROM models m
+            INNER JOIN model_arima_stats a ON m.id = a.model_id AND a.is_active = TRUE
+            WHERE m.model_type = %L AND m.input_table = %L AND m.date_column = %L AND m.value_column = %L',
+            
+            model_name, input_table, date_column, value_column
+        ) INTO rec_model;
+
+        IF rec_model IS NULL THEN
+            RAISE WARNING 'run_forecast: no autoarima model found, please run create_forecast first';
+            RETURN;
+        END IF;
+        
+        v_opt_result := (rec_model.phi, rec_model.theta, rec_model.c, rec_model.residuals, rec_model.css);
+        RETURN QUERY
+            SELECT 
+                *
+            FROM
+                arima_run_forecast(
+                    rec_model.p,
+                    rec_model.d,
+                    rec_model.q,
+                    v_opt_result,
+                    input_table,
+                    date_column,
+                    value_column,
+                    horizon,
+                    forecast_step
+                )
+        RETURN;
+    END IF;
+
+    -- If model type not found
+    RAISE WARNING 'run_forecast: % is not a valid model', model_name;
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION remove_forecast(
     model_type model,

@@ -215,7 +215,7 @@ arima_forecast(PG_FUNCTION_ARGS)
     ArrayType *theta_arr  = PG_GETARG_ARRAYTYPE_P(6);
     int32 horizon = PG_GETARG_INT32(7);
 
-    if (p < 1 || q < 1 || horizon < 1)
+    if (p < 0 || q < 0 || horizon < 1)
     {
         ereport(ERROR, 
                 (errmsg("p, q and horizon must be positive integers")));

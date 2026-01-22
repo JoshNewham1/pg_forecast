@@ -181,11 +181,11 @@ BEGIN
     EXCEPTION
         WHEN OTHERS THEN
         IF silent_error THEN
-            RAISE DEBUG 'train_arima: Failed to train ARMA(%, %) due to error: %',
+            RAISE DEBUG 'arima_train: Failed to train ARMA(%, %) due to error: %',
                 p, q, SQLERRM;
             opt_result := ('{}', '{}', 0.0, '{}', 'Infinity'::double precision)::arima_optimise_result;
         ELSE
-            RAISE EXCEPTION 'train_arima: Failed to train ARMA(%, %) due to error: %', p, q, SQLERRM;
+            RAISE EXCEPTION 'arima_train: Failed to train ARMA(%, %) due to error: %', p, q, SQLERRM;
         END IF;
     END;
 
@@ -202,7 +202,8 @@ CREATE OR REPLACE FUNCTION arima_train_and_forecast(
     date_col TEXT,     -- Timestamp column
     value_col TEXT,    -- Numerical value column
     include_mean BOOLEAN DEFAULT TRUE,
-    optimiser TEXT DEFAULT 'L-BFGS'
+    optimiser TEXT DEFAULT 'L-BFGS',
+    forecast_step INTERVAL DEFAULT '1 day'
 )
 RETURNS TABLE(date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
 DECLARE
@@ -215,7 +216,6 @@ DECLARE
     arr_last_vals DOUBLE PRECISION[];
     arr_forecasts DOUBLE PRECISION[];
     last_date TIMESTAMP;
-    v_i INT;
 BEGIN
     v_ncond := GREATEST(p, q);
 
@@ -266,11 +266,74 @@ BEGIN
     END IF;
 
     -- Return table of dates and forecast values
-    FOR v_i IN 1..horizon LOOP
-        date := last_date + (v_i * interval '1 day');  -- adjust interval if your data is not daily
-        forecast_value := arr_forecasts[v_i];
-        RETURN NEXT;
-    END LOOP;
+    RETURN QUERY
+        SELECT
+            last_date + (i * forecast_step) AS forecast_date,
+            arr_forecasts[i] AS forecast_value
+        FROM generate_series(1, horizon) AS i;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION arima_run_forecast(
+    p INT, -- Number of lagged y_t
+    d INT, -- Number of times to difference
+    q INT, -- Number of lagged residuals
+    opt_result arima_optimise_result,
+    source_table TEXT, -- Table/view name
+    date_col TEXT,     -- Timestamp column
+    value_col TEXT,    -- Numerical value column
+    horizon INT,
+    forecast_step INTERVAL
+)
+RETURNS TABLE(forecast_date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
+DECLARE
+    v_ncond INT;
+    arr_vals DOUBLE PRECISION[];
+    arr_initial_vals DOUBLE PRECISION[];
+    v_last_idx INT;
+    v_n_vals INT;
+    arr_last_vals DOUBLE PRECISION[];
+    arr_forecasts DOUBLE PRECISION[];
+    last_date TIMESTAMP;
+BEGIN
+    v_ncond := GREATEST(p, q);
+
+    -- Aggregate the series into an array, dropping NULLs
+    arr_vals := series_to_array(source_table, date_col, value_col, TRUE);
+
+    IF d > 0 THEN
+        arr_initial_vals := arr_vals[1:d];
+        arr_vals := arima_difference(arr_vals, d);
+    END IF;
+
+    -- Determine number of values/residuals needed for forecast
+    v_n_vals := array_length(arr_vals, 1);
+    v_last_idx := v_n_vals - v_ncond + 1;
+    arr_last_vals := arr_vals[v_last_idx : v_n_vals];
+
+    -- Generate forecasts
+    arr_forecasts := arima_forecast(arr_last_vals, opt_result.residuals, p, q, opt_result.c, opt_result.phi, opt_result.theta, horizon);
+    RAISE DEBUG 'ARIMA forecasted with last_vals: %, residuals: %, forecast: %', arr_last_vals, opt_result.residuals, arr_forecasts;
+
+    -- Get the last timestamp to build forecast dates
+    EXECUTE format(
+        'SELECT MAX(%I) FROM %I',
+        date_col,
+        source_table
+    )
+    INTO last_date;
+
+    IF d > 0 THEN
+        arr_forecasts := arima_integrate(arr_vals || arr_forecasts, d, arr_initial_vals);
+        arr_forecasts := arr_forecasts[v_n_vals + d + 1 : v_n_vals + d + horizon];
+    END IF;
+
+    -- Return table of dates and forecast values
+    RETURN QUERY
+        SELECT
+            last_date + (i * forecast_step) AS forecast_date,
+            arr_forecasts[i] AS forecast_value
+        FROM generate_series(1, horizon) AS i;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -309,10 +372,12 @@ CREATE OR REPLACE FUNCTION css_incremental_full_table(
     date_col TEXT,
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
-    c DOUBLE PRECISION DEFAULT 0 -- 0 if no constant term required
+    c DOUBLE PRECISION DEFAULT 0, -- 0 if no constant term required
+    d INT DEFAULT 0
 )
 RETURNS css_incremental_state AS $$
 DECLARE
+    v_query TEXT;
     rec_state RECORD;
 BEGIN
     EXECUTE format(
