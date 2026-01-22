@@ -131,6 +131,9 @@ class InDBModelAdapter(ModelBase):
         # Run forecast
         args_str = self._format_sql_args(self.model_args)
         with self.engine.begin() as conn:
+            # Create forecast model
+            sql = f"SELECT {self.train_fn}('{self._model_name}', '{self.base_table}', '{date_col}', '{value_col}');"
+            conn.execute(text(sql))
             sql = f"""
                 SELECT forecast_value
                 FROM {self.forecast_fn}('{self._model_name}', '{temp_table}', '{date_col}', '{value_col}', {horizon}{args_str});

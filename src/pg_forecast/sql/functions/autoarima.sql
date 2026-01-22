@@ -251,7 +251,7 @@ BEGIN
     INSERT INTO model_arima_stats(model_id, phi, theta, d, c, is_active, incremental_state)
     VALUES (v_model_id, rec_current.phi, rec_current.theta, rec_current.d, rec_current.c, TRUE, v_incremental_state)
     ON CONFLICT (model_id, phi, theta, d, c)
-    DO UPDATE SET incremental_state = v_incremental_state
+    DO UPDATE SET incremental_state = v_incremental_state, is_active = TRUE
     RETURNING id
     INTO v_arima_id;
 
