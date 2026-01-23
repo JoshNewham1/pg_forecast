@@ -1,6 +1,10 @@
 #ifndef CONSTANTS_H
 #define CONSTANTS_H
 
+#define AR_MAX 10      /* max AR order (phi) */
+#define MA_MAX 10      /* max MA order (theta) */
+#define D_MAX 2        /* max differencing order (d) */
+
 static const double ARIMA_OPTIMISER_MIN_BOUND = -2.0;
 static const double ARIMA_OPTIMISER_MAX_BOUND = 2.0;
 

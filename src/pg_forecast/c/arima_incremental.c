@@ -7,6 +7,7 @@
 #include "utils.h"
 #include "arima.h"
 #include <string.h>
+#include "constants.h"
 
 PG_FUNCTION_INFO_V1(css_incremental_transition);
 PG_FUNCTION_INFO_V1(_css_incremental_transition);
@@ -31,22 +32,40 @@ css_state_from_tuple(HeapTupleData *tup, TupleDesc desc)
     
     ArrayType *y_lags_arr = DatumGetArrayTypeP(heap_getattr(tup, 4, desc, &is_null));
     if (is_null) ereport(ERROR, (errmsg("css_incremental: y_lags cannot be NULL")));
-    s->y_lags = (double *) ARR_DATA_PTR(y_lags_arr);
+    int n_y = ArrayGetNItems(ARR_NDIM(y_lags_arr), ARR_DIMS(y_lags_arr));
+    if (n_y > AR_MAX)
+        ereport(ERROR, (errmsg("css_incremental: y_lags too long")));
+    memcpy(s->y_lags, ARR_DATA_PTR(y_lags_arr), n_y * sizeof(double));
 
     ArrayType *e_lags_arr = DatumGetArrayTypeP(heap_getattr(tup, 5, desc, &is_null));
     if (is_null) ereport(ERROR, (errmsg("css_incremental: e_lags cannot be NULL")));
-    s->e_lags = (double *) ARR_DATA_PTR(e_lags_arr);
+    int n_e = ArrayGetNItems(ARR_NDIM(e_lags_arr), ARR_DIMS(e_lags_arr));
+    if (n_e > MA_MAX)
+        ereport(ERROR, (errmsg("css_incremental: e_lags too long")));
+    memcpy(s->e_lags, ARR_DATA_PTR(e_lags_arr), n_e * sizeof(double));
     
     s->css = DatumGetFloat8(heap_getattr(tup, 6, desc, &is_null));
     if (is_null) ereport(ERROR, (errmsg("css_incremental: css cannot be NULL")));
+
+    s->d        = DatumGetInt32(heap_getattr(tup, 7, desc, &is_null));
+    if (is_null) ereport(ERROR, (errmsg("css_incremental: d cannot be NULL")));
+    s->n_diff   = DatumGetInt32(heap_getattr(tup, 8, desc, &is_null));
+    if (is_null) ereport(ERROR, (errmsg("css_incremental: n_diff cannot be NULL")));
+
+    ArrayType *diff_buf_arr = DatumGetArrayTypeP(heap_getattr(tup, 9, desc, &is_null));
+    if (is_null) ereport(ERROR, (errmsg("css_incremental: diff_buf cannot be NULL")));
+    int n_diff_buf = ArrayGetNItems(ARR_NDIM(diff_buf_arr), ARR_DIMS(diff_buf_arr));
+    if (n_diff_buf > D_MAX)
+        ereport(ERROR, (errmsg("css_incremental: diff_buf too long")));
+    memcpy(s->diff_buf, ARR_DATA_PTR(diff_buf_arr), n_diff_buf * sizeof(double));
 
     return s;
 }
 
 static Datum css_state_to_tuple(arima_inc_state_t *state, TupleDesc tupdesc)
 {
-    Datum values[6];
-    bool nulls[6] = {false};
+    Datum values[9];
+    bool nulls[9] = {false};
 
     values[0] = Int32GetDatum(state->t);
     values[1] = Int32GetDatum(state->p);
@@ -54,12 +73,15 @@ static Datum css_state_to_tuple(arima_inc_state_t *state, TupleDesc tupdesc)
     values[3] = PointerGetDatum(build_float8_array(state->y_lags, state->p));
     values[4] = PointerGetDatum(build_float8_array(state->e_lags, state->q));
     values[5] = Float8GetDatum(state->css);
+    values[6] = Float8GetDatum(state->d);
+    values[7] = Float8GetDatum(state->n_diff);
+    values[8] = PointerGetDatum(build_float8_array(state->diff_buf, state->d+1));
 
     HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
     return HeapTupleGetDatum(tuple);
 }
 
-static arima_inc_state_t* css_incremental_init(int p, int q)
+static arima_inc_state_t* css_incremental_init(int p, int q, int d)
 {
     arima_inc_state_t *state = palloc0(sizeof(arima_inc_state_t));
 
@@ -67,8 +89,12 @@ static arima_inc_state_t* css_incremental_init(int p, int q)
     state->p = p;
     state->q = q;
     state->css = 0.0;
-    state->y_lags = palloc0(sizeof(double) * (p == 0 ? 1 : p));
-    state->e_lags = palloc0(sizeof(double) * (q == 0 ? 1 : q));
+    for (int i = 0; i < AR_MAX; i++) state->y_lags[i] = 0.0;
+    for (int i = 0; i < MA_MAX; i++) state->e_lags[i] = 0.0;
+
+    state->d = d;
+    state->n_diff = 0;
+    if (d > 0) for (int i = 0; i < D_MAX; i++) state->diff_buf[i] = 0.0;
 
     return state;
 }
@@ -76,12 +102,77 @@ static arima_inc_state_t* css_incremental_init(int p, int q)
 /* ------------------------------------------------------------------------- 
  * Incremental logic
  * ------------------------------------------------------------------------- */
-static arima_inc_state_t* css_incremental(arima_inc_state_t *state, double* phi, double* theta, double y_t, double c)
+
+static bool
+arima_incremental_difference(arima_inc_state_t *state, double y, double *out)
 {
-    double e_t = y_t - c;
+    int d = state->d;
+
+    // No differencing
+    if (d == 0)
+    {
+        *out = y;
+        return true;
+    }
+
+    // Warm-up: fill buffer
+    if (state->n_diff < d + 1)
+    {
+        state->diff_buf[state->n_diff++] = y;
+
+        if (state->n_diff < d + 1)
+            return false;  // not ready yet
+    }
+    else
+    {
+        // Shift buffer to make room for newest
+        memmove(state->diff_buf, state->diff_buf + 1, sizeof(double) * d);
+        state->diff_buf[d] = y;
+    }
+
+    // Compute differenced value
+    double curr[D_MAX + 1];
+    double next[D_MAX + 1];
+
+    // Copy diff_buf into curr
+    for (int i = 0; i <= D_MAX; i++)
+        curr[i] = state->diff_buf[i];
+
+    int len = d + 1;
+    for (int i = 0; i < d; i++)
+    {
+        // Compute first differences
+        for (int j = 0; j < len - 1; j++)
+            next[j] = curr[j + 1] - curr[j];
+
+        // Swap buffers: copy next -> curr safely
+        for (int j = 0; j < len - 1; j++)
+            curr[j] = next[j];
+
+        len--;
+    }
+
+    *out = curr[0];
+    return true;
+}
+
+static arima_inc_state_t*
+css_incremental(arima_inc_state_t *state, double* phi, double* theta, double y_t, double c)
+{
     int p = state->p;
     int q = state->q;
     int ncond = max(p, q);
+
+    // Compute differenced value
+    double y_diff;
+    bool ready = arima_incremental_difference(state, y_t, &y_diff);
+    double e_t = y_diff - c;
+
+    elog(DEBUG1, "css_incremental after differencing: p = %d, q = %d", state->p, state->q);
+
+    // Differencing warm-up: skip CSS and lag updates
+    if (!ready)
+        return state;
 
     // AR part
     for (int j = 0; j < p; j++)
@@ -115,7 +206,7 @@ static arima_inc_state_t* css_incremental(arima_inc_state_t *state, double* phi,
         memmove(&state->y_lags[1], // Dest
                 &state->y_lags[0], // Source
                 sizeof(double) * (p - 1)); // Copy first p-1 entries
-        state->y_lags[0] = y_t;
+        state->y_lags[0] = y_diff;
     }
 
     if (q > 0)
@@ -173,6 +264,7 @@ _css_incremental_transition(PG_FUNCTION_ARGS)
     phi_arr = PG_GETARG_ARRAYTYPE_P(2);
     theta_arr = PG_GETARG_ARRAYTYPE_P(3);
     float8 c = PG_GETARG_FLOAT8(4);
+    int d = PG_GETARG_INT32(5);
 
     int n_phi, n_theta;
     double *phi = get_1d_double_array(phi_arr, &n_phi, "_css_incremental_transition");
@@ -182,7 +274,7 @@ _css_incremental_transition(PG_FUNCTION_ARGS)
     if (PG_ARGISNULL(0))
     {
         // Infer p and q from phi/theta arrays
-        state = css_incremental_init(n_phi, n_theta);
+        state = css_incremental_init(n_phi, n_theta, d);
     }
     else
     {

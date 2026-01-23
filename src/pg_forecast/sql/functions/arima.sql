@@ -16,7 +16,11 @@ CREATE TYPE css_incremental_state AS (
     q INT,
     y_lags DOUBLE PRECISION[],
     e_lags DOUBLE PRECISION[],
-    css DOUBLE PRECISION
+    css DOUBLE PRECISION,
+
+    d INT,
+    n_diff INT,
+    diff_buf DOUBLE PRECISION[]
 );
 
 /* -------------------------------------------------------------------------
@@ -112,7 +116,8 @@ CREATE FUNCTION css_incremental_transition(
     y DOUBLE PRECISION,
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
-    c DOUBLE PRECISION DEFAULT 0.0 -- 0 if no constant term required
+    c DOUBLE PRECISION DEFAULT 0.0, -- 0 if no constant term required
+    d INT DEFAULT 0
 )
 RETURNS css_incremental_state
 AS 'MODULE_PATHNAME', 'css_incremental_transition'
@@ -123,7 +128,8 @@ CREATE FUNCTION _css_incremental_transition(
     y DOUBLE PRECISION,
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
-    c DOUBLE PRECISION DEFAULT 0.0 -- 0 if no constant term required
+    c DOUBLE PRECISION DEFAULT 0.0, -- 0 if no constant term required
+    d INT DEFAULT 0
 )
 RETURNS INTERNAL
 AS 'MODULE_PATHNAME', '_css_incremental_transition'
@@ -142,7 +148,8 @@ CREATE AGGREGATE css_incremental(
     y DOUBLE PRECISION,
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
-    c DOUBLE PRECISION
+    c DOUBLE PRECISION,
+    d INT
 ) (
     SFUNC = _css_incremental_transition,
     STYPE = INTERNAL, -- Initialisation handled by C
@@ -385,14 +392,15 @@ DECLARE
     rec_state RECORD;
 BEGIN
     EXECUTE format(
-        'SELECT (css_incremental(%I, %L, %L, %L) OVER (ORDER BY %I)) AS s
+        'SELECT (css_incremental(%I, %L, %L, %L, %L) OVER (ORDER BY %I)) AS s
          FROM %I
          ORDER BY %I DESC
          LIMIT 1',
 
-        value_col, phi, theta, c, date_col,
+        value_col, phi, theta, c, d, date_col,
         source_table, date_col, date_col
     ) INTO rec_state;
+    RAISE DEBUG 'Incremental CSS: %', (rec_state.s).css;
     RETURN rec_state.s;
 END;
 $$ LANGUAGE plpgsql;
@@ -482,7 +490,7 @@ BEGIN
                 (CASE WHEN v_theta[i - cardinality(v_phi)] >= 0 THEN tolerance ELSE -tolerance END);
         END IF;
 
-        v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new, rec_centre.c);
+        v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new, rec_centre.c, rec_centre.d);
 
         INSERT INTO arima_vertices(arima_id, vertex_id, phi, theta, incremental_state)
         VALUES (centre_id, i, v_phi_new, v_theta_new, v_state_new);
@@ -507,7 +515,7 @@ BEGIN
     SELECT COALESCE(array_agg(val * v_scale_factor), '{}') INTO v_theta_new 
     FROM unnest(v_theta) val;
 
-    v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new, rec_centre.c);
+    v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new, rec_centre.c, rec_centre.d);
 
     INSERT INTO arima_vertices(arima_id, vertex_id, phi, theta, incremental_state)
     VALUES (centre_id, v_d+1, v_phi_new, v_theta_new, v_state_new);

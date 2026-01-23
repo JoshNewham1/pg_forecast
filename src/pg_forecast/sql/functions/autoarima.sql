@@ -186,6 +186,7 @@ BEGIN
                 WHERE t.p = v_p AND t.d = v_d AND t.q = v_q
             );
 
+            RAISE DEBUG 'AutoARIMA: Training ARIMA(%, %, %)', v_p, v_d, v_q;
             trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, include_c, TRUE);
             n_params := autoarima_param_count(v_p, v_q, include_c);
             model_aicc := aicc(trained.css, v_p, v_q, n_params, n_vals);
@@ -207,9 +208,11 @@ BEGIN
         v_p := rec_current.p;
         v_q := rec_current.q;
 
+        RAISE DEBUG 'AutoARIMA: Training ARIMA(%, %, %)', v_p, v_d, v_q;
         trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, NOT include_c, TRUE);
         n_params := autoarima_param_count(v_p, v_q, NOT include_c);
         model_aicc := aicc(trained.css, v_p, v_q, n_params, n_vals);
+        RAISE DEBUG 'AutoARIMA: Trained ARIMA(%, %, %) with phi = %, theta = %', v_p, v_d, v_q, trained.phi, trained.theta;
 
         INSERT INTO tmp_autoarima (
             p, d, q, c, phi, theta, css, aicc
@@ -244,7 +247,8 @@ BEGIN
     INTO v_model_id;
 
     -- Get starting incremental state (from every value in the table)
-    v_incremental_state := css_incremental_full_table(source_table, value_col, date_col, rec_current.phi, rec_current.theta, rec_current.c);
+    RAISE DEBUG 'Best model: ARIMA(%, %, %) with phi = %, theta = %, CSS = %', rec_current.p, rec_current.d, rec_current.q, rec_current.phi, rec_current.theta, rec_current.css;
+    v_incremental_state := css_incremental_full_table(source_table, value_col, date_col, rec_current.phi, rec_current.theta, rec_current.c, rec_current.d);
 
     -- Deactivate any existing models
     UPDATE model_arima_stats

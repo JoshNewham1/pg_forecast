@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <nlopt.h>
+#include "constants.h"
 
 #ifndef ARIMA_H
 #define ARIMA_H
@@ -20,12 +21,18 @@ typedef struct {
 } opt_result_t;
 
 typedef struct {
+    /* CSS */
     int t; // Current time index
     int p;
     int q;
     double css;
-    double *y_lags;
-    double *e_lags;
+    double y_lags[AR_MAX];
+    double e_lags[MA_MAX];
+
+    /* Differencing */
+    int d;
+    int n_diff;
+    double diff_buf[D_MAX + 1];
 } arima_inc_state_t;
 
 double css(double *vals, double *phi, double *theta, int p, int q, bool include_c, double c, int n_vals, double* grad, double* resid);

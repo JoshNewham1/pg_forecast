@@ -88,7 +88,7 @@ def css_loss_query(phi: list[float], theta: list[float], p: int, q: int, c: floa
     """
     return text(query_str)
 
-def css_incremental_query(phi: list[float], theta: list[float], c: float = 0.0, series_id=None):
+def css_incremental_query(phi: list[float], theta: list[float], c: float = 0.0, d: int = 0, series_id=None):
     """
     Build a SQLAlchemy text query to call css_incremental aggregate
     on pg_forecast_unit_test.
@@ -102,7 +102,8 @@ def css_incremental_query(phi: list[float], theta: list[float], c: float = 0.0, 
             (css_incremental(value,
                 ARRAY[{phi_array}]::double precision[],
                 ARRAY[{theta_array}]::double precision[],
-                {c}
+                {c}::double precision,
+                {d}::int
             )).css
         FROM pg_forecast_unit_test
         {where_clause};
@@ -286,6 +287,36 @@ def setup_large_dataset(test_engine):
         """))
         conn.commit()
 
+def setup_nonstationary_dataset(test_engine):
+    """
+    Generates a random walk with drift:
+        x_t = x_{t-1} + drift + noise
+    This *requires* differencing (d=1).
+    """
+    with test_engine.connect() as conn:
+        conn.execute(text("""
+            TRUNCATE TABLE pg_forecast_unit_test;
+
+            WITH RECURSIVE rw AS (
+                SELECT
+                    0 AS n,
+                    10.0::double precision AS value
+                UNION ALL
+                SELECT
+                    n + 1,
+                    value + 0.5 + (random() - 0.5) * 0.1
+                FROM rw
+                WHERE n < 120
+            )
+            INSERT INTO pg_forecast_unit_test (t, series_id, value)
+            SELECT
+                '2023-01-01'::timestamp + n * interval '1 day',
+                'DiffSeries',
+                value
+            FROM rw;
+        """))
+        conn.commit()
+
 
 def test_css_loss_p_1_q_0(test_engine):
     """
@@ -432,6 +463,34 @@ def test_css_incremental_matches_css_loss_p_2_q_2_constant(test_engine):
         q=2,
         series_id="TestSeries"
     )
+
+def test_css_incremental_p_2_d_1_q_2_constant(test_engine):
+    setup_basic_dataset(test_engine)
+
+    query = css_incremental_query(
+        phi = [0.099934682, 0.674069236],
+        theta = [2.0, -2.0],
+        c = 0.0,
+        d = 1
+    )
+
+    with test_engine.connect() as conn:
+        css_value = conn.execute(query).scalar()
+        assert_close(0.001469628, css_value, tolerance=0.0001, name="css_incremental differenced")
+
+def test_css_incremental_p_2_d_2_q_2_constant(test_engine):
+    setup_basic_dataset(test_engine)
+
+    query = css_incremental_query(
+        phi = [0.450980392, 0.480392157],
+        theta = [2.0, -2.0],
+        c = 0.0,
+        d = 2
+    )
+
+    with test_engine.connect() as conn:
+        css_value = conn.execute(query).scalar()
+        assert_close(0.00245098, css_value, tolerance=0.0001, name="css_incremental differenced")
 
 def test_css_incremental_matches_css_loss_large_input(test_engine):
     setup_large_dataset(test_engine)
@@ -688,4 +747,63 @@ def test_autoarima_trigger_on_outliers(test_engine):
         assert post_outlier_id is None, (
             f"Model {initial_arima_id} should have been deactivated "
             f"and no longer returned as active."
+        )
+
+def test_autoarima_matches_manual_arima_on_differenced_series(test_engine):
+    """
+    Verify that AutoARIMA forecast matches a manually trained ARIMA forecast
+    on a series that requires differencing (d > 0).
+    """
+    setup_nonstationary_dataset(test_engine)
+
+    with test_engine.connect() as conn:
+        # Step 1: Train AutoARIMA to get optimum p, d, q
+        auto_query = text("""
+            SELECT p, d, q
+            FROM autoarima_train(
+                source_table := 'pg_forecast_unit_test',
+                date_col := 't',
+                value_col := 'value'
+            );
+        """)
+        auto_result = conn.execute(auto_query).fetchone()
+        auto_p, auto_d, auto_q = auto_result
+
+        assert auto_d > 0, "AutoARIMA found undifferenced forecast, d = " + str(auto_d)
+
+        # Step 2: Get AutoARIMA forecast
+        horizon = 4
+        auto_forecast_query = text("""
+            SELECT create_forecast(
+                model_name := 'autoarima',
+                input_table := 'pg_forecast_unit_test',
+                date_column := 't',
+                value_column := 'value'
+            );
+            SELECT forecast_value
+            FROM run_forecast(
+                model_name := 'autoarima',
+                input_table := 'pg_forecast_unit_test',
+                date_column := 't',
+                value_column := 'value',
+                horizon := :horizon
+            );
+        """).bindparams(
+            horizon=horizon
+        )
+        auto_forecast = conn.execute(auto_forecast_query).fetchall()
+        auto_forecast = [row[0] for row in auto_forecast]  # extract floats
+
+        # Step 3: Train and forecast manually using ARIMA with same parameters
+        manual_query = arima_query(
+            p=auto_p, d=auto_d, q=auto_q, horizon=horizon, include_mean=True
+        )
+        manual_forecast = [row[1] for row in conn.execute(manual_query).fetchall()]
+
+    # Step 4: Assert forecasts match closely
+    for i, (af, mf) in enumerate(zip(auto_forecast, manual_forecast)):
+        assert_close(
+            af, mf,
+            tolerance=1e-6,
+            name=f"AutoARIMA vs manual ARIMA forecast at step {i+1}"
         )
