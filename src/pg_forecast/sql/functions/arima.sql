@@ -36,6 +36,10 @@ CREATE TABLE model_arima_stats(
     UNIQUE (model_id, phi, theta, d, c)
 );
 
+CREATE UNIQUE INDEX idx_active_model
+ON model_arima_stats (model_id)
+WHERE is_active = TRUE;
+
 CREATE TABLE arima_vertices (
     arima_id BIGINT NOT NULL REFERENCES model_arima_stats(id) ON DELETE CASCADE,
     vertex_id INT NOT NULL,
@@ -512,7 +516,7 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION arima_updated_states(
     target_model_id BIGINT,
-    new_y DOUBLE PRECISION,
+    new_ys DOUBLE PRECISION[],
     arima_id BIGINT,
     OUT vertex_id BIGINT,
     OUT new_state css_incremental_state
@@ -520,10 +524,8 @@ CREATE OR REPLACE FUNCTION arima_updated_states(
 RETURNS SETOF RECORD
 LANGUAGE SQL
 AS $$
-    SELECT
-        s.vertex_id,
-        css_incremental_transition(s.state, new_y, s.phi, s.theta) AS new_state
-    FROM (
+    -- TODO: Rewrite this as a loop in C
+    WITH RECURSIVE vertices AS (
         SELECT NULL AS vertex_id, s.phi, s.theta, s.incremental_state AS state
         FROM model_arima_stats s
         WHERE s.model_id = target_model_id AND s.is_active = TRUE
@@ -533,12 +535,42 @@ AS $$
         SELECT v.vertex_id, v.phi, v.theta, v.incremental_state AS state
         FROM arima_vertices v
         WHERE v.arima_id = arima_id
-    ) s
+    ),
+    ys AS (
+        SELECT y, ord
+        FROM unnest(new_ys) WITH ORDINALITY AS u(y, ord)
+    ),
+    recurse AS (
+        SELECT
+            base.vertex_id,
+            y.ord,
+            css_incremental_transition(base.state, y.y, base.phi, base.theta) AS state,
+            base.phi,
+            base.theta
+        FROM vertices base
+        INNER JOIN ys y ON y.ord = 1
+
+        UNION ALL
+
+        SELECT
+            r.vertex_id,
+            y.ord,
+            css_incremental_transition(r.state, y.y, r.phi, r.theta) AS state,
+            r.phi,
+            r.theta
+        FROM recurse r
+        INNER JOIN ys y ON y.ord = r.ord + 1
+    )
+    SELECT
+        vertex_id,
+        state AS new_state
+    FROM recurse
+    WHERE ord = (SELECT max(ord) FROM ys);
 $$;
 
 CREATE OR REPLACE FUNCTION arima_update_model(
     target_model_id BIGINT,
-    new_y DOUBLE PRECISION
+    new_ys DOUBLE PRECISION[]
 )
 RETURNS VOID
 SECURITY DEFINER
@@ -557,8 +589,8 @@ BEGIN
 
     WITH comparison AS (
         SELECT
-            (SELECT (new_state).css FROM arima_updated_states(target_model_id, new_y, rec_model.arima_id) WHERE vertex_id IS NULL) AS centre_css,
-            (SELECT MIN((new_state).css) FROM arima_updated_states(target_model_id, new_y, rec_model.arima_id) WHERE vertex_id IS NOT NULL) AS min_vertex_css
+            (SELECT (new_state).css FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id) WHERE vertex_id IS NULL) AS centre_css,
+            (SELECT MIN((new_state).css) FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id) WHERE vertex_id IS NOT NULL) AS min_vertex_css
     )
     SELECT (min_vertex_css < centre_css)
     INTO v_breach_detected
@@ -577,13 +609,13 @@ BEGIN
         -- Centre vector
         UPDATE model_arima_stats m
         SET incremental_state = u.new_state
-        FROM arima_updated_states(target_model_id, new_y, rec_model.arima_id) u
+        FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id) u
         WHERE m.model_id = target_model_id AND u.vertex_id IS NULL;
 
         -- Simplex vertices
         UPDATE arima_vertices v
         SET incremental_state = u.new_state
-        FROM arima_updated_states(target_model_id, new_y, rec_model.arima_id) u
+        FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id) u
         WHERE v.arima_id = rec_model.arima_id AND v.vertex_id = u.vertex_id;
     END IF;
 END;
@@ -599,7 +631,7 @@ SECURITY DEFINER
 AS $$
 DECLARE
     rec_model RECORD;
-    v_new_val DOUBLE PRECISION;
+    v_new_values DOUBLE PRECISION[];
 BEGIN
     -- Safety precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
@@ -613,13 +645,18 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- Dynamically get the value from the NEW record using the column name stored in the model
-    EXECUTE format('SELECT ($1).%I', rec_model.value_column) 
-    USING NEW 
-    INTO v_new_val;
+    -- Compute updated states once for all rows in the table of NEW records
+    EXECUTE format(
+        'SELECT array_agg((n).%I::double precision) FROM new n',
+        rec_model.value_column
+    ) INTO v_new_values;
+   
+    IF v_new_values IS NULL OR array_length(v_new_values, 1) IS NULL THEN
+        RETURN NULL;
+    END IF;
 
-    PERFORM arima_update_model(rec_model.id, v_new_val);
+    PERFORM arima_update_model(rec_model.id, v_new_values);
 
-    RETURN NEW;
+    RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;

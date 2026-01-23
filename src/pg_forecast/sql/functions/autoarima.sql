@@ -89,8 +89,6 @@ BEGIN
     -- Aggregate the series into an array, dropping NULLs
     arr_vals := series_to_array(source_table, date_col, value_col, TRUE);
 
-    RAISE NOTICE 'autoarima_train: arr_vals dims: %, length: %, type: %', array_dims(arr_vals), array_length(arr_vals, 1), pg_typeof(arr_vals);
-
     n_vals := array_length(arr_vals, 1);
 
     -- Determine the number of differences with repeated KPSS tests
@@ -247,7 +245,13 @@ BEGIN
 
     -- Get starting incremental state (from every value in the table)
     v_incremental_state := css_incremental_full_table(source_table, value_col, date_col, rec_current.phi, rec_current.theta, rec_current.c);
+
+    -- Deactivate any existing models
+    UPDATE model_arima_stats
+    SET is_active = FALSE
+    WHERE model_id = v_model_id AND is_active = TRUE;
     
+    -- Upsert
     INSERT INTO model_arima_stats(model_id, phi, theta, d, c, is_active, incremental_state)
     VALUES (v_model_id, rec_current.phi, rec_current.theta, rec_current.d, rec_current.c, TRUE, v_incremental_state)
     ON CONFLICT (model_id, phi, theta, d, c)
@@ -264,7 +268,8 @@ BEGIN
     EXECUTE format('
         CREATE OR REPLACE TRIGGER autoarima_on_insert_%I_%I
         AFTER INSERT ON %I
-        FOR EACH ROW
+        REFERENCING NEW TABLE AS new
+        FOR EACH STATEMENT
         EXECUTE FUNCTION trg_autoarima_on_insert();', 
         source_table, value_col, source_table
     );

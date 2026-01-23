@@ -79,35 +79,16 @@ class InDBModelAdapter(ModelBase):
     def forecast_fit(self, train_data: pd.DataFrame, **kwargs) -> "ModelBase":
         """
         Uploads training data to DB and triggers model training.
+        "Scheduling" stage of TFB
         """
-        date_col, value_col = "date", "value"
-
-        with self.engine.begin() as conn:
-            conn.execute(
-                text(f"""
-                CREATE TABLE IF NOT EXISTS {self.base_table} (
-                    {date_col} TIMESTAMP,
-                    {value_col} DOUBLE PRECISION
-                );
-                TRUNCATE TABLE {self.base_table};
-                """)
-            )
-
-        # Bulk insert training data
-        train_data = train_data.reset_index()
-        train_data.columns = [date_col, value_col]
-        self._copy_to_db(train_data, self.base_table)
-
-        # Run in-DB training
-        with self.engine.begin() as conn:
-            sql = f"SELECT {self.train_fn}('{self._model_name}', '{self.base_table}', '{date_col}', '{value_col}');"
-            conn.execute(text(sql))
+        # Don't need to train twice, can do it when we're forecasting
 
         return self
 
     def forecast(self, horizon: int, series: pd.DataFrame, **kwargs) -> np.ndarray:
         """
         Executes in-database forecast and retrieves predictions.
+        "Collecting" stage of TFB
         """
         date_col, value_col = "date", "value"
         temp_table = f"{self.base_table}"
@@ -133,6 +114,8 @@ class InDBModelAdapter(ModelBase):
         with self.engine.begin() as conn:
             # Create forecast model
             sql = f"SELECT {self.train_fn}('{self._model_name}', '{self.base_table}', '{date_col}', '{value_col}');"
+
+            # Get forecast
             conn.execute(text(sql))
             sql = f"""
                 SELECT forecast_value
@@ -140,6 +123,10 @@ class InDBModelAdapter(ModelBase):
             """
             result = conn.execute(text(sql))
             preds = [row[0] for row in result.fetchall()]
+
+            # Tear down forecast model
+            sql = f"SELECT remove_forecast('{self._model_name}', '{temp_table}', '{date_col}', '{value_col}');"
+            conn.execute(text(sql))
 
         return np.array(preds)
 
