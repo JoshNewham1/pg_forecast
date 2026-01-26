@@ -536,7 +536,7 @@ AS $$
     WITH RECURSIVE vertices AS (
         SELECT NULL AS vertex_id, s.phi, s.theta, s.incremental_state AS state
         FROM model_arima_stats s
-        WHERE s.model_id = target_model_id AND s.is_active = TRUE
+        WHERE s.id = arima_id
 
         UNION ALL
 
@@ -609,6 +609,9 @@ BEGIN
         UPDATE model_arima_stats
         SET is_active = FALSE
         WHERE id = rec_model.arima_id;
+
+        DELETE FROM arima_vertices
+        WHERE arima_id = rec_model.arima_id;
 
         RAISE NOTICE 'Retraining AutoARIMA model as loss dropped below threshold';
         PERFORM autoarima_train(rec_model.input_table, rec_model.date_column, rec_model.value_column);

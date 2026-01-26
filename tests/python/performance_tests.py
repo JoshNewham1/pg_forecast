@@ -1,224 +1,302 @@
-from monash.utils import stream_tsf_series, stream_tsf_values
-import pytest
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-import os
 import time
-from datetime import timedelta
+from typing import Dict, List, Literal
+import csv
+from datetime import datetime, timedelta, timezone
+import os
+
+from sqlalchemy import create_engine, text
+from monash.utils import stream_tsf_values
+from itertools import islice
 import logging
+from abc import ABC, abstractmethod
+from dotenv import load_dotenv
 
-BASE_TABLE = "pg_forecast_tfb_performance"
-MODELS_TO_TEST = ["autoarima"]
+logger = logging.getLogger(__name__)
 
-
-@pytest.fixture(scope="session")
-def test_engine():
-    """
-    Create an SQLAlchemy engine for the test database using TEST_ env vars.
-    """
-    load_dotenv()
-    TEST_DB_USERNAME = os.getenv("TEST_DB_USERNAME")
-    TEST_DB_PASSWORD = os.getenv("TEST_DB_PASSWORD")
-    TEST_DB_HOST = os.getenv("TEST_DB_HOST", "localhost")
-    TEST_DB_PORT = os.getenv("TEST_DB_PORT", "5432")
-    TEST_DB_NAME = os.getenv("TEST_DB_NAME")
-
-    if not all([TEST_DB_USERNAME, TEST_DB_PASSWORD, TEST_DB_NAME]):
-        raise RuntimeError(
-            "TEST_DB_USERNAME, TEST_DB_PASSWORD, TEST_DB_NAME must be set")
-
-    engine = create_engine(
-        f"postgresql+psycopg2://{TEST_DB_USERNAME}:{TEST_DB_PASSWORD}@"
-        f"{TEST_DB_HOST}:{TEST_DB_PORT}/{TEST_DB_NAME}"
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    yield engine
 
-
-# Datasets can be downloaded from here
-# https://huggingface.co/datasets/Monash-University/monash_tsf/tree/main/data
-@pytest.fixture
-def wind_farms_dataset():
-    path = os.path.abspath(os.path.join(os.path.dirname(
-        __file__), "../../eval/monash/data/wind_farms_minutely_dataset_with_missing_values.tsf"))
-    return stream_tsf_values(path)
-
-
-@pytest.fixture
-def solar_dataset():
-    path = os.path.abspath(os.path.join(os.path.dirname(
-        __file__), "../../eval/monash/data/solar_10_minutes_dataset.tsf"))
-    return stream_tsf_values(path)
-
-# Utility functions
-
-
-def setup_forecast_model(conn, model_name, table_name):
-    conn.execute(text(
-        f"SELECT create_forecast('{model_name}', '{table_name}', 'date', 'value', 10)"
-    ))
-    conn.commit()
-    return model_name
-
-def tear_down_forecast_model(conn, model_name, table_name):
-    conn.execute(text(
-        f"SELECT remove_forecast('{model_name}', '{table_name}', 'date', 'value')"
-    ))
-    conn.commit()
-    return model_name
-
-
-def single_inserts_test(test_engine, dataset, num_inserts, max_avg_insert, model_name):
-    timings = []
-    inserts = 0
-    train_size = 100
-
-    with test_engine.connect() as conn:
-        trans = conn.begin()
-        conn.execute(
-            text(f"""
-            CREATE TABLE IF NOT EXISTS {BASE_TABLE} (
-                date TIMESTAMP,
-                value DOUBLE PRECISION
-            );
-            """)
-        )
-        conn.execute(text(f"TRUNCATE TABLE {BASE_TABLE};"))
-        trans.commit()
-
-        # Insert training data
-        for _ in range(train_size):
-            try:
-                series_val = next(dataset)
-                timestamp = series_val['start_timestamp'] + \
-                    timedelta(seconds=series_val['time_index'])
-                trans = conn.begin()
-                conn.execute(text(
-                    f"INSERT INTO {BASE_TABLE}(date, value) VALUES ('{timestamp}', {series_val['value']})"))
-                trans.commit()
-            except StopIteration:
-                break
-
-        setup_forecast_model(conn, model_name, BASE_TABLE)
-
-        try:
-            # Go through each time-series value in the first series and insert & commit
-            for series_val in dataset:
-                if inserts == num_inserts:
-                    break
-                
-                timestamp = series_val['start_timestamp'] + \
-                    timedelta(seconds=series_val['time_index'])
-                
-                start = time.perf_counter()
-                with conn.begin():
-                    conn.execute(text(
-                        f"INSERT INTO {BASE_TABLE}(date, value) VALUES ('{timestamp}', {series_val['value']})"))
-                end = time.perf_counter()
-                
-                timings.append(end - start)
-                inserts += 1
-        finally:
-            if conn.in_transaction():
-                conn.rollback()
-            tear_down_forecast_model(conn, model_name, BASE_TABLE)
-
-    avg_insert = sum(timings) / len(timings)
-    logging.info(f"Average insert time (s): {avg_insert}")
-    assert avg_insert < max_avg_insert, f"Average insert time ({avg_insert} s) is over an acceptable threshold"
-
-
-def bulk_inserts_test(test_engine, dataset, num_inserts, page_size, max_avg_insert, model_name):
-    timings = []
-    inserts = 0
-    train_size = 100
-
-    with test_engine.connect() as conn:
-        trans = conn.begin()
-        conn.execute(
-            text(f"""
-            CREATE TABLE IF NOT EXISTS {BASE_TABLE} (
-                date TIMESTAMP,
-                value DOUBLE PRECISION
-            );
-            """)
-        )
-        conn.execute(text(f"TRUNCATE TABLE {BASE_TABLE};"))
-        trans.commit()
-
-        # Insert training data
-        values = []
-        for _ in range(train_size):
-            try:
-                series_val = next(dataset)
-                timestamp = series_val['start_timestamp'] + \
-                    timedelta(seconds=series_val['time_index'])
-                values.append(f"('{timestamp}', {series_val['value']})")
-            except StopIteration:
-                break
+class BenchmarkResult:
+    def __init__(self, test_name: str, insert_timings: list[float], forecast_timings: list[float], write_to_file = True, csv_prefix = "performance_"):
+        self.insert_timings = insert_timings
+        self.forecast_timings = forecast_timings
+        self.metrics = self.calculate_metrics(insert_timings, forecast_timings)
+        self.test_name = test_name
+        self.csv_prefix = csv_prefix
+        if write_to_file:
+            self._write_to_file()
+        logging.info(f"Time-series benchmark {self.test_name}: {self.metrics}")
+    
+    def _write_to_file(self):
+        if not isinstance(self.metrics, dict):
+            logger.error("_write_to_file called before metrics were calculated")
+            raise ValueError("_write_to_file called before instantiation")
         
-        if values:
-            with conn.begin():
-                conn.execute(text(
-                    f"INSERT INTO {BASE_TABLE}(date, value) VALUES {','.join(values)}"))
-            values = []
+        timestamp = datetime.now(timezone.utc)
+        timestamp_text = timestamp.isoformat()
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        timestamp_unix = (timestamp - epoch).total_seconds()
 
-        setup_forecast_model(conn, model_name, BASE_TABLE)
+        summary_fields = ["timestamp", "test_name", *self.metrics.keys()]
+        summary_path = f"{self.csv_prefix}summary.csv"
+        summary_exists = os.path.isfile(summary_path)
+        with open(summary_path, mode="a", newline="") as f:
+            logging.info("Writing benchmark summary results to %s", summary_path)
 
-        try:
-            # Go through each time-series value in all series, bulk inserting every PAGE_SIZE records
-            values = []
-            for series_val in dataset:
-                if inserts == num_inserts:
-                    break
+            writer = csv.DictWriter(f, fieldnames=summary_fields)
+            if not summary_exists:
+                writer.writeheader()
 
-                # Parse individual value
-                timestamp = series_val['start_timestamp'] + \
-                    timedelta(seconds=series_val['time_index'])
-                values.append(f"('{timestamp}', {series_val['value']})")
-                inserts += 1
+            writer.writerow(
+                {
+                    "timestamp": timestamp_text,
+                    "test_name": self.test_name,
+                    **self.metrics,
+                }
+            )
+        
+        full_fields = ["type", "time"]
+        full_path = f"{self.csv_prefix}{timestamp_unix}.csv"
+        with open(full_path, mode="w", newline="") as f:
+            logging.info("Writing full benchmark results to %s", full_path)
 
-                # Every page_size values, bulk insert them and time it
-                if inserts % page_size == 0:
-                    start = time.perf_counter()
-                    with conn.begin():
-                        conn.execute(text(
-                            f"INSERT INTO {BASE_TABLE}(date, value) VALUES {','.join(values)}"))
-                    end = time.perf_counter()
-                    timings.append(end - start)
-                    values = []
-                    logging.info(f"Page {len(timings)}/{num_inserts//page_size}: inserted {page_size} records in {end - start} seconds")
-        finally:
-            if conn.in_transaction():
-                conn.rollback()
-            tear_down_forecast_model(conn, model_name, BASE_TABLE)
+            writer = csv.DictWriter(f, fieldnames=full_fields)
+            writer.writeheader()
 
-    avg_insert = sum(timings) / len(timings) / page_size
-    logging.info(f"Average insert time (s): {avg_insert}")
-    assert avg_insert < max_avg_insert, f"Average insert time ({avg_insert} s) is over an acceptable threshold"
+            insert_rows = map(lambda t: { "type": "insert", "time": t }, self.insert_timings)
+            forecast_rows = map(lambda t: { "type": "forecast", "time": t }, self.forecast_timings)
+            writer.writerows(insert_rows)
+            writer.writerows(forecast_rows)
 
+    def calculate_metrics(self, insert_timings, forecast_timings):
+        avg_forecast = None
+        avg_insert = None
 
-# Test in-DB models
-@pytest.mark.parametrize("model_name", MODELS_TO_TEST)
-def test_wind_farms_individual(model_name, test_engine, wind_farms_dataset):
-    single_inserts_test(test_engine, wind_farms_dataset,
-                        num_inserts=10_000, max_avg_insert=1, model_name=model_name)
+        if len(insert_timings) > 0:
+            avg_insert = sum(insert_timings) / len(insert_timings)
+        if len(forecast_timings) > 0:
+            avg_forecast = sum(forecast_timings) / len(forecast_timings)
 
+        return {"avg_insert": avg_insert, "avg_forecast": avg_forecast}
+    
+class Dataset:
+    def __init__(self, file_name: str, path: str = "../../eval/monash/data"):
+        self.file_name = file_name
+        self.path = os.path.join(os.path.dirname(__file__), path, file_name)
 
-@pytest.mark.parametrize("model_name", MODELS_TO_TEST)
-def test_wind_farms_batch(model_name, test_engine, wind_farms_dataset):
-    bulk_inserts_test(test_engine, wind_farms_dataset,
-                      num_inserts=1_000_000, page_size=10_000, max_avg_insert=0.01, model_name=model_name)
+        logger.info("Loading dataset: %s", self.path)
 
+        if not os.path.exists(self.path):
+            raise RuntimeError(f"The path {self.path} does not exist for dataset {file_name}, could not instantiate object")
+        
+    def __iter__(self):
+        logger.debug("Creating dataset iterator for %s", self.file_name)
+        return stream_tsf_values(self.path)
+    
+    def get_n(self, n_records: int) -> List[Dict[str, float]]:
+        logger.debug("Fetching %d records from dataset", n_records)
+        return list(islice(self, n_records))
+    
+    def get_file_name(self) -> str:
+        return self.file_name
+    
+class SystemUnderTest(ABC):
+    def __init__():
+        raise NotImplementedError("Please use an implementation of SystemUnderTest")
 
-@pytest.mark.parametrize("model_name", MODELS_TO_TEST)
-def test_solar_individual(model_name, test_engine, solar_dataset):
-    single_inserts_test(test_engine, solar_dataset,
-                        num_inserts=10_000, max_avg_insert=1, model_name=model_name)
+    @abstractmethod
+    def setup_single(self, seed_records: List[Dict[str, float]]):
+        pass
+    
+    @abstractmethod
+    def setup_batch(self, seed_records: List[Dict[str, float]]):
+        pass
 
+    @abstractmethod
+    def add_single(self, record: Dict[str, float]):
+        pass
 
-@pytest.mark.parametrize("model_name", MODELS_TO_TEST)
-def test_solar_batch(model_name, test_engine, solar_dataset):
-    bulk_inserts_test(test_engine, solar_dataset,
-                      num_inserts=1_000_000, page_size=10_000, max_avg_insert=0.01, model_name=model_name)
+    @abstractmethod
+    def add_batch(self, records: List[Dict[str, float]]):
+        pass
 
-# Test other solutions
+    @abstractmethod
+    def forecast(self, horizon: int) -> List[Dict[str, float]]:
+        pass
+
+    @abstractmethod
+    def teardown_single(self):
+        pass
+
+    @abstractmethod
+    def teardown_batch(self):
+        pass
+
+class BenchmarkRunner:
+    def __init__(self, sut: SystemUnderTest, dataset: Dataset, forecast_horizon: int = 14):
+        self.sut = sut
+        self.dataset = dataset
+        self.forecast_horizon = forecast_horizon
+        self.insert_timings = []
+        self.forecast_timings = []
+
+    def get_benchmark_name(self, type: Literal["single", "batch"]):
+        return f"{type}_insert: {self.dataset.get_file_name()}"
+    
+    def run_single(self, num_records: int) -> BenchmarkResult:
+        logger.info(
+            "Starting single insert benchmark (%d records)", num_records
+        )
+
+        self.insert_timings = []
+        self.forecast_timings = []
+
+        self.sut.setup_single(self.dataset.get_n(100))
+
+        num_inserted = 0
+        for record in self.dataset:
+            if num_inserted == num_records:
+                break
+            if num_inserted % 100 == 0 and num_inserted > 0:
+                start = time.perf_counter()
+                _ = self.sut.forecast(self.forecast_horizon)
+                end = time.perf_counter()
+                self.forecast_timings.append(end - start)
+                logging.info(f"Inserted {num_inserted} records, forecasted in {end - start}s")
+
+            start = time.perf_counter()
+            self.sut.add_single(record)
+            end = time.perf_counter()
+            self.insert_timings.append(end - start)
+            num_inserted += 1
+            logging.debug(f"Inserted record #{num_inserted}")
+
+        logger.info("Single insert benchmark complete")
+        self.sut.teardown_single()
+        result = BenchmarkResult(self.get_benchmark_name("single"), 
+                                 self.insert_timings,
+                                 self.forecast_timings, 
+                                 write_to_file=True)
+        return result
+    
+    def run_batch(self, page_size: int, num_records: int) -> BenchmarkResult:
+        self.insert_timings = []
+        self.forecast_timings = []
+
+        self.sut.setup_batch(self.dataset.get_n(100))
+
+        num_pages = num_records // page_size
+        for page in range(0, num_pages):
+            records = self.dataset.get_n(page_size)
+            start = time.perf_counter()
+            self.sut.add_batch(records)
+            end = time.perf_counter()
+            self.insert_timings.append(end - start)
+
+            start = time.perf_counter()
+            _ = self.sut.forecast(self.forecast_horizon)
+            end = time.perf_counter()
+            self.forecast_timings.append(end - start)
+
+            logger.debug(
+                "Page %d/%d processed (insert=%.6fs, forecast=%.6fs)",
+                page + 1,
+                num_pages,
+                self.insert_timings[-1],
+                self.forecast_timings[-1],
+            )
+
+        logger.info("Batch insert benchmark complete")
+        self.sut.teardown_batch()
+        result = BenchmarkResult(self.get_benchmark_name("batch"), 
+                                 self.insert_timings,
+                                 self.forecast_timings, 
+                                 write_to_file=True)
+        return result
+    
+class PgForecast(SystemUnderTest):
+    def __init__(self, model_name: str = "autoarima"):
+        self.model_name = model_name
+        load_dotenv()
+
+        TEST_DB_USERNAME = os.getenv("TEST_DB_USERNAME")
+        TEST_DB_PASSWORD = os.getenv("TEST_DB_PASSWORD")
+        TEST_DB_HOST = os.getenv("TEST_DB_HOST", "localhost")
+        TEST_DB_PORT = os.getenv("TEST_DB_PORT", "5432")
+        TEST_DB_NAME = os.getenv("TEST_DB_NAME")
+        self.base_table = os.getenv("TEST_BASE_TABLE", "time_series_performance_test")
+
+        if not all([TEST_DB_USERNAME, TEST_DB_PASSWORD, TEST_DB_NAME]):
+            raise RuntimeError(
+                "TEST_DB_USERNAME, TEST_DB_PASSWORD, TEST_DB_NAME must be set")
+
+        self.engine = create_engine(
+            f"postgresql+psycopg2://{TEST_DB_USERNAME}:{TEST_DB_PASSWORD}@"
+            f"{TEST_DB_HOST}:{TEST_DB_PORT}/{TEST_DB_NAME}"
+        )
+        self.conn = self.engine.connect()
+
+    def __del__(self):
+        self.conn.close()
+
+    def setup_single(self, seed_records):
+        trans = self.conn.begin()
+        self.conn.execute(
+            text(f"""
+            SELECT remove_forecast('autoarima', '{self.base_table}', 'date', 'value');
+            CREATE TABLE IF NOT EXISTS {self.base_table} (
+                date TIMESTAMP,
+                value DOUBLE PRECISION
+            );
+            TRUNCATE TABLE {self.base_table};
+            """)
+        )
+        trans.commit()
+        self.add_batch(seed_records)
+        trans = self.conn.begin()
+        self.conn.execute(text(f"SELECT create_forecast('{self.model_name}', '{self.base_table}', 'date', 'value');"))
+        trans.commit()
+    
+    def setup_batch(self, seed_records):
+        return self.setup_single(seed_records)
+    
+    def add_single(self, record):
+        timestamp = record['start_timestamp'] + timedelta(seconds=record['time_index'])
+        self.conn.execute(text(
+                    f"INSERT INTO {self.base_table}(date, value) VALUES ('{timestamp}', {record['value']})"))
+        self.conn.commit()
+
+    def add_batch(self, records):
+        values = []
+        for record in records:
+            timestamp = record['start_timestamp'] + timedelta(seconds=record['time_index'])
+            values.append(f"('{timestamp}', {record['value']})")
+        
+        self.conn.execute(text(f"INSERT INTO {self.base_table}(date, value) VALUES {','.join(values)}"))
+        self.conn.commit()
+
+    def forecast(self, horizon):
+        with self.conn.begin():
+            sql = f"""
+            SELECT forecast_date, forecast_value
+            FROM run_forecast('{self.model_name}', '{self.base_table}', 'date', 'value', {horizon});
+            """
+            result = self.conn.execute(text(sql)).fetchall()
+            return result
+    
+    def teardown_single(self):
+        self.conn.execute(text(f"SELECT remove_forecast('{self.model_name}', '{self.base_table}', 'date', 'value');"))
+        self.conn.execute(text(f"TRUNCATE TABLE {self.base_table};"))
+        self.conn.commit()
+
+    def teardown_batch(self):
+        return self.teardown_single()
+    
+sut = PgForecast()
+ds = Dataset("solar_10_minutes_dataset.tsf")
+bench = BenchmarkRunner(sut, ds)
+bench.run_single(10_000)
+bench.run_batch(100, 1_000_000)
