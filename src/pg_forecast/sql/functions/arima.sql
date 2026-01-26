@@ -91,7 +91,7 @@ CREATE FUNCTION arima_optimise(
     p INT,
     q INT,
     include_c BOOLEAN DEFAULT TRUE,
-    method TEXT DEFAULT 'L-BFGS' -- 'Nelder-Mead', 'L-BFGS'
+    method TEXT DEFAULT 'Nelder-Mead' -- 'Nelder-Mead', 'L-BFGS'
 )
 RETURNS arima_optimise_result
 AS 'MODULE_PATHNAME', 'arima_optimise'
@@ -213,7 +213,7 @@ CREATE OR REPLACE FUNCTION arima_train_and_forecast(
     date_col TEXT,     -- Timestamp column
     value_col TEXT,    -- Numerical value column
     include_mean BOOLEAN DEFAULT TRUE,
-    optimiser TEXT DEFAULT 'L-BFGS',
+    optimiser TEXT DEFAULT 'Nelder-Mead',
     forecast_step INTERVAL DEFAULT '1 day'
 )
 RETURNS TABLE(date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
