@@ -10,6 +10,7 @@ from itertools import islice
 import logging
 from abc import ABC, abstractmethod
 from dotenv import load_dotenv
+import pytest
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +260,7 @@ class PgForecast(SystemUnderTest):
         trans = self.conn.begin()
         self.conn.execute(text(f"SELECT create_forecast('{self.model_name}', '{self.base_table}', 'date', 'value');"))
         trans.commit()
+        logging.debug(f"Setup completed with {len(seed_records)} seed records")
     
     def setup_batch(self, seed_records):
         return self.setup_single(seed_records)
@@ -294,9 +296,72 @@ class PgForecast(SystemUnderTest):
 
     def teardown_batch(self):
         return self.teardown_single()
-    
-sut = PgForecast()
-ds = Dataset("solar_10_minutes_dataset.tsf")
-bench = BenchmarkRunner(sut, ds)
-bench.run_single(10_000)
-bench.run_batch(100, 1_000_000)
+
+@pytest.fixture(scope="session")
+def dataset():
+    return Dataset("solar_10_minutes_dataset.tsf")
+
+
+@pytest.fixture
+def sut():
+    sut = PgForecast()
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
+
+
+@pytest.fixture
+def runner(sut, dataset):
+    return BenchmarkRunner(sut, dataset)
+
+@pytest.mark.parametrize("num_records", [10_000])
+def test_single_insert_benchmark(runner, num_records):
+    """
+    Verifies that single-insert benchmarking runs successfully
+    and produces sane metrics.
+    """
+    result = runner.run_single(num_records)
+
+    # Type & structure
+    assert isinstance(result, BenchmarkResult)
+    assert isinstance(result.metrics, dict)
+
+    # Metrics correctness
+    assert "avg_insert" in result.metrics
+    assert "avg_forecast" in result.metrics
+
+    # Basic sanity checks
+    assert len(result.insert_timings) == num_records
+    assert result.metrics["avg_insert"] is not None
+    assert result.metrics["avg_insert"] > 0.0
+    assert result.metrics["avg_insert"] < 1.0
+    assert result.metrics["avg_forecast"] is not None
+    assert result.metrics["avg_forecast"] > 0.0
+    assert result.metrics["avg_forecast"] < 1.0
+
+
+@pytest.mark.parametrize("page_size,num_records", [(10_000, 1_000_000)])
+def test_batch_insert_benchmark(runner, page_size, num_records):
+    """
+    Verifies that batch-insert benchmarking runs successfully
+    and produces sane metrics.
+    """
+    result = runner.run_batch(page_size, num_records)
+
+    # Type & structure
+    assert isinstance(result, BenchmarkResult)
+    assert isinstance(result.metrics, dict)
+
+    # Derived expectations
+    expected_pages = num_records // page_size
+
+    assert len(result.insert_timings) == expected_pages
+
+    assert result.metrics["avg_insert"] is not None
+    assert result.metrics["avg_insert"] > 0.0
+    assert result.metrics["avg_insert"] < 1.0
+    assert result.metrics["avg_forecast"] is not None
+    assert result.metrics["avg_forecast"] > 0.0
+    assert result.metrics["avg_forecast"] < 1.0
