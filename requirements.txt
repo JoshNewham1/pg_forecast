@@ -21,3 +21,8 @@ psycopg2-binary>=2.9
 dotenv
 # test requirements
 pytest
+# competitor requirements
+fastapi
+uvicorn
+pmdarima
+requests

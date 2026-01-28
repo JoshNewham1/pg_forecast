@@ -60,3 +60,13 @@ find src/TFB/ts_benchmark/baselines/pg_forecast \
         ln -sf "$(realpath "$f")" "$target"
     done
     ' sh {} +
+
+mkdir -p eval/TFB/ts_benchmark/baselines/python_competitor
+find src/TFB/ts_benchmark/baselines/python_competitor \
+  -type f \
+  -exec sh -c '
+    for f; do
+        target="eval/TFB/ts_benchmark/baselines/python_competitor/${f#src/TFB/ts_benchmark/baselines/python_competitor/}"
+        ln -sf "$(realpath "$f")" "$target"
+    done
+    ' sh {} +

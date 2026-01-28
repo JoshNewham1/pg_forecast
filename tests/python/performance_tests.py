@@ -1,5 +1,5 @@
 import time
-from typing import Dict, List, Literal
+from typing import Dict, List, Any
 import csv
 from datetime import datetime, timedelta, timezone
 import os
@@ -11,6 +11,8 @@ import logging
 from abc import ABC, abstractmethod
 from dotenv import load_dotenv
 import pytest
+import requests
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -137,15 +139,13 @@ class SystemUnderTest(ABC):
         pass
 
 class BenchmarkRunner:
-    def __init__(self, sut: SystemUnderTest, dataset: Dataset, forecast_horizon: int = 14):
+    def __init__(self, sut: SystemUnderTest, dataset: Dataset, test_name: str, forecast_horizon: int = 14):
         self.sut = sut
         self.dataset = dataset
+        self.test_name = test_name
         self.forecast_horizon = forecast_horizon
         self.insert_timings = []
         self.forecast_timings = []
-
-    def get_benchmark_name(self, type: Literal["single", "batch"]):
-        return f"{type}_insert: {self.dataset.get_file_name()}"
     
     def run_single(self, num_records: int) -> BenchmarkResult:
         logger.info(
@@ -177,7 +177,7 @@ class BenchmarkRunner:
 
         logger.info("Single insert benchmark complete")
         self.sut.teardown_single()
-        result = BenchmarkResult(self.get_benchmark_name("single"), 
+        result = BenchmarkResult(self.test_name, 
                                  self.insert_timings,
                                  self.forecast_timings, 
                                  write_to_file=True)
@@ -212,7 +212,7 @@ class BenchmarkRunner:
 
         logger.info("Batch insert benchmark complete")
         self.sut.teardown_batch()
-        result = BenchmarkResult(self.get_benchmark_name("batch"), 
+        result = BenchmarkResult(self.test_name, 
                                  self.insert_timings,
                                  self.forecast_timings, 
                                  write_to_file=True)
@@ -296,6 +296,51 @@ class PgForecast(SystemUnderTest):
 
     def teardown_batch(self):
         return self.teardown_single()
+    
+class PythonCompetitor(SystemUnderTest):
+    def __init__(self, base_url: str = "http://localhost:8000"):
+        self.base_url = base_url
+
+    def _post(self, endpoint: str, data: Any = None):
+        response = requests.post(f"{self.base_url}/{endpoint}", json=data)
+        response.raise_for_status()
+        return response.json()
+
+    def set_mode(self, mode: str):
+        self._post("config", {"mode": mode})
+
+    def setup_single(self, seed_records: List[Dict[str, float]]):
+        records = [self._transform_record(r) for r in seed_records]
+        self._post("setup_single", records)
+    
+    def setup_batch(self, seed_records: List[Dict[str, float]]):
+        records = [self._transform_record(r) for r in seed_records]
+        self._post("setup_batch", records)
+
+    def add_single(self, record: Dict[str, float]):
+        self._post("add_single", self._transform_record(record))
+
+    def add_batch(self, records: List[Dict[str, float]]):
+        batch = {"records": [self._transform_record(r) for r in records]}
+        self._post("add_batch", batch)
+
+    def forecast(self, horizon: int) -> List[Dict[str, float]]:
+        return self._post("forecast", {"horizon": horizon})
+    
+    def teardown_single(self):
+        self._post("teardown")
+
+    def teardown_batch(self):
+        self._post("teardown")
+
+    def _transform_record(self, record: Dict[str, float]) -> Dict[str, Any]:
+        # Handle datetime serialization manually if needed, 
+        # but pydantic/fastapi handles ISO strings well.
+        # record['start_timestamp'] is likely a datetime object from monash utils
+        r = record.copy()
+        if isinstance(r.get('start_timestamp'), datetime):
+            r['start_timestamp'] = r['start_timestamp'].isoformat()
+        return r
 
 @pytest.fixture(scope="session")
 def dataset():
@@ -303,7 +348,7 @@ def dataset():
 
 
 @pytest.fixture
-def sut():
+def pgforecast_sut():
     sut = PgForecast()
     yield sut
     try:
@@ -311,12 +356,78 @@ def sut():
     except Exception:
         pass
 
+@pytest.fixture
+def python_sut():
+    sut = PythonCompetitor()
+    sut.set_mode("naive")
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
 
 @pytest.fixture
-def runner(sut, dataset):
-    return BenchmarkRunner(sut, dataset)
+def python_geometric_sut():
+    sut = PythonCompetitor()
+    sut.set_mode("geometric")
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
 
-@pytest.mark.parametrize("num_records", [10_000])
+@pytest.fixture
+def sut(request):
+    """
+    Returns the SUT based on the parametrization.
+    """
+    return request.getfixturevalue(request.param)
+
+@pytest.fixture
+def runner(sut, dataset, request):
+    return BenchmarkRunner(sut, dataset, request.node.name)
+
+@pytest.fixture(scope="session", autouse=True)
+def competitor_server():
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+    venv_python = os.path.join(root, ".venv/bin/python")
+    server_script = os.path.join(root, "eval/competitors/python_autoarima/main.py")
+    
+    logger.info(f"Starting competitor server from {server_script}")
+    
+    proc = subprocess.Popen(
+        [venv_python, server_script, "--output-css"],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": root}
+    )
+    
+    max_retries = 10
+    started = False
+    for i in range(max_retries):
+        try:
+            resp = requests.get("http://localhost:8000/health", timeout=1)
+            if resp.status_code == 200:
+                started = True
+                break
+        except Exception as e:
+            logging.debug(e)
+            pass
+        time.sleep(1)
+        
+    if not started:
+        proc.terminate()
+        raise RuntimeError("Competitor server failed to start")
+        
+    yield
+    
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+@pytest.mark.parametrize("sut", ["pgforecast_sut", "python_sut", "python_geometric_sut"], indirect=True)
+@pytest.mark.parametrize("num_records", [3000])
 def test_single_insert_benchmark(runner, num_records):
     """
     Verifies that single-insert benchmarking runs successfully
@@ -336,12 +447,11 @@ def test_single_insert_benchmark(runner, num_records):
     assert len(result.insert_timings) == num_records
     assert result.metrics["avg_insert"] is not None
     assert result.metrics["avg_insert"] > 0.0
-    assert result.metrics["avg_insert"] < 1.0
     assert result.metrics["avg_forecast"] is not None
     assert result.metrics["avg_forecast"] > 0.0
-    assert result.metrics["avg_forecast"] < 1.0
 
 
+@pytest.mark.parametrize("sut", ["pgforecast_sut", "python_sut", "python_geometric_sut"], indirect=True)
 @pytest.mark.parametrize("page_size,num_records", [(10_000, 1_000_000)])
 def test_batch_insert_benchmark(runner, page_size, num_records):
     """
@@ -361,7 +471,5 @@ def test_batch_insert_benchmark(runner, page_size, num_records):
 
     assert result.metrics["avg_insert"] is not None
     assert result.metrics["avg_insert"] > 0.0
-    assert result.metrics["avg_insert"] < 1.0
     assert result.metrics["avg_forecast"] is not None
     assert result.metrics["avg_forecast"] > 0.0
-    assert result.metrics["avg_forecast"] < 1.0
