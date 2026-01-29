@@ -155,10 +155,11 @@ class BenchmarkRunner:
         self.insert_timings = []
         self.forecast_timings = []
 
-        self.sut.setup_single(self.dataset.get_n(100))
+        it = iter(self.dataset)
+        self.sut.setup_single(list(islice(it, 100)))
 
         num_inserted = 0
-        for record in self.dataset:
+        for record in it:
             if num_inserted == num_records:
                 break
             if num_inserted % 100 == 0 and num_inserted > 0:
@@ -184,14 +185,21 @@ class BenchmarkRunner:
         return result
     
     def run_batch(self, page_size: int, num_records: int) -> BenchmarkResult:
+        logger.info(
+            "Starting batch insert benchmark (%d records, page_size=%d)", num_records, page_size
+        )
         self.insert_timings = []
         self.forecast_timings = []
 
-        self.sut.setup_batch(self.dataset.get_n(100))
+        it = iter(self.dataset)
+        self.sut.setup_batch(list(islice(it, 100)))
 
         num_pages = num_records // page_size
         for page in range(0, num_pages):
-            records = self.dataset.get_n(page_size)
+            records = list(islice(it, page_size))
+            if not records:
+                break
+
             start = time.perf_counter()
             self.sut.add_batch(records)
             end = time.perf_counter()
@@ -266,7 +274,8 @@ class PgForecast(SystemUnderTest):
         return self.setup_single(seed_records)
     
     def add_single(self, record):
-        timestamp = record['start_timestamp'] + timedelta(seconds=record['time_index'])
+        index = record.get('global_index', record['time_index'])
+        timestamp = record['start_timestamp'] + timedelta(seconds=index)
         self.conn.execute(text(
                     f"INSERT INTO {self.base_table}(date, value) VALUES ('{timestamp}', {record['value']})"))
         self.conn.commit()
@@ -274,7 +283,8 @@ class PgForecast(SystemUnderTest):
     def add_batch(self, records):
         values = []
         for record in records:
-            timestamp = record['start_timestamp'] + timedelta(seconds=record['time_index'])
+            index = record.get('global_index', record['time_index'])
+            timestamp = record['start_timestamp'] + timedelta(seconds=index)
             values.append(f"('{timestamp}', {record['value']})")
         
         self.conn.execute(text(f"INSERT INTO {self.base_table}(date, value) VALUES {','.join(values)}"))

@@ -190,6 +190,7 @@ state = State()
 class Record(BaseModel):
     start_timestamp: datetime
     time_index: float
+    global_index: Optional[float] = None
     value: float
 
 class BatchRecords(BaseModel):
@@ -282,7 +283,8 @@ def _reset_state():
 def _add_records(records: List[Record]):
     new_data = []
     for r in records:
-        ts = r.start_timestamp + timedelta(seconds=r.time_index)
+        index = r.global_index if r.global_index is not None else r.time_index
+        ts = r.start_timestamp + timedelta(seconds=index)
         new_data.append({"date": ts, "value": r.value})
     
     if new_data:

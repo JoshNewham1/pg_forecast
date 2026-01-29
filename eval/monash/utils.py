@@ -92,6 +92,7 @@ def stream_tsf_values(full_file_path_and_name, replace_missing_vals_with="NULL")
     col_names = metadata["column_names"]
     col_types = metadata["column_types"]
     started_data_section = False
+    global_idx = 0
 
     with open(full_file_path_and_name, "r", encoding="cp1252") as file:
         for line in file:
@@ -132,8 +133,10 @@ def stream_tsf_values(full_file_path_and_name, replace_missing_vals_with="NULL")
                 yield {
                     **attributes,
                     "time_index": idx,
+                    "global_index": global_idx,
                     "value": parsed_val,
                 }
+                global_idx += 1
 
 
 # From https://huggingface.co/datasets/Monash-University/monash_tsf/tree/main
