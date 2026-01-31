@@ -463,7 +463,7 @@ def competitor_server():
         proc.kill()
 
 @pytest.mark.parametrize("sut", ["pgforecast_sut", "python_sut", "python_geometric_sut"], indirect=True)
-@pytest.mark.parametrize("num_records", [1_000])
+@pytest.mark.parametrize("num_records", [10_000])
 def test_single_insert_benchmark(runner, num_records):
     """
     Verifies that single-insert benchmarking runs successfully
