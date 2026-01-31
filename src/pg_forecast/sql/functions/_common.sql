@@ -168,6 +168,42 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Used to validate performance test
+CREATE OR REPLACE FUNCTION model_get_loss(
+    model_type model,
+    input_table TEXT,
+    date_column TEXT,
+    value_column TEXT
+)
+RETURNS DOUBLE PRECISION
+SECURITY DEFINER
+AS $$
+DECLARE
+    rec_result RECORD;
+BEGIN
+    -- Safety precaution for SECURITY DEFINER
+    PERFORM set_config('search_path', 'public,pg_temp', true);
+
+    EXECUTE format(
+        'SELECT
+            (s.incremental_state).css 
+        FROM models m 
+        LEFT JOIN model_arima_stats s 
+            ON s.model_id = m.id 
+        WHERE 
+            m.model_type = %L AND 
+            m.input_table = %L AND 
+            m.date_column = %L AND 
+            m.value_column = %L 
+        LIMIT 1;',
+        
+        model_type, input_table, date_column, value_column
+    ) INTO rec_result;
+
+    RETURN rec_result.css;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE FUNCTION series_to_array(
     source_table TEXT,
     date_col TEXT,

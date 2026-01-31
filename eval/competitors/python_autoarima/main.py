@@ -1,191 +1,155 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 import pandas as pd
 import numpy as np
 import pmdarima as pm
 from datetime import datetime, timedelta, timezone
 import logging
-import argparse
+from dataclasses import dataclass
 
-# Configure logging
+# -----------------------------
+# Configuration & logging
+# -----------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--output-css", action="store_true", help="Write the resultant CSS (loss) of each forecast to a file")
-args = parser.parse_args()
-OUTPUT_CSS = args.output_css or False
+# -----------------------------
+# Incremental ARIMA
+# -----------------------------
+
+@dataclass(frozen=True)
+class IncrementalState:
+    css: float
+    y_lags: np.ndarray
+    e_lags: np.ndarray
+    diff_lags: np.ndarray
+
+    @staticmethod
+    def initial(p: int, q: int, d: int):
+        return IncrementalState(
+            css=0.0,
+            y_lags=np.zeros(p),
+            e_lags=np.zeros(q),
+            diff_lags=np.zeros(d),
+        )
+
+def transition(state: IncrementalState, y_raw: float,
+               phi: np.ndarray, theta: np.ndarray, c: float) -> IncrementalState:
+    # Differencing (any d)
+    x = y_raw
+    diff_lags = state.diff_lags.copy()
+
+    for i in range(len(diff_lags)):
+        delta = x - diff_lags[i]
+        diff_lags[i] = x
+        x = delta
+
+    y = x  # fully differenced observation
+
+    # Prediction
+    y_hat = c
+    if len(phi):
+        y_hat += phi @ state.y_lags
+    if len(theta):
+        y_hat += theta @ state.e_lags
+
+    eps = y - y_hat
+
+    # Lag updates
+    y_lags = state.y_lags.copy()
+    e_lags = state.e_lags.copy()
+    if len(y_lags):
+        y_lags[1:], y_lags[0] = y_lags[:-1], y
+    if len(e_lags):
+        e_lags[1:], e_lags[0] = e_lags[:-1], eps
+
+    return IncrementalState(
+        css=state.css + eps * eps,
+        y_lags=y_lags,
+        e_lags=e_lags,
+        diff_lags=diff_lags,
+    )
+
+
+def full_table_state(ys, phi, theta, c, d):
+    state = IncrementalState.initial(len(phi), len(theta), d)
+    for y in ys:
+        state = transition(state, y, phi, theta, c)
+    return state
+
 
 class GeometricArima:
-    def __init__(self, p, d, q, phi, theta, c, data_history: np.ndarray, tolerance=0.05):
-        self.p = p
-        self.d = d
-        self.q = q
+    def __init__(self, p, d, q, phi, theta, c, history, tol=0.05):
         self.phi = np.array(phi)
         self.theta = np.array(theta)
         self.c = c
-        self.tolerance = tolerance
-        
-        # Incremental state
-        self.css = 0.0
-        self.y_lags = np.zeros(p)
-        self.e_lags = np.zeros(q)
-        self.diff_history = [] # To handle differencing
-        
-        # Initialize state with history
-        self._initialize_state(data_history)
-        
-        # Simplex vertices
-        self.vertices = []
-        if p + q > 0:
-             self._create_vertices(data_history)
+        self.d = d
+        self.tol = tol
 
-    def _initialize_state(self, data: np.ndarray):
-        # Apply differencing if d > 0
-        current_data = data
-        for _ in range(self.d):
-            current_data = np.diff(current_data)
-        
-        # Simplified: run filter to get current css and lags
-        self.css = 0.0
-        y_lags = np.zeros(self.p)
-        e_lags = np.zeros(self.q)
-        
-        for y in current_data:
-            eps = self._transition_step(y, self.phi, self.theta, self.c, y_lags, e_lags)
-            self.css += eps * eps
-            
-        self.y_lags = y_lags
-        self.e_lags = e_lags
-        # Keep last d values of raw data to perform incremental differencing
-        self.diff_history = list(data[-self.d:]) if self.d > 0 else []
+        self.centre_state = full_table_state(history, self.phi, self.theta, c, d)
 
-    def _transition_step(self, y, phi, theta, c, y_lags, e_lags):
-        # y_hat = c + sum(phi * y_prev) + sum(theta * e_prev)
-        y_hat = c
-        if len(phi) > 0 and len(y_lags) > 0:
-            y_hat += np.dot(phi, y_lags)
-        if len(theta) > 0 and len(e_lags) > 0:
-            y_hat += np.dot(theta, e_lags)
-            
-        eps = y - y_hat
-        
-        # Update lags (shift)
-        if len(y_lags) > 0:
-            y_lags[1:] = y_lags[:-1]
-            y_lags[0] = y
-        if len(e_lags) > 0:
-            e_lags[1:] = e_lags[:-1]
-            e_lags[0] = eps
-            
-        return eps
-
-    def _create_vertices(self, data_history):
         params = np.concatenate([self.phi, self.theta])
-        num_params = len(params)
-        
-        for i in range(num_params):
-            v_params = params.copy()
-            # Perturb
-            shift = self.tolerance if v_params[i] >= 0 else -self.tolerance
-            v_params[i] += shift
-            
-            v_phi = v_params[:self.p]
-            v_theta = v_params[self.p:]
-            
-            v = {
-                "phi": v_phi,
-                "theta": v_theta,
-                "css": 0.0,
-                "y_lags": np.zeros(self.p),
-                "e_lags": np.zeros(self.q)
-            }
-            # Initialize vertex state
-            self._init_vertex(v, data_history)
-            self.vertices.append(v)
-            
-        # Add one more vertex scaled toward origin (like in arima.sql)
+        p_len = len(self.phi)
+        self.vertices = []
+
+        for i in range(len(params)):
+            v = params.copy()
+            v[i] += tol if v[i] >= 0 else -tol
+            self.vertices.append({
+                "phi": v[:p_len],
+                "theta": v[p_len:],
+                "state": full_table_state(history, v[:p_len], v[p_len:], c, d),
+            })
+
         dist = np.linalg.norm(params)
-        scale = 1.0 - (self.tolerance / dist) if dist > self.tolerance else 0.5
-        v_params = params * scale
-        v = {
-            "phi": v_params[:self.p],
-            "theta": v_params[self.p:],
-            "css": 0.0,
-            "y_lags": np.zeros(self.p),
-            "e_lags": np.zeros(self.q)
-        }
-        self._init_vertex(v, data_history)
-        self.vertices.append(v)
+        scale = 1.0 - tol / dist if dist > tol else 0.5
+        v = params * scale
+        self.vertices.append({
+            "phi": v[:p_len],
+            "theta": v[p_len:],
+            "state": full_table_state(history, v[:p_len], v[p_len:], c, d),
+        })
 
-    def _init_vertex(self, v, data):
-        current_data = data
-        for _ in range(self.d):
-            current_data = np.diff(current_data)
+    def update(self, new_ys: List[float]) -> bool:
+        centre = self.centre_state
+        verts = [v["state"] for v in self.vertices]
+
+        for y in new_ys:
+            centre = transition(centre, y, self.phi, self.theta, self.c)
+            verts = [
+                transition(s, y, v["phi"], v["theta"], self.c)
+                for s, v in zip(verts, self.vertices)
+            ]
         
-        v["css"] = 0.0
-        y_lags = np.zeros(self.p)
-        e_lags = np.zeros(self.q)
-        for y in current_data:
-            eps = self._transition_step(y, v["phi"], v["theta"], self.c, y_lags, e_lags)
-            v["css"] += eps * eps
-        v["y_lags"] = y_lags
-        v["e_lags"] = e_lags
+        self.centre_state = centre
 
-    def update(self, y_raw):
-        # Incremental differencing
-        y = y_raw
-        if self.d > 0:
-            for i in range(self.d):
-                prev = self.diff_history[-(i+1)]
-                new_y = y - prev
-                # Update diff history for next level or next raw point
-                # This is a bit tricky for d > 1, but for d=1 it's simple
-                pass 
-            # Simple implementation for d=1
-            if self.d == 1:
-                y_diff = y - self.diff_history[-1]
-                self.diff_history = [y]
-                y = y_diff
-            else:
-                # Fallback: if d > 1, we might need more complex logic. 
-                # For now, let's just re-diff the tail if needed, 
-                # or assume d <= 1 for this competitor.
-                # Actually let's just use the last value to difference.
-                for i in range(self.d):
-                    # This is not perfectly correct for d > 1 without full history,
-                    # but let's assume d=1 is the common case or simplify.
-                    pass
-                y = y_raw - self.diff_history[-1] # Naive d=1
-                self.diff_history[-1] = y_raw
+        if min(v.css for v in verts) < centre.css * (1 - 1e-12):
+            return False  # breach & retrain
 
-        # Update center
-        eps = self._transition_step(y, self.phi, self.theta, self.c, self.y_lags, self.e_lags)
-        self.css += eps * eps
-        
-        # Update vertices
-        for v in self.vertices:
-            eps_v = self._transition_step(y, v["phi"], v["theta"], self.c, v["y_lags"], v["e_lags"])
-            v["css"] += eps_v * eps_v
+        for v, s in zip(self.vertices, verts):
+            v["state"] = s
+        return True
 
-    def check_breach(self):
-        if not self.vertices:
-            return False
-        min_vertex_css = min(v["css"] for v in self.vertices)
-        return min_vertex_css < self.css
+# -----------------------------
+# In-memory application state
+# -----------------------------
 
-# In-memory storage
 class State:
     def __init__(self):
-        self.data: pd.DataFrame = pd.DataFrame(columns=["date", "value"])
+        self.data = pd.DataFrame(columns=["date", "value"])
         self.model = None
         self.geo_arima: Optional[GeometricArima] = None
-        self.mode = "naive" # "naive" or "geometric"
+        self.mode = "naive"
 
 state = State()
+
+# -----------------------------
+# API models
+# -----------------------------
 
 class Record(BaseModel):
     start_timestamp: datetime
@@ -200,22 +164,26 @@ class ForecastRequest(BaseModel):
     horizon: int
 
 class Config(BaseModel):
-    mode: str # "naive" or "geometric"
+    mode: str  # "naive" | "geometric"
+
+# -----------------------------
+# API endpoints
+# -----------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.post("/config")
 def set_config(config: Config):
     state.mode = config.mode
     return {"status": "ok", "mode": state.mode}
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
 @app.post("/setup_single")
 def setup_single(records: List[Record]):
     _reset_state()
     _add_records(records)
-    return {"status": "ok", "message": f"Setup complete with {len(records)} records"}
+    return {"status": "ok"}
 
 @app.post("/setup_batch")
 def setup_batch(records: List[Record]):
@@ -225,9 +193,8 @@ def setup_batch(records: List[Record]):
 def add_single(record: Record):
     _add_records([record])
     if state.mode == "geometric" and state.geo_arima:
-        state.geo_arima.update(record.value)
-        if state.geo_arima.check_breach():
-            logger.info("Breach detected! Retraining...")
+        if not state.geo_arima.update([record.value]):
+            logger.info("Breach detected - retraining")
             _train()
     return {"status": "ok"}
 
@@ -235,44 +202,54 @@ def add_single(record: Record):
 def add_batch(batch: BatchRecords):
     _add_records(batch.records)
     if state.mode == "geometric" and state.geo_arima:
-        for r in batch.records:
-            state.geo_arima.update(r.value)
-        if state.geo_arima.check_breach():
-             logger.info("Breach detected! Retraining...")
-             _train()
+        ys = [r.value for r in batch.records]
+        if not state.geo_arima.update(ys):
+            logger.info("Breach detected - retraining")
+            _train()
     return {"status": "ok"}
 
 @app.post("/forecast")
 def forecast(req: ForecastRequest):
     if len(state.data) < 10:
-         raise HTTPException(status_code=400, detail="Not enough data to forecast")
+        raise HTTPException(status_code=400, detail="Not enough data")
 
-    retrained = False
-    if state.mode == "naive" or not state.model:
-        _train() # Naive always retrains
-        retrained = True
-    
-    model = state.model
-    forecast_values = model.predict(n_periods=req.horizon)
-    
-    last_date = state.data["date"].max()
-    if len(state.data) >= 2:
-        diff = state.data["date"].iloc[-1] - state.data["date"].iloc[-2]
-    else:
-        diff = timedelta(days=1)
-        
-    forecast_dates = [last_date + diff * (i + 1) for i in range(req.horizon)]
-    
-    result = []
-    for date, val in zip(forecast_dates, forecast_values):
-        result.append({"forecast_date": date, "forecast_value": val})
-        
-    return result
+    if state.mode == "naive" or state.model is None:
+        _train()
+
+    forecast_vals = state.model.predict(n_periods=req.horizon)
+
+    last_date = state.data["date"].iloc[-1]
+    step = state.data["date"].iloc[-1] - state.data["date"].iloc[-2]
+
+    return [
+        {
+            "forecast_date": last_date + step * (i + 1),
+            "forecast_value": float(v),
+        }
+        for i, v in enumerate(forecast_vals)
+    ]
+
+@app.get("/loss")
+def get_loss() -> float:
+    # Geometric ARIMA - use incremental CSS
+    if state.mode == "geometric" and state.geo_arima is not None:
+        return float(state.geo_arima.centre_state.css)
+
+    # Naive ARIMA
+    if state.model is not None:
+        resid = state.model.resid()
+        return float(np.sum(resid * resid))
+
+    raise HTTPException(status_code=400, detail="Model not trained")
 
 @app.post("/teardown")
 def teardown():
     _reset_state()
     return {"status": "ok"}
+
+# -----------------------------
+# Helpers
+# -----------------------------
 
 def _reset_state():
     state.data = pd.DataFrame(columns=["date", "value"])
@@ -281,58 +258,47 @@ def _reset_state():
     logger.info("State reset")
 
 def _add_records(records: List[Record]):
-    new_data = []
+    rows = []
     for r in records:
-        index = r.global_index if r.global_index is not None else r.time_index
-        ts = r.start_timestamp + timedelta(seconds=index)
-        new_data.append({"date": ts, "value": r.value})
-    
-    if new_data:
-        new_df = pd.DataFrame(new_data)
-        state.data = pd.concat([state.data, new_df]).sort_values("date").reset_index(drop=True)
+        idx = r.global_index if r.global_index is not None else r.time_index
+        ts = r.start_timestamp + timedelta(seconds=idx)
+        rows.append({"date": ts, "value": r.value})
+    if rows:
+        df = pd.DataFrame(rows)
+        state.data = pd.concat([state.data, df]).sort_values("date").reset_index(drop=True)
+    if (state.mode == "geometric" and not state.geo_arima) or not state.model:
+        _train()
 
 def _train():
-    logger.info(f"Training AutoARIMA on {len(state.data)} records...")
-    model = pm.auto_arima(state.data["value"], 
-                          seasonal=False,
-                          stepwise=True,
-                          suppress_warnings=True,
-                          error_action="ignore",
-                          max_p=5, max_q=5, max_d=2,
-                          trace=False)
+    logger.info(f"Training AutoARIMA on {len(state.data)} points")
+    model = pm.auto_arima(
+        state.data["value"],
+        seasonal=False,
+        stepwise=True,
+        suppress_warnings=True,
+        error_action="ignore",
+        max_p=5, max_q=5, max_d=2,
+    )
     state.model = model
-    
+
     if state.mode == "geometric":
         p, d, q = model.order
-        # Extract params
-        params = model.arima_res_.params
-        # pmdarima params order: intercept (if any), ar.L1..., ma.L1..., sigma2
-        phi = []
-        theta = []
-        c = 0.0
-        
-        # This is a bit fragile as param names vary.
-        # But statsmodels usually has 'const', 'ar.L1', 'ma.L1' etc.
-        param_names = model.arima_res_.param_names
-        for name, val in zip(param_names, params):
-            if name == 'const' or name == 'intercept':
+        phi, theta, c = [], [], 0.0
+        for name, val in zip(model.arima_res_.param_names, model.arima_res_.params):
+            if name in ("const", "intercept"):
                 c = val
-            elif name.startswith('ar.L'):
+            elif name.startswith("ar.L"):
                 phi.append(val)
-            elif name.startswith('ma.L'):
+            elif name.startswith("ma.L"):
                 theta.append(val)
-        
-        state.geo_arima = GeometricArima(p, d, q, phi, theta, c, state.data["value"].values)
-        
-    logger.info(f"Trained model: {model.order}")
 
-    residuals = model.resid()
-    css = np.sum(residuals ** 2)
-    timestamp = datetime.now(timezone.utc)
-    timestamp_text = timestamp.isoformat()
-    if OUTPUT_CSS:
-        with open("python_competitor_accuracy.csv", "a") as f:
-            f.writelines([timestamp_text, ",", str(css), "\n"])
+        state.geo_arima = GeometricArima(
+            p, d, q, phi, theta, c, state.data["value"].values
+        )
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
 
 if __name__ == "__main__":
     import uvicorn

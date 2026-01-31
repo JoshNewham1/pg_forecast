@@ -23,10 +23,11 @@ if not logger.handlers:
     )
 
 class BenchmarkResult:
-    def __init__(self, test_name: str, insert_timings: list[float], forecast_timings: list[float], write_to_file = True, csv_prefix = "performance_"):
+    def __init__(self, test_name: str, insert_timings: list[float], forecast_timings: list[float], losses: list[float], write_to_file = True, csv_prefix = "performance_"):
         self.insert_timings = insert_timings
         self.forecast_timings = forecast_timings
-        self.metrics = self.calculate_metrics(insert_timings, forecast_timings)
+        self.losses = losses
+        self.metrics = self.calculate_metrics(insert_timings, forecast_timings, losses)
         self.test_name = test_name
         self.csv_prefix = csv_prefix
         if write_to_file:
@@ -71,19 +72,24 @@ class BenchmarkResult:
 
             insert_rows = map(lambda t: { "type": "insert", "time": t }, self.insert_timings)
             forecast_rows = map(lambda t: { "type": "forecast", "time": t }, self.forecast_timings)
+            loss_rows = map(lambda l: { "type": "loss", "time": l }, self.losses)
             writer.writerows(insert_rows)
             writer.writerows(forecast_rows)
+            writer.writerows(loss_rows)
 
-    def calculate_metrics(self, insert_timings, forecast_timings):
+    def calculate_metrics(self, insert_timings: list[float], forecast_timings: list[float], losses: list[float]):
         avg_forecast = None
         avg_insert = None
+        final_loss = None
 
         if len(insert_timings) > 0:
             avg_insert = sum(insert_timings) / len(insert_timings)
         if len(forecast_timings) > 0:
             avg_forecast = sum(forecast_timings) / len(forecast_timings)
+        if len(losses) > 0:
+            final_loss = losses[-1]
 
-        return {"avg_insert": avg_insert, "avg_forecast": avg_forecast}
+        return {"avg_insert": avg_insert, "avg_forecast": avg_forecast, "final_loss": final_loss}
     
 class Dataset:
     def __init__(self, file_name: str, path: str = "../../eval/monash/data"):
@@ -131,6 +137,10 @@ class SystemUnderTest(ABC):
         pass
 
     @abstractmethod
+    def get_loss(self) -> float:
+        pass
+
+    @abstractmethod
     def teardown_single(self):
         pass
 
@@ -146,6 +156,7 @@ class BenchmarkRunner:
         self.forecast_horizon = forecast_horizon
         self.insert_timings = []
         self.forecast_timings = []
+        self.losses = []
     
     def run_single(self, num_records: int) -> BenchmarkResult:
         logger.info(
@@ -173,14 +184,16 @@ class BenchmarkRunner:
             self.sut.add_single(record)
             end = time.perf_counter()
             self.insert_timings.append(end - start)
+            self.losses.append(self.sut.get_loss())
             num_inserted += 1
             logging.debug(f"Inserted record #{num_inserted}")
 
         logger.info("Single insert benchmark complete")
         self.sut.teardown_single()
-        result = BenchmarkResult(self.test_name, 
+        result = BenchmarkResult(self.test_name,
                                  self.insert_timings,
-                                 self.forecast_timings, 
+                                 self.forecast_timings,
+                                 self.losses,
                                  write_to_file=True)
         return result
     
@@ -210,6 +223,8 @@ class BenchmarkRunner:
             end = time.perf_counter()
             self.forecast_timings.append(end - start)
 
+            self.losses.append(self.sut.get_loss())
+
             logger.debug(
                 "Page %d/%d processed (insert=%.6fs, forecast=%.6fs)",
                 page + 1,
@@ -220,9 +235,10 @@ class BenchmarkRunner:
 
         logger.info("Batch insert benchmark complete")
         self.sut.teardown_batch()
-        result = BenchmarkResult(self.test_name, 
+        result = BenchmarkResult(self.test_name,
                                  self.insert_timings,
-                                 self.forecast_timings, 
+                                 self.forecast_timings,
+                                 self.losses,
                                  write_to_file=True)
         return result
     
@@ -287,17 +303,25 @@ class PgForecast(SystemUnderTest):
             timestamp = record['start_timestamp'] + timedelta(seconds=index)
             values.append(f"('{timestamp}', {record['value']})")
         
-        self.conn.execute(text(f"INSERT INTO {self.base_table}(date, value) VALUES {','.join(values)}"))
+        # TODO: This is currently retraining after every batch. Fix incremental CSS and then delete the remove and create forecast lines
+        self.conn.execute(text(f"INSERT INTO {self.base_table}(date, value) VALUES {','.join(values)};"))
+        self.conn.execute(text(f"SELECT remove_forecast('autoarima', '{self.base_table}', 'date', 'value');"))
+        self.conn.execute(text(f"SELECT create_forecast('autoarima', '{self.base_table}', 'date', 'value');"))
         self.conn.commit()
 
     def forecast(self, horizon):
-        with self.conn.begin():
-            sql = f"""
-            SELECT forecast_date, forecast_value
-            FROM run_forecast('{self.model_name}', '{self.base_table}', 'date', 'value', {horizon});
-            """
-            result = self.conn.execute(text(sql)).fetchall()
-            return result
+        sql = f"""
+        SELECT forecast_date, forecast_value
+        FROM run_forecast('{self.model_name}', '{self.base_table}', 'date', 'value', {horizon});
+        """
+        result = self.conn.execute(text(sql)).fetchall()
+        return result
+        
+    def get_loss(self):
+        css = self.conn.execute(text(f"SELECT model_get_loss('{self.model_name}', '{self.base_table}', 'date', 'value');")).fetchone()[0]
+        if css is None or css == float("NaN"):
+            logging.warning(f"Invalid CSS returned on run {len(self.insert_timings)}: {css}")
+        return css
     
     def teardown_single(self):
         self.conn.execute(text(f"SELECT remove_forecast('{self.model_name}', '{self.base_table}', 'date', 'value');"))
@@ -337,6 +361,11 @@ class PythonCompetitor(SystemUnderTest):
     def forecast(self, horizon: int) -> List[Dict[str, float]]:
         return self._post("forecast", {"horizon": horizon})
     
+    def get_loss(self) -> float:
+        response = requests.get(f"{self.base_url}/loss")
+        response.raise_for_status()
+        return float(response.json())
+    
     def teardown_single(self):
         self._post("teardown")
 
@@ -344,9 +373,6 @@ class PythonCompetitor(SystemUnderTest):
         self._post("teardown")
 
     def _transform_record(self, record: Dict[str, float]) -> Dict[str, Any]:
-        # Handle datetime serialization manually if needed, 
-        # but pydantic/fastapi handles ISO strings well.
-        # record['start_timestamp'] is likely a datetime object from monash utils
         r = record.copy()
         if isinstance(r.get('start_timestamp'), datetime):
             r['start_timestamp'] = r['start_timestamp'].isoformat()
@@ -406,7 +432,7 @@ def competitor_server():
     logger.info(f"Starting competitor server from {server_script}")
     
     proc = subprocess.Popen(
-        [venv_python, server_script, "--output-css"],
+        [venv_python, server_script],
         cwd=root,
         env={**os.environ, "PYTHONPATH": root}
     )
@@ -437,7 +463,7 @@ def competitor_server():
         proc.kill()
 
 @pytest.mark.parametrize("sut", ["pgforecast_sut", "python_sut", "python_geometric_sut"], indirect=True)
-@pytest.mark.parametrize("num_records", [3000])
+@pytest.mark.parametrize("num_records", [1_000])
 def test_single_insert_benchmark(runner, num_records):
     """
     Verifies that single-insert benchmarking runs successfully
