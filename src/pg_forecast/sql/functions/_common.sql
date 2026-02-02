@@ -3,7 +3,8 @@ CREATE OR REPLACE FUNCTION create_forecast(
     model_name TEXT,
     input_table TEXT,
     date_column TEXT,
-    value_column TEXT
+    value_column TEXT,
+    args JSONB DEFAULT '{}'
 )
 RETURNS BOOLEAN -- Was forecast creation successful
 LANGUAGE plpgsql
@@ -18,6 +19,14 @@ BEGIN
                     input_table,
                     date_column,
                     value_column
+                )) IS NOT NULL
+            WHEN 'pyautoarima' THEN
+                (SELECT pyautoarima_create(
+                    input_table,
+                    date_column,
+                    value_column,
+                    COALESCE((args->>'use_continuous_agg')::boolean, FALSE),
+                    COALESCE((args->>'is_incremental')::boolean, FALSE)
                 )) IS NOT NULL
             ELSE
                 NULL
@@ -45,6 +54,8 @@ AS $$
 DECLARE
     rec_model RECORD;
     v_opt_result arima_optimise_result;
+    v_func_name TEXT;
+    v_func_exists BOOLEAN;
 BEGIN
     -- Safety precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
@@ -94,11 +105,33 @@ BEGIN
                     forecast_step
                 )
         RETURN;
-    END IF;
+    ELSIF model_name = 'pyautoarima' THEN
+        v_func_name := model_name || '_forecast';
 
-    -- If model type not found
-    RAISE WARNING 'run_forecast: % is not a valid model', model_name;
-    RETURN;
+        -- Check if the function exists in the current schema
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_proc p
+            JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE p.proname = v_func_name
+            AND n.nspname = 'public'
+        ) INTO v_func_exists;
+
+        IF v_func_exists THEN
+            RETURN QUERY EXECUTE format(
+                'SELECT * FROM %I(%L, %L, %L, %L, %L)',
+                v_func_name,
+                input_table,
+                date_column,
+                value_column,
+                horizon,
+                forecast_step
+            );
+        ELSE
+            RAISE WARNING 'run_forecast: % is not a valid model', model_name;
+            RETURN;
+        END IF;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -180,15 +213,22 @@ SECURITY DEFINER
 AS $$
 DECLARE
     rec_result RECORD;
+    v_stats_table TEXT;
 BEGIN
     -- Safety precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
+
+    IF model_type = 'autoarima' THEN
+        v_stats_table := 'model_arima_stats';
+    ELSE
+        v_stats_table := 'model_' || model_type || '_stats';
+    END IF;
 
     EXECUTE format(
         'SELECT
             (s.incremental_state).css 
         FROM models m 
-        LEFT JOIN model_arima_stats s 
+        LEFT JOIN %I s 
             ON s.model_id = m.id 
         WHERE 
             m.model_type = %L AND 
@@ -197,7 +237,7 @@ BEGIN
             m.value_column = %L 
         LIMIT 1;',
         
-        model_type, input_table, date_column, value_column
+        v_stats_table, model_type, input_table, date_column, value_column
     ) INTO rec_result;
 
     RETURN rec_result.css;

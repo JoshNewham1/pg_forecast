@@ -243,8 +243,9 @@ class BenchmarkRunner:
         return result
     
 class PgForecast(SystemUnderTest):
-    def __init__(self, model_name: str = "autoarima"):
+    def __init__(self, model_name: str = "autoarima", with_timescale: bool = False):
         self.model_name = model_name
+        self.with_timescale = with_timescale
         load_dotenv()
 
         TEST_DB_USERNAME = os.getenv("TEST_DB_USERNAME")
@@ -271,18 +272,23 @@ class PgForecast(SystemUnderTest):
         trans = self.conn.begin()
         self.conn.execute(
             text(f"""
-            SELECT remove_forecast('autoarima', '{self.base_table}', 'date', 'value');
+            SELECT remove_forecast('{self.model_name}', '{self.base_table}', 'date', 'value');
             CREATE TABLE IF NOT EXISTS {self.base_table} (
                 date TIMESTAMP,
                 value DOUBLE PRECISION
-            );
+            ) {"WITH (tsdb.hypertable)" if self.with_timescale else ""};
             TRUNCATE TABLE {self.base_table};
             """)
         )
         trans.commit()
         self.add_batch(seed_records)
         trans = self.conn.begin()
-        self.conn.execute(text(f"SELECT create_forecast('{self.model_name}', '{self.base_table}', 'date', 'value');"))
+        self.conn.execute(text(f"""SELECT create_forecast('{self.model_name}', 
+                                                          '{self.base_table}', 
+                                                          'date', 
+                                                          'value', 
+                                                          '{'{"is_incremental": "true"}' if self.model_name == "pyautoarima" else '{}'}'
+                                                        );"""))
         trans.commit()
         logging.debug(f"Setup completed with {len(seed_records)} seed records")
     
@@ -303,10 +309,11 @@ class PgForecast(SystemUnderTest):
             timestamp = record['start_timestamp'] + timedelta(seconds=index)
             values.append(f"('{timestamp}', {record['value']})")
         
-        # TODO: This is currently retraining after every batch. Fix incremental CSS and then delete the remove and create forecast lines
         self.conn.execute(text(f"INSERT INTO {self.base_table}(date, value) VALUES {','.join(values)};"))
-        self.conn.execute(text(f"SELECT remove_forecast('autoarima', '{self.base_table}', 'date', 'value');"))
-        self.conn.execute(text(f"SELECT create_forecast('autoarima', '{self.base_table}', 'date', 'value');"))
+        # TODO: This is currently retraining after every batch. Fix incremental CSS and then delete the remove and create forecast lines
+        if self.model_name == "autoarima":
+            self.conn.execute(text(f"SELECT remove_forecast('{self.model_name}', '{self.base_table}', 'date', 'value');"))
+            self.conn.execute(text(f"SELECT create_forecast('{self.model_name}', '{self.base_table}', 'date', 'value');"))
         self.conn.commit()
 
     def forecast(self, horizon):
@@ -393,6 +400,15 @@ def pgforecast_sut():
         pass
 
 @pytest.fixture
+def pgforecast_timescale_sut():
+    sut = PgForecast("autoarima", with_timescale=True)
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
+
+@pytest.fixture
 def python_sut():
     sut = PythonCompetitor()
     sut.set_mode("naive")
@@ -406,6 +422,15 @@ def python_sut():
 def python_geometric_sut():
     sut = PythonCompetitor()
     sut.set_mode("geometric")
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
+
+@pytest.fixture
+def timescale_python_geometric_sut():
+    sut = PgForecast(model_name="pyautoarima", with_timescale=True)
     yield sut
     try:
         sut.teardown_single()
@@ -462,7 +487,8 @@ def competitor_server():
     except subprocess.TimeoutExpired:
         proc.kill()
 
-@pytest.mark.parametrize("sut", ["pgforecast_sut", "python_sut", "python_geometric_sut"], indirect=True)
+SUTS = ["pgforecast_sut", "pgforecast_timescale_sut" "python_sut", "python_geometric_sut", "timescale_python_geometric_sut"]
+@pytest.mark.parametrize("sut", SUTS, indirect=True)
 @pytest.mark.parametrize("num_records", [10_000])
 def test_single_insert_benchmark(runner, num_records):
     """
@@ -487,7 +513,7 @@ def test_single_insert_benchmark(runner, num_records):
     assert result.metrics["avg_forecast"] > 0.0
 
 
-@pytest.mark.parametrize("sut", ["pgforecast_sut", "python_sut", "python_geometric_sut"], indirect=True)
+@pytest.mark.parametrize("sut", SUTS, indirect=True)
 @pytest.mark.parametrize("page_size,num_records", [(10_000, 1_000_000)])
 def test_batch_insert_benchmark(runner, page_size, num_records):
     """

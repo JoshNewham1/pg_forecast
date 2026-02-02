@@ -1,4 +1,4 @@
-CREATE TYPE model AS ENUM ('autoarima');
+CREATE TYPE model AS ENUM ('autoarima', 'pyautoarima');
 
 CREATE TABLE models(
     id BIGSERIAL PRIMARY KEY,
@@ -7,5 +7,5 @@ CREATE TABLE models(
     date_column TEXT NOT NULL,
     value_column TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (model_type, input_table, date_column, value_column)
+    CONSTRAINT models_unique_model UNIQUE (model_type, input_table, date_column, value_column)
 );
