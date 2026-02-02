@@ -24,7 +24,8 @@ CREATE TYPE pyautoarima_fit_result AS (
     q INT,
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
-    c DOUBLE PRECISION
+    c DOUBLE PRECISION,
+    css DOUBLE PRECISION
 );
 
 CREATE TYPE pyautoarima_incremental_state AS (
@@ -142,6 +143,8 @@ for idx, v_params in enumerate(vertices):
         """,
         ["bigint", "int", "double precision[]", "double precision[]", "int", "int", "double precision[]", "double precision"]
     ), [stats_id, idx + 1, new_phi, new_theta, p, q, init_lags, 0.0])
+    with open("pyautoarima.log", "a") as f:
+        f.writelines([f"pyautoarima: Created vertex {idx+1} with phi {new_phi} and theta {new_theta}\n"])
 $$;
 
 CREATE OR REPLACE FUNCTION pyautoarima_incremental_update(
@@ -254,6 +257,11 @@ model = pm.auto_arima(
 )
 
 p, d, q = model.order
+residuals = model.resid()
+css = np.sum(residuals ** 2)
+
+with open("pyautoarima.log", "a") as f:
+    f.writelines([f"Trained pyautoarima with {len(y)} records, p = {p}, d = {d}, q = {q}, css = {css}\n"])
 
 phi = []
 theta = []
@@ -267,7 +275,7 @@ for name, val in zip(model.arima_res_.param_names, model.arima_res_.params):
     elif name.startswith("ma.L"):
         theta.append(float(val))
 
-return (p, d, q, phi, theta, c)
+return (p, d, q, phi, theta, c, css)
 $$;
 
 -- =========================================================
@@ -334,7 +342,8 @@ BEGIN
     EXECUTE format(
         'CREATE TRIGGER pyautoarima_on_insert_%I_%I
          AFTER INSERT ON %I
-         FOR EACH ROW
+         REFERENCING NEW TABLE AS new_rows
+         FOR EACH STATEMENT
          EXECUTE FUNCTION pyautoarima_on_insert_trigger(%L, %L, %L, %L);',
         input_table, value_column,
         input_table,
@@ -379,6 +388,10 @@ BEGIN
     v_incremental_state := (v_fit.p, v_fit.q, array_fill(0.0, ARRAY[v_fit.q]), 0.0, 0.0);
 
     -- Store ARIMA stats + incremental state
+    UPDATE model_pyautoarima_stats
+    SET is_active = FALSE
+    WHERE model_id = v_model_id;
+    
     INSERT INTO model_pyautoarima_stats (
         model_id, phi, theta, d, c, incremental_state, "is_incremental", is_active
     )
@@ -420,9 +433,6 @@ BEGIN
     -- Security precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
 
-    -- Get the value of the inserted row dynamically
-    EXECUTE format('SELECT ($1).%I', v_value_column) INTO v_value USING NEW;
-
     -- Load model
     SELECT
         m.id,
@@ -444,23 +454,50 @@ BEGIN
     LIMIT 1;
 
     IF NOT FOUND THEN
-        RETURN NEW;
+        RETURN NULL;
     END IF;
 
-    -- Incremental ARIMA update
-    v_ok := pyautoarima_incremental_update(
-        v_model.stats_id,
-        v_is_incremental,
-        v_value
-    );
+    IF v_model.p + v_model.q = 0 THEN
+        v_is_incremental := FALSE;
+    END IF;
 
-    -- Geometric breach detection
+    IF v_is_incremental AND NOT EXISTS (SELECT 1 FROM pyautoarima_vertices WHERE stats_id = v_model.stats_id) THEN
+        PERFORM pyautoarima_generate_vertices(
+            v_model.stats_id, v_model.p, v_model.q, v_model.d, v_model.phi, v_model.theta, v_model.c
+        );
+    END IF; 
+
+    -- Apply incremental updates in timestamp order
+    FOR v_value IN
+        EXECUTE format(
+            'SELECT %I FROM new_rows ORDER BY %I',
+            v_value_column,
+            v_date_column
+        )
+    LOOP
+        v_ok := pyautoarima_incremental_update(
+            v_model.stats_id,
+            v_is_incremental,
+            v_value
+        );
+
+        -- Stop early if geometry breached
+        IF NOT v_ok THEN
+            EXIT;
+        END IF;
+    END LOOP;
+
+    -- Retrain once if breached
     IF NOT v_ok THEN
-        PERFORM pyautoarima_train(v_input_table, v_date_column, v_value_column, FALSE);
-        RETURN NEW;
+        PERFORM pyautoarima_train(
+            v_input_table,
+            v_date_column,
+            v_value_column,
+            v_is_incremental
+        );
     END IF;
 
-    RETURN NEW;
+    RETURN NULL;
 END;
 $$;
 
