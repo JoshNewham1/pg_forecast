@@ -590,7 +590,12 @@ BEGIN
     -- Safety precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
 
-    SELECT m.*, a.id AS arima_id INTO rec_model 
+    SELECT
+        m.*,
+        a.id AS arima_id,
+        (a.incremental_state).p AS p,
+        (a.incremental_state).q AS q
+    INTO rec_model 
     FROM models m 
     INNER JOIN model_arima_stats a ON m.id = a.model_id AND a.is_active = TRUE
     WHERE m.id = target_model_id;
@@ -603,6 +608,11 @@ BEGIN
     SELECT (min_vertex_css < centre_css)
     INTO v_breach_detected
     FROM comparison;
+
+    -- If no simplex can be performed, retrain
+    IF rec_model.p + rec_model.q = 0 THEN
+        v_breach_detected := TRUE;
+    END IF;
 
     IF v_breach_detected THEN
         -- Mark current model inactive and retrain

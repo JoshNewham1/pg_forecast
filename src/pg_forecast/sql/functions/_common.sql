@@ -234,7 +234,8 @@ BEGIN
             m.model_type = %L AND 
             m.input_table = %L AND 
             m.date_column = %L AND 
-            m.value_column = %L 
+            m.value_column = %L AND
+            s.is_active = TRUE
         LIMIT 1;',
         
         v_stats_table, model_type, input_table, date_column, value_column

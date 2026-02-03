@@ -298,8 +298,7 @@ class PgForecast(SystemUnderTest):
     def add_single(self, record):
         index = record.get('global_index', record['time_index'])
         timestamp = record['start_timestamp'] + timedelta(seconds=index)
-        self.conn.execute(text(
-                    f"INSERT INTO {self.base_table}(date, value) VALUES ('{timestamp}', {record['value']})"))
+        self.conn.execute(text(f"INSERT INTO {self.base_table}(date, value) VALUES ('{timestamp}', {record['value']})"))
         self.conn.commit()
 
     def add_batch(self, records):
@@ -487,7 +486,7 @@ def competitor_server():
     except subprocess.TimeoutExpired:
         proc.kill()
 
-SUTS = ["pgforecast_sut", "pgforecast_timescale_sut" "python_sut", "python_geometric_sut", "timescale_python_geometric_sut"]
+SUTS = ["pgforecast_sut", "pgforecast_timescale_sut", "python_sut", "python_geometric_sut", "timescale_python_geometric_sut"]
 @pytest.mark.parametrize("sut", SUTS, indirect=True)
 @pytest.mark.parametrize("num_records", [10_000])
 def test_single_insert_benchmark(runner, num_records):

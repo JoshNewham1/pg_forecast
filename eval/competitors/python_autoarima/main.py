@@ -86,6 +86,8 @@ class GeometricArima:
     def __init__(self, p, d, q, phi, theta, c, history, tol=0.05):
         self.phi = np.array(phi)
         self.theta = np.array(theta)
+        self.p = p
+        self.q = q
         self.c = c
         self.d = d
         self.tol = tol
@@ -126,6 +128,10 @@ class GeometricArima:
             ]
         
         self.centre_state = centre
+
+        # No vertices, retrain
+        if self.p + self.q == 0:
+            return False
 
         if min(v.css for v in verts) < centre.css * (1 - 1e-12):
             return False  # breach & retrain
@@ -280,9 +286,9 @@ def _train():
         max_p=5, max_q=5, max_d=2,
     )
     state.model = model
+    p, d, q = model.order
 
     if state.mode == "geometric":
-        p, d, q = model.order
         phi, theta, c = [], [], 0.0
         for name, val in zip(model.arima_res_.param_names, model.arima_res_.params):
             if name in ("const", "intercept"):
