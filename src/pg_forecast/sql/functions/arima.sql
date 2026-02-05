@@ -534,14 +534,15 @@ LANGUAGE SQL
 AS $$
     -- TODO: Rewrite this as a loop in C
     WITH RECURSIVE vertices AS (
-        SELECT NULL AS vertex_id, s.phi, s.theta, s.incremental_state AS state
+        SELECT NULL AS vertex_id, s.phi, s.theta, s.incremental_state AS state, s.c, s.d
         FROM model_arima_stats s
         WHERE s.id = arima_id
 
         UNION ALL
 
-        SELECT v.vertex_id, v.phi, v.theta, v.incremental_state AS state
+        SELECT v.vertex_id, v.phi, v.theta, v.incremental_state AS state, s.c, s.d
         FROM arima_vertices v
+        INNER JOIN model_arima_stats s ON s.id = v.arima_id
         WHERE v.arima_id = arima_id
     ),
     ys AS (
@@ -552,9 +553,11 @@ AS $$
         SELECT
             base.vertex_id,
             y.ord,
-            css_incremental_transition(base.state, y.y, base.phi, base.theta) AS state,
+            css_incremental_transition(base.state, y.y, base.phi, base.theta, base.c, base.d) AS state,
             base.phi,
-            base.theta
+            base.theta,
+            base.c,
+            base.d
         FROM vertices base
         INNER JOIN ys y ON y.ord = 1
 
@@ -563,9 +566,11 @@ AS $$
         SELECT
             r.vertex_id,
             y.ord,
-            css_incremental_transition(r.state, y.y, r.phi, r.theta) AS state,
+            css_incremental_transition(r.state, y.y, r.phi, r.theta, r.c, r.d) AS state,
             r.phi,
-            r.theta
+            r.theta,
+            r.c,
+            r.d
         FROM recurse r
         INNER JOIN ys y ON y.ord = r.ord + 1
     )
@@ -586,6 +591,8 @@ AS $$
 DECLARE
     v_breach_detected BOOLEAN;
     rec_model RECORD;
+    v_centre_css DOUBLE PRECISION;
+    v_min_vertex_css DOUBLE PRECISION;
 BEGIN
     -- Safety precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
@@ -600,14 +607,24 @@ BEGIN
     INNER JOIN model_arima_stats a ON m.id = a.model_id AND a.is_active = TRUE
     WHERE m.id = target_model_id;
 
-    WITH comparison AS (
-        SELECT
-            (SELECT (new_state).css FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id) WHERE vertex_id IS NULL) AS centre_css,
-            (SELECT MIN((new_state).css) FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id) WHERE vertex_id IS NOT NULL) AS min_vertex_css
-    )
-    SELECT (min_vertex_css < centre_css)
-    INTO v_breach_detected
-    FROM comparison;
+    -- Create a temp table to hold the updated states so we don't calculate them twice
+    -- and we don't mistakenly calculate t+1 ahead when querying again (further down)
+    CREATE TEMP TABLE tmp_arima_states ON COMMIT DROP AS
+    SELECT vertex_id, new_state
+    FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id);
+
+    SELECT (new_state).css INTO v_centre_css FROM tmp_arima_states WHERE vertex_id IS NULL;
+    SELECT MIN((new_state).css) INTO v_min_vertex_css FROM tmp_arima_states WHERE vertex_id IS NOT NULL;
+
+    -- Check for divergence (Infinity/NaN) or improvement
+    IF v_centre_css = 'Infinity'::DOUBLE PRECISION OR v_centre_css = 'NaN'::DOUBLE PRECISION THEN
+        v_breach_detected := TRUE;
+        RAISE WARNING 'arima_update_model: Model diverged (CSS=%). Forcing retrain.', v_centre_css;
+    ELSIF v_min_vertex_css < v_centre_css THEN
+        v_breach_detected := TRUE;
+    ELSE
+        v_breach_detected := FALSE;
+    END IF;
 
     -- If no simplex can be performed, retrain
     IF rec_model.p + rec_model.q = 0 THEN
@@ -626,19 +643,21 @@ BEGIN
         RAISE NOTICE 'Retraining AutoARIMA model as loss dropped below threshold';
         PERFORM autoarima_train(rec_model.input_table, rec_model.date_column, rec_model.value_column);
     ELSE
-        -- Update the stored states with the new values calculated in the CTE
+        -- Update the stored states with the new values calculated in the temp table
         -- Centre vector
         UPDATE model_arima_stats m
         SET incremental_state = u.new_state
-        FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id) u
+        FROM tmp_arima_states u
         WHERE m.model_id = target_model_id AND u.vertex_id IS NULL;
 
         -- Simplex vertices
         UPDATE arima_vertices v
         SET incremental_state = u.new_state
-        FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id) u
+        FROM tmp_arima_states u
         WHERE v.arima_id = rec_model.arima_id AND v.vertex_id = u.vertex_id;
     END IF;
+
+    DROP TABLE IF EXISTS tmp_arima_states;
 END;
 $$ LANGUAGE plpgsql;
 

@@ -102,7 +102,8 @@ BEGIN
     END LOOP;
 
     IF v_d > MAX_DIFF THEN
-        RAISE EXCEPTION 'More than 2 differences required, ARIMA model not suitable';
+        RAISE WARNING 'More than 2 differences required, ARIMA model not suitable';
+        v_d = 2;
     END IF;
 
     RAISE NOTICE '% differences required', v_d;
