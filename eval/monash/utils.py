@@ -1,11 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from distutils.util import strtobool
 
 import numpy as np
 import pandas as pd
-
-from datetime import datetime
-from distutils.util import strtobool
 
 
 def parse_tsf_metadata(full_file_path_and_name):
@@ -155,7 +152,7 @@ def stream_tsf_aligned_series(full_file_path_and_name, replace_missing_vals_with
     min_length = min(len(s) for _, s in aligned_series)
 
     for t in range(min_length):
-        row = {"index": t}
+        row = {"index": t, "timestamp": best_start_time + timedelta(minutes=t)}
         for name, series in aligned_series:
             row[name] = series[t]
         yield row

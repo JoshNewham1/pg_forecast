@@ -389,6 +389,9 @@ class PythonWebServer(SystemUnderTest):
     def set_mode(self, mode: str):
         self._post("config", {"mode": mode})
 
+    def set_n_features(self, n_lags: int, n_features: int):
+        self._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features})
+
     def setup_single(self, seed_records: List[Dict[str, float]]):
         records = [self._transform_record(r) for r in seed_records]
         self._post("setup_single", records)
@@ -419,10 +422,58 @@ class PythonWebServer(SystemUnderTest):
         self._post("teardown")
 
     def _transform_record(self, record: Dict[str, float]) -> Dict[str, Any]:
-        r = record.copy()
-        if isinstance(r.get('start_timestamp'), datetime):
-            r['start_timestamp'] = r['start_timestamp'].isoformat()
+        if not "T1" in record: # univariate
+            r = record.copy()
+            if isinstance(r.get('start_timestamp'), datetime):
+                r['start_timestamp'] = r['start_timestamp'].isoformat()
+        else: # multivariate
+            r = {"index": record["index"], "timestamp": str(record["timestamp"]), "values": {}}
+
+            for k, v in record.items():
+                if k.startswith("T"):
+                    r["values"][k] = v
         return r
+    
+@pytest.fixture
+def competitor_server(request):
+    server_name = request.param
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+    venv_python = os.path.join(root, ".venv/bin/python")
+    server_script = os.path.join(root, f"eval/competitors/{server_name}/main.py")
+    
+    logger.info(f"Starting competitor server from {server_script}")
+    
+    proc = subprocess.Popen(
+        [venv_python, server_script],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": root}
+    )
+    
+    max_retries = 10
+    started = False
+    for i in range(max_retries):
+        try:
+            resp = requests.get("http://localhost:8000/health", timeout=1)
+            if resp.status_code == 200:
+                started = True
+                break
+        except Exception as e:
+            logging.debug(e)
+            pass
+        time.sleep(1)
+        
+    if not started:
+        proc.terminate()
+        raise RuntimeError("Competitor server failed to start")
+        
+    yield
+    
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 @pytest.fixture(scope="session")
 def univar_dataset():
@@ -430,7 +481,8 @@ def univar_dataset():
 
 @pytest.fixture(scope="session")
 def multivar_dataset():
-    return MultivariateDataset("wind_farms_minutely_dataset_with_missing_values.tsf")
+    # return MultivariateDataset("wind_farms_minutely_dataset_with_missing_values.tsf")
+    return MultivariateDataset("solar_10_minutes_dataset.tsf")
 
 @pytest.fixture
 def pgforecast_sut():
@@ -451,9 +503,14 @@ def pgforecast_timescale_sut():
         pass
 
 @pytest.fixture
-def python_sut(competitor_server):
+def python_sut(competitor_server, n_lags=None, n_features=None):
     sut = PythonWebServer()
-    sut.set_mode("naive")
+    
+    if n_lags is not None and n_features is not None:
+        sut.set_n_features(n_lags, n_features)
+    else:
+        sut.set_mode("naive")
+
     yield sut
     try:
         sut.teardown_single()
@@ -494,49 +551,12 @@ def univar_runner(sut, univar_dataset, request):
 def multivar_runner(sut, multivar_dataset, request):
     return BenchmarkRunner(sut, multivar_dataset, request.node.name)
 
-@pytest.fixture
-def competitor_server():
-    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
-    venv_python = os.path.join(root, ".venv/bin/python")
-    server_script = os.path.join(root, "eval/competitors/python_autoarima/main.py")
-    
-    logger.info(f"Starting competitor server from {server_script}")
-    
-    proc = subprocess.Popen(
-        [venv_python, server_script],
-        cwd=root,
-        env={**os.environ, "PYTHONPATH": root}
-    )
-    
-    max_retries = 10
-    started = False
-    for i in range(max_retries):
-        try:
-            resp = requests.get("http://localhost:8000/health", timeout=1)
-            if resp.status_code == 200:
-                started = True
-                break
-        except Exception as e:
-            logging.debug(e)
-            pass
-        time.sleep(1)
-        
-    if not started:
-        proc.terminate()
-        raise RuntimeError("Competitor server failed to start")
-        
-    yield
-    
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-
 UNIVAR_SUTS = ["pgforecast_sut", "pgforecast_timescale_sut", "python_sut", "python_geometric_sut", "timescale_python_geometric_sut"]
+
+@pytest.mark.parametrize("competitor_server", ["python_autoarima"], indirect=True)
 @pytest.mark.parametrize("sut", UNIVAR_SUTS, indirect=True)
 @pytest.mark.parametrize("num_records", [10_000])
-def test_single_insert_benchmark(univar_runner, num_records):
+def test_univar_single_insert(univar_runner, num_records, competitor_server):
     """
     Verifies that single-insert benchmarking runs successfully
     and produces sane metrics.
@@ -559,9 +579,10 @@ def test_single_insert_benchmark(univar_runner, num_records):
     assert result.metrics["avg_forecast"] > 0.0
 
 
+@pytest.mark.parametrize("competitor_server", ["python_autoarima"], indirect=True)
 @pytest.mark.parametrize("sut", UNIVAR_SUTS, indirect=True)
 @pytest.mark.parametrize("page_size,num_records", [(10_000, 1_000_000)])
-def test_batch_insert_benchmark(univar_runner, page_size, num_records):
+def test_univar_batch_insert(univar_runner, page_size, num_records, competitor_server):
     """
     Verifies that batch-insert benchmarking runs successfully
     and produces sane metrics.
@@ -582,10 +603,11 @@ def test_batch_insert_benchmark(univar_runner, page_size, num_records):
     assert result.metrics["avg_forecast"] is not None
     assert result.metrics["avg_forecast"] > 0.0
 
-MULTIVAR_SUTS = ["pgforecast_sut"]
+MULTIVAR_SUTS = ["python_sut"]
+@pytest.mark.parametrize("competitor_server", ["python_xgboost"], indirect=True)
 @pytest.mark.parametrize("sut", MULTIVAR_SUTS, indirect=True)
-@pytest.mark.parametrize("page_size,num_records", [(10_000, 1_000_000)])
-def test_multivariate_benchmark(multivar_runner, page_size, num_records):
+@pytest.mark.parametrize("page_size,num_records,n_lags,n_features", [(10_000, 1_000_000, 5, 100)])
+def test_multivar_batch_insert(multivar_runner, page_size, num_records, n_lags, n_features, competitor_server):
     result = multivar_runner.run_batch(page_size, num_records)
 
     # Type & structure
