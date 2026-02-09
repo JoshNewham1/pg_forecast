@@ -105,6 +105,7 @@ class InDBModelAdapter(ModelBase):
             )
 
         # Bulk insert eval data
+        # TODO: Compare results with incremental?
         series = series.reset_index()
         series.columns = [date_col, value_col]
         self._copy_to_db(series, temp_table)

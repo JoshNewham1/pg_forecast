@@ -85,6 +85,81 @@ def stream_tsf_series(full_file_path_and_name, replace_missing_vals_with="NULL")
 
             yield record
 
+# Adapted from stream_tsf_series above, uses time series that start at the same time
+# Selects this start time based on the max number of time series
+# TODO: This could be made faster by avoiding line.split
+def stream_tsf_aligned_series(full_file_path_and_name, replace_missing_vals_with="NULL"):
+    """
+    Streams aligned time steps from the largest group of time series
+    that share the same start timestamp.
+
+    Yields:
+        dict: {series_name: value_at_t, ..., "index": t}
+    """
+
+    metadata = parse_tsf_metadata(full_file_path_and_name)
+    col_names = metadata["column_names"]
+    col_types = metadata["column_types"]
+
+    # Find most common start time
+    series_by_start = {}
+
+    def load_series():
+        started_data_section = False
+        with open(full_file_path_and_name, "r", encoding="cp1252") as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("@data"):
+                    started_data_section = True
+                    continue
+                if not started_data_section:
+                    continue
+
+                full_info = line.split(":")
+                record = {}
+
+                for i, col_name in enumerate(col_names):
+                    attr_type = col_types[i]
+                    attr_val = full_info[i]
+                    if attr_type == "numeric":
+                        record[col_name] = int(attr_val)
+                    elif attr_type == "string":
+                        record[col_name] = attr_val
+                    elif attr_type == "date":
+                        record[col_name] = datetime.strptime(
+                            attr_val, "%Y-%m-%d %H-%M-%S"
+                        )
+
+                series = [
+                    float(v) if v != "?" else replace_missing_vals_with
+                    for v in full_info[-1].split(",")
+                ]
+
+                yield record, series
+
+    for record, series in load_series():
+        start_time = record["start_timestamp"]
+        if start_time not in series_by_start:
+            series_by_start[start_time] = []
+        series_by_start[start_time].append(
+            (record["series_name"], series)
+        )
+
+    # Select start time with maximum number of series
+    best_start_time = max(series_by_start, key=lambda k: len(series_by_start[k]))
+    aligned_series = series_by_start[best_start_time]
+
+    # Stream index-by-index
+    min_length = min(len(s) for _, s in aligned_series)
+
+    for t in range(min_length):
+        row = {"index": t}
+        for name, series in aligned_series:
+            row[name] = series[t]
+        yield row
+
 
 def stream_tsf_values(full_file_path_and_name, replace_missing_vals_with="NULL"):
     """Stream individual data values from a .tsf file, one at a time."""

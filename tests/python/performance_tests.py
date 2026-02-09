@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import os
 
 from sqlalchemy import create_engine, text
-from monash.utils import stream_tsf_values
+from monash.utils import stream_tsf_values, stream_tsf_aligned_series
 from itertools import islice
 import logging
 from abc import ABC, abstractmethod
@@ -91,19 +91,63 @@ class BenchmarkResult:
 
         return {"avg_insert": avg_insert, "avg_forecast": avg_forecast, "final_loss": final_loss}
     
-class Dataset:
+class Dataset(ABC):
+    def __init__(self, file_name: str, path: str = "../../eval/monash/data"):
+        raise NotImplementedError("Please use an implementation of Dataset")
+    
+    @abstractmethod
+    def __iter__(self):
+        pass
+
+    @abstractmethod
+    def get_n(self, n_records: int) -> List[Dict[str, float]]:
+        pass
+
+    @abstractmethod
+    def get_file_name(self) -> str:
+        return self.file_name
+
+
+class UnivariateDataset(Dataset):
+    """
+    Loads each time-series sequentially, assuming they're all independent
+    """
     def __init__(self, file_name: str, path: str = "../../eval/monash/data"):
         self.file_name = file_name
         self.path = os.path.join(os.path.dirname(__file__), path, file_name)
 
-        logger.info("Loading dataset: %s", self.path)
+        logger.info("Loading univariate dataset: %s", self.path)
 
         if not os.path.exists(self.path):
             raise RuntimeError(f"The path {self.path} does not exist for dataset {file_name}, could not instantiate object")
         
     def __iter__(self):
-        logger.debug("Creating dataset iterator for %s", self.file_name)
+        logger.debug("Creating univariate dataset iterator for %s", self.file_name)
         return stream_tsf_values(self.path)
+    
+    def get_n(self, n_records: int) -> List[Dict[str, float]]:
+        logger.debug("Fetching %d records from dataset", n_records)
+        return list(islice(self, n_records))
+    
+    def get_file_name(self) -> str:
+        return self.file_name
+
+class MultivariateDataset(Dataset):
+    """
+    Loads all time series **with the same start date** together, each as a variable
+    """
+    def __init__(self, file_name: str, path: str = "../../eval/monash/data"):
+        self.file_name = file_name
+        self.path = os.path.join(os.path.dirname(__file__), path, file_name)
+
+        logger.info("Loading multivariate dataset: %s", self.path)
+
+        if not os.path.exists(self.path):
+            raise RuntimeError(f"The path {self.path} does not exist for dataset {file_name}, could not instantiate object")
+        
+    def __iter__(self):
+        logger.debug("Creating multivariate dataset iterator for %s", self.file_name)
+        return stream_tsf_aligned_series(self.path)
     
     def get_n(self, n_records: int) -> List[Dict[str, float]]:
         logger.debug("Fetching %d records from dataset", n_records)
@@ -309,10 +353,6 @@ class PgForecast(SystemUnderTest):
             values.append(f"('{timestamp}', {record['value']})")
         
         self.conn.execute(text(f"INSERT INTO {self.base_table}(date, value) VALUES {','.join(values)};"))
-        # TODO: This is currently retraining after every batch. Fix incremental CSS and then delete the remove and create forecast lines
-        if self.model_name == "autoarima":
-            self.conn.execute(text(f"SELECT remove_forecast('{self.model_name}', '{self.base_table}', 'date', 'value');"))
-            self.conn.execute(text(f"SELECT create_forecast('{self.model_name}', '{self.base_table}', 'date', 'value');"))
         self.conn.commit()
 
     def forecast(self, horizon):
@@ -337,7 +377,7 @@ class PgForecast(SystemUnderTest):
     def teardown_batch(self):
         return self.teardown_single()
     
-class PythonCompetitor(SystemUnderTest):
+class PythonWebServer(SystemUnderTest):
     def __init__(self, base_url: str = "http://localhost:8000"):
         self.base_url = base_url
 
@@ -385,9 +425,12 @@ class PythonCompetitor(SystemUnderTest):
         return r
 
 @pytest.fixture(scope="session")
-def dataset():
-    return Dataset("solar_10_minutes_dataset.tsf")
+def univar_dataset():
+    return UnivariateDataset("solar_10_minutes_dataset.tsf")
 
+@pytest.fixture(scope="session")
+def multivar_dataset():
+    return MultivariateDataset("wind_farms_minutely_dataset_with_missing_values.tsf")
 
 @pytest.fixture
 def pgforecast_sut():
@@ -408,8 +451,8 @@ def pgforecast_timescale_sut():
         pass
 
 @pytest.fixture
-def python_sut():
-    sut = PythonCompetitor()
+def python_sut(competitor_server):
+    sut = PythonWebServer()
     sut.set_mode("naive")
     yield sut
     try:
@@ -418,8 +461,8 @@ def python_sut():
         pass
 
 @pytest.fixture
-def python_geometric_sut():
-    sut = PythonCompetitor()
+def python_geometric_sut(competitor_server):
+    sut = PythonWebServer()
     sut.set_mode("geometric")
     yield sut
     try:
@@ -444,10 +487,14 @@ def sut(request):
     return request.getfixturevalue(request.param)
 
 @pytest.fixture
-def runner(sut, dataset, request):
-    return BenchmarkRunner(sut, dataset, request.node.name)
+def univar_runner(sut, univar_dataset, request):
+    return BenchmarkRunner(sut, univar_dataset, request.node.name)
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture
+def multivar_runner(sut, multivar_dataset, request):
+    return BenchmarkRunner(sut, multivar_dataset, request.node.name)
+
+@pytest.fixture
 def competitor_server():
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
     venv_python = os.path.join(root, ".venv/bin/python")
@@ -486,15 +533,15 @@ def competitor_server():
     except subprocess.TimeoutExpired:
         proc.kill()
 
-SUTS = ["pgforecast_sut", "pgforecast_timescale_sut", "python_sut", "python_geometric_sut", "timescale_python_geometric_sut"]
-@pytest.mark.parametrize("sut", SUTS, indirect=True)
+UNIVAR_SUTS = ["pgforecast_sut", "pgforecast_timescale_sut", "python_sut", "python_geometric_sut", "timescale_python_geometric_sut"]
+@pytest.mark.parametrize("sut", UNIVAR_SUTS, indirect=True)
 @pytest.mark.parametrize("num_records", [10_000])
-def test_single_insert_benchmark(runner, num_records):
+def test_single_insert_benchmark(univar_runner, num_records):
     """
     Verifies that single-insert benchmarking runs successfully
     and produces sane metrics.
     """
-    result = runner.run_single(num_records)
+    result = univar_runner.run_single(num_records)
 
     # Type & structure
     assert isinstance(result, BenchmarkResult)
@@ -512,14 +559,34 @@ def test_single_insert_benchmark(runner, num_records):
     assert result.metrics["avg_forecast"] > 0.0
 
 
-@pytest.mark.parametrize("sut", SUTS, indirect=True)
+@pytest.mark.parametrize("sut", UNIVAR_SUTS, indirect=True)
 @pytest.mark.parametrize("page_size,num_records", [(10_000, 1_000_000)])
-def test_batch_insert_benchmark(runner, page_size, num_records):
+def test_batch_insert_benchmark(univar_runner, page_size, num_records):
     """
     Verifies that batch-insert benchmarking runs successfully
     and produces sane metrics.
     """
-    result = runner.run_batch(page_size, num_records)
+    result = univar_runner.run_batch(page_size, num_records)
+
+    # Type & structure
+    assert isinstance(result, BenchmarkResult)
+    assert isinstance(result.metrics, dict)
+
+    # Derived expectations
+    expected_pages = num_records // page_size
+
+    assert len(result.insert_timings) == expected_pages
+
+    assert result.metrics["avg_insert"] is not None
+    assert result.metrics["avg_insert"] > 0.0
+    assert result.metrics["avg_forecast"] is not None
+    assert result.metrics["avg_forecast"] > 0.0
+
+MULTIVAR_SUTS = ["pgforecast_sut"]
+@pytest.mark.parametrize("sut", MULTIVAR_SUTS, indirect=True)
+@pytest.mark.parametrize("page_size,num_records", [(10_000, 1_000_000)])
+def test_multivariate_benchmark(multivar_runner, page_size, num_records):
+    result = multivar_runner.run_batch(page_size, num_records)
 
     # Type & structure
     assert isinstance(result, BenchmarkResult)
