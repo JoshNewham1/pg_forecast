@@ -26,3 +26,5 @@ fastapi
 uvicorn
 pmdarima
 requests
+duckdb
+xgboost

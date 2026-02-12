@@ -7,6 +7,7 @@ import numpy as np
 from xgboost import XGBRegressor
 import logging
 import math
+import gc
 
 from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -33,6 +34,7 @@ class State:
         self.mode = "naive"
         self.n_lags = 5
         self.n_features = 50
+        self.single_target = False
 
 state = State()
 
@@ -40,23 +42,23 @@ state = State()
 # Forecasting model
 # -----------------------------
 class XGBTimeSeriesModel:
-    def __init__(self, lags: int, max_features: int):
+    def __init__(self, lags: int, max_features: int, single_target: bool = False):
         self.lags = lags
         self.max_features = max_features
+        self.single_target = single_target
         self.model = XGBRegressor(
-            n_estimators=300,
+            n_estimators=100,
             max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            objective="reg:squarederror",
-            random_state=42,
+            learning_rate=0.05
         )
         self.train_X = None
         self.train_y = None
         self.last_window = None
         self.n_raw_features_ = None
         self.n_lagged_features_ = None
+
+        if single_target:
+            self.max_features = lags
 
     def _cap_features(self, x: np.ndarray) -> np.ndarray:
         """
@@ -119,9 +121,11 @@ class XGBTimeSeriesModel:
         with open("xgboost.log", "a") as f:
             f.write(
                 f"{datetime.now()}: trained on {X.shape[0]} samples, "
-                f"lagged_features={self.n_lagged_features_}, "
-                f"target_features={y.shape[1]}, "
-                f"lags={self.lags}, max_features={self.max_features}\n"
+                f"X shape={X.shape}, "
+                f"y shape={y.shape}, "
+                f"lags={self.lags}, max_features={self.max_features}, "
+                f"n_zeroes_X={int((X == 0).all(axis=1).sum())}, "
+                f"n_zeroes_y={int((y == 0).all(axis=1).sum())}\n"
             )
 
         # Store only the needed raw features for rolling
@@ -135,13 +139,14 @@ class XGBTimeSeriesModel:
         """
         preds = []
         window = self.last_window.copy()  # (lags, n_target_features)
+        window = np.nan_to_num(window, nan=0.0)
 
         for _ in range(n_periods):
             features = []
 
             for f in range(window.shape[1]):
                 for l in range(self.lags):
-                    features.append(window[l, f])
+                    features.append(window[-l, f])
                     if len(features) >= self.max_features:
                         break
                 if len(features) >= self.max_features:
@@ -149,6 +154,8 @@ class XGBTimeSeriesModel:
 
             x = np.array(features).reshape(1, -1)
             y_hat = self.model.predict(x)[0]
+            if y_hat.ndim == 1:
+                y_hat = y_hat.reshape(1, -1)
 
             preds.append(y_hat)
             window = np.vstack([window[1:], y_hat])
@@ -159,6 +166,9 @@ class XGBTimeSeriesModel:
 
     def resid(self):
         preds = self.model.predict(self.train_X)
+        if preds.ndim == 1 and self.train_y.ndim == 2:
+            preds = preds.reshape(-1, self.train_y.shape[1])
+        
         return self.train_y - preds
 
 # -----------------------------
@@ -180,6 +190,7 @@ class Config(BaseModel):
     mode: str  # "naive" | "geometric"
     n_lags: int
     n_features: int
+    single_target: bool = False
 
 # -----------------------------
 # API endpoints
@@ -194,7 +205,8 @@ def set_config(config: Config):
     state.mode = config.mode
     state.n_lags = config.n_lags
     state.n_features = config.n_features
-    return {"status": "ok", "mode": state.mode, "n_lags": state.n_lags, "n_features": state.n_features}
+    state.single_target = config.single_target
+    return {"status": "ok", "mode": state.mode, "n_lags": state.n_lags, "n_features": state.n_features, "single_target": state.single_target}
 
 @app.post("/setup_single")
 def setup_single(records: List[Record]):
@@ -235,9 +247,16 @@ def forecast(req: ForecastRequest):
     result = []
     for i, row in enumerate(forecast_vals):
         forecast_dt = last_date + step * (i + 1)
+
+        forecast_val = None
+        if isinstance(row, np.ndarray):
+            forecast_val = dict(zip(feature_cols, row.tolist()))
+        else: # single value
+            forecast_val = float(row)
+
         result.append({
             "forecast_date": forecast_dt.isoformat(),
-            "forecast_value": dict(zip(feature_cols, row.tolist()))
+            "forecast_value": forecast_val
         })
 
     return result
@@ -261,7 +280,7 @@ def teardown():
 # -----------------------------
 
 def _reset_state():
-    state.data = pd.DataFrame(columns=["date", "value"])
+    state.data = pd.DataFrame()
     state.model = None
     logger.info("State reset")
 
@@ -269,19 +288,27 @@ def _add_records(records: Union[list[Record], list[dict]]):
     if not records:
         return
     
-    if isinstance(records, list) and isinstance(records[0], Record):
-        records_for_df = list(map(lambda x: [x.timestamp, x.values.values()], records))
-    else:
-        records_for_df = list(map(lambda x: [x['timestamp'], x['values'].values()], records))
+    data_list = []
+    for r in records:
+        if isinstance(r, Record):
+            row = r.values.copy()
+            row['date'] = r.timestamp
+        else:
+            row = r['values'].copy()
+            row['date'] = r['timestamp']
+        
+        # Lowercase keys (except date)
+        new_row = {}
+        for k, v in row.items():
+            if k == 'date':
+                new_row[k] = v
+            else:
+                new_row[k.lower()] = v
+        data_list.append(new_row)
 
-    df = pd.DataFrame(records_for_df, columns=['date', 'values'])
-
-    # Normalise list of feature values in 'values' to columns
-    values_df = pd.DataFrame(df['values'].to_list(), index=df.index)
-    values_df.insert(0, 'date', df['date'].values)
-    df = values_df
-
+    df = pd.DataFrame(data_list)
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.replace("NULL", np.nan, inplace=True)
 
     # Forward fill (Last Observation Carried Forward)
     df.fillna(method='ffill', inplace=True)
@@ -293,15 +320,19 @@ def _add_records(records: Union[list[Record], list[dict]]):
 
 def _train():
     logger.info(f"Training XGBoost on {len(state.data)} rows")
-    logger.info(state.data)
 
     feature_cols = [c for c in state.data.columns if c != "date" and c != "values"]
-    values = state.data[feature_cols].astype(float).values
+    values = state.data[feature_cols].astype(np.float32).to_numpy(copy=True)
 
-    model = XGBTimeSeriesModel(state.n_lags, state.n_features)
-    model.fit(values)
+    # Reset model before retraining
+    state.model = XGBTimeSeriesModel(
+        state.n_lags,
+        state.n_features,
+        state.single_target
+    )
+    
+    state.model.fit(values)
 
-    state.model = model
 
 # -----------------------------
 # Entrypoint

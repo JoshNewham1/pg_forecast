@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 import pytest
 import requests
 import subprocess
+from joinboost_sut import JoinBoostSUT
+from ts_joinboost_sut import TSJoinBoostSUT
 
 logger = logging.getLogger(__name__)
 
@@ -270,11 +272,12 @@ class BenchmarkRunner:
             self.losses.append(self.sut.get_loss())
 
             logger.debug(
-                "Page %d/%d processed (insert=%.6fs, forecast=%.6fs)",
+                "Page %d/%d processed (insert=%.6fs, forecast=%.6fs, loss=%f)",
                 page + 1,
                 num_pages,
                 self.insert_timings[-1],
                 self.forecast_timings[-1],
+                self.losses[-1]
             )
 
         logger.info("Batch insert benchmark complete")
@@ -481,8 +484,7 @@ def univar_dataset():
 
 @pytest.fixture(scope="session")
 def multivar_dataset():
-    # return MultivariateDataset("wind_farms_minutely_dataset_with_missing_values.tsf")
-    return MultivariateDataset("solar_10_minutes_dataset.tsf")
+    return MultivariateDataset("wind_farms_minutely_dataset_with_missing_values.tsf")
 
 @pytest.fixture
 def pgforecast_sut():
@@ -503,11 +505,11 @@ def pgforecast_timescale_sut():
         pass
 
 @pytest.fixture
-def python_sut(competitor_server, n_lags=None, n_features=None):
+def python_sut(competitor_server, n_lags, n_features, single_target):
     sut = PythonWebServer()
     
     if n_lags is not None and n_features is not None:
-        sut.set_n_features(n_lags, n_features)
+        sut._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features, "single_target": single_target})
     else:
         sut.set_mode("naive")
 
@@ -530,6 +532,34 @@ def python_geometric_sut(competitor_server):
 @pytest.fixture
 def timescale_python_geometric_sut():
     sut = PgForecast(model_name="pyautoarima", with_timescale=True)
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
+
+@pytest.fixture
+def pg_joinboost_sut(n_lags, n_features, single_target):
+    sut = JoinBoostSUT(lags=n_lags, n_features=n_features, predict_single_target=single_target)
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
+
+@pytest.fixture
+def ts_joinboost_sut(n_lags, n_features, single_target):
+    sut = TSJoinBoostSUT(lags=n_lags, n_features=n_features, predict_single_target=single_target)
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
+
+@pytest.fixture
+def duckdb_joinboost_sut(competitor_server, n_lags, n_features, single_target):
+    sut = PythonWebServer()
+    sut._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features, "single_target": single_target})
     yield sut
     try:
         sut.teardown_single()
@@ -603,11 +633,16 @@ def test_univar_batch_insert(univar_runner, page_size, num_records, competitor_s
     assert result.metrics["avg_forecast"] is not None
     assert result.metrics["avg_forecast"] > 0.0
 
-MULTIVAR_SUTS = ["python_sut"]
-@pytest.mark.parametrize("competitor_server", ["python_xgboost"], indirect=True)
-@pytest.mark.parametrize("sut", MULTIVAR_SUTS, indirect=True)
-@pytest.mark.parametrize("page_size,num_records,n_lags,n_features", [(10_000, 1_000_000, 5, 100)])
-def test_multivar_batch_insert(multivar_runner, page_size, num_records, n_lags, n_features, competitor_server):
+MULTIVAR_CASES = [
+    ("python_xgboost", "python_sut"),
+    ("python_xgboost", "pg_joinboost_sut"),
+    ("python_xgboost", "ts_joinboost_sut"),
+    ("python_joinboost", "duckdb_joinboost_sut"),
+]
+
+@pytest.mark.parametrize("competitor_server, sut", MULTIVAR_CASES, indirect=True)
+@pytest.mark.parametrize("page_size,num_records,n_lags,n_features,single_target", [(10_000, 50_000, 5, 100, True)])
+def test_multivar_batch_insert(multivar_runner, page_size, num_records, n_lags, n_features, single_target, competitor_server):
     result = multivar_runner.run_batch(page_size, num_records)
 
     # Type & structure
