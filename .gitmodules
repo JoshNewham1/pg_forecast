@@ -1,3 +1,6 @@
 [submodule "eval/TFB"]
 	path = eval/TFB
 	url = https://github.com/decisionintelligence/TFB.git
+[submodule "eval/JoinBoost"]
+	path = eval/JoinBoost
+	url = git@github.com:JoinBoost/JoinBoost.git

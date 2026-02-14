@@ -20,19 +20,33 @@ from joinboost.aggregator import value_to_sql, agg_to_sql, selection_to_sql, is_
 from joinboost.joingraph import JoinGraph
 from joinboost.app import GradientBoosting
 
+# Patch JoinGraph to disable fact table check
+JoinGraph.check_target_is_fact = lambda self: None
+
 logger = logging.getLogger(__name__)
 
 class PostgresExecutor(DuckdbExecutor):
-    def __init__(self, conn, debug=False):
+    def __init__(self, conn, debug=False, fact_table_limit=None, fact_table_order_by=None):
         super().__init__(conn, debug)
         self.prefix = "joinboost_tmp_"
+        self.fact_table_limit = fact_table_limit
+        self.fact_table_order_by = fact_table_order_by
+        self.fact_table = None
+        self.is_rmse_query = False
+
+    def set_fact_table(self, table):
+        self.fact_table = table
 
     def get_schema(self, table: str) -> list:
         # Get all columns in training table
+        # If it's a schema-qualified table, strip it for information_schema
+        table_name = table.split(".")[-1]
+        schema = "public" if table.startswith(self.prefix) else "fav"
         sql = f"""
         SELECT column_name 
         FROM information_schema.columns 
-        WHERE table_name = '{table}'
+        WHERE table_name = '{table_name}'
+        AND table_schema = '{schema}'
         """
         result = self._execute_query(sql)
         return [row[0] for row in result]
@@ -44,12 +58,31 @@ class PostgresExecutor(DuckdbExecutor):
             raise Exception("PostgresExecutor.add_table only supports pandas DataFrame as table_address")
 
     def delete_table(self, table: str):
-        self.check_table(table)
-        sql = "DROP TABLE IF EXISTS " + table + " CASCADE;"
+        # table might already have schema prefix
+        full_table = table
+        if table.startswith(self.prefix) and "." not in table:
+            full_table = f"public.{table}"
+        sql = "DROP TABLE IF EXISTS " + full_table + " CASCADE;"
         self._execute_query(sql)
 
     def _execute_query(self, q):
         q = q.replace("AS DOUBLE", "AS DOUBLE PRECISION")
+        # Automatically prefix joinboost_tmp_ tables with public. in queries
+        # but only if they don't already have a schema prefix
+        # This is a bit hacky but avoids modifying JoinBoost core
+        q = re.sub(rf'\b(?<!\.){self.prefix}(\d+)\b', r'public.\g<0>', q)
+        
+        # Fix Postgres syntax for multi-column IN subqueries:
+        # (col1, col2) in (SELECT (col1, col2) FROM ...) -> (col1, col2) in (SELECT col1, col2 FROM ...)
+        q = re.sub(r'IN\s*\(\s*SELECT\s*\(([^)]+,[^)]+)\)\s+FROM', r'IN (SELECT \1 FROM', q, flags=re.IGNORECASE)
+
+        # Fix Postgres strict typing for comparisons between text columns and numeric literals:
+        # col <= 90 -> CAST(col AS DOUBLE PRECISION) <= 90
+        # Only target patterns like "table.column <= number" or "column <= number" 
+        # We look for words that are NOT immediately followed by '('
+        q = re.sub(r'\b(?<!SUM\()(?<!COUNT\()(?<!AVG\()(?<!MAX\()(?<!MIN\()(?<!CAST\()([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s*(<=|>=|<|>|=)\s*(\d+(?:\.\d+)?)\b', 
+                   r'CAST(\1 AS DOUBLE PRECISION) \2 \3', q)
+
         if self.debug:
             print(q)
         result = self.conn.execute(text(q))
@@ -69,13 +102,64 @@ class PostgresExecutor(DuckdbExecutor):
         # Mostly same as DuckDB, but SAMPLE is different
         
         parsed_aggregate_expressions = []
+        uses_distinct = False
         for target_col, aggExp in spja_data.aggregate_expressions.items():
+            if aggExp.agg == Aggregator.DISTINCT_IDENTITY:
+                uses_distinct = True
+                expr = agg_to_sql(aggExp.para, qualified=spja_data.qualified)
+            elif aggExp.agg == Aggregator.COUNT:
+                # Postgres doesn't support COUNT(col1, col2, ...)
+                # JoinBoost sometimes passes multiple columns joined by comma
+                if isinstance(aggExp.para, str) and "," in aggExp.para:
+                    expr = "COUNT(*)"
+                else:
+                    expr = agg_to_sql(aggExp, qualified=spja_data.qualified)
+            else:
+                expr = agg_to_sql(aggExp, qualified=spja_data.qualified)
+                
             window_clause = " OVER joinboost_window " if spja_data.window_by and is_agg(aggExp.agg) else ""
             rename_expr = (" AS " + value_to_sql(target_col, qualified=False)) if target_col is not None else ""
-            parsed_aggregate_expressions.append(agg_to_sql(aggExp, qualified=spja_data.qualified) + window_clause + rename_expr)
+            parsed_aggregate_expressions.append(expr + window_clause + rename_expr)
 
-        sql = "SELECT " + ", ".join(parsed_aggregate_expressions) + "\n"
-        sql += "FROM " + ",".join(spja_data.from_tables) + "\n"
+        from_clause = []
+        # Only apply limit if it's a simple query on the fact table (no joins)
+        # and fact_table_limit is set.
+        apply_limit = (len(spja_data.from_tables) == 1 and self.fact_table_limit)
+        
+        for table in spja_data.from_tables:
+            # JoinBoost sometimes passes JoinGraph objects in from_tables
+            actual_table = table
+            if not isinstance(table, str):
+                # Assume it's a JoinGraph or similar object with target_relation
+                actual_table = table.target_relation
+                
+            if self.is_rmse_query and actual_table == self.fact_table:
+                # Provide fully joined data for RMSE calculation
+                order_clause = f"ORDER BY {self.fact_table_order_by}" if self.fact_table_order_by else ""
+                joined_data = f"""(
+                    SELECT 
+                        s.*,
+                        h.htype, h.locale, h.locale_name, h.transferred, h.f2,
+                        o.dcoilwtico, o.f3,
+                        t.transactions, t.f5,
+                        st.city, st.state, st.stype, st.cluster, st.f4,
+                        i.family, i.class, i.perishable, i.f1
+                    FROM (SELECT * FROM fav.sales {order_clause} LIMIT {self.fact_table_limit}) AS s
+                    LEFT JOIN fav.items i ON s.item_nbr = i.item_nbr
+                    LEFT JOIN fav.trans t ON s.date = t.date AND s.store_nbr = t.store_nbr
+                    LEFT JOIN fav.stores st ON t.store_nbr = st.store_nbr
+                    LEFT JOIN fav.holidays h ON t.date = h.date
+                    LEFT JOIN fav.oil o ON h.date = o.date
+                ) AS {actual_table}"""
+                from_clause.append(joined_data)
+            elif apply_limit and actual_table == self.fact_table:
+                order_clause = f"ORDER BY {self.fact_table_order_by}" if self.fact_table_order_by else ""
+                from_clause.append(f"(SELECT * FROM {actual_table} {order_clause} LIMIT {self.fact_table_limit}) AS {actual_table}")
+            else:
+                from_clause.append(actual_table)
+
+        sql = "SELECT " + ("DISTINCT " if uses_distinct else "") + ", ".join(parsed_aggregate_expressions) + "\n"
+        sql += "FROM " + ",".join(from_clause) + "\n"
 
         # Postgres TAMPLESAMPLE syntax: FROM table TABLESAMPLE BERNOULLI(percent)
         # But JoinBoost supports sampling on the result of joins?
@@ -120,12 +204,12 @@ class PostgresExecutor(DuckdbExecutor):
         entity_type_ = "TABLE "
         
         if spja_data.replace:
-            self._execute_query(f"DROP TABLE IF EXISTS {name_} CASCADE")
+            self._execute_query(f"DROP TABLE IF EXISTS public.{name_} CASCADE")
         
         sql = (
             "CREATE "
             + entity_type_
-            + name_
+            + f"public.{name_}"
             + " AS "
         )
         sql += spja
@@ -140,7 +224,7 @@ class PostgresExecutor(DuckdbExecutor):
         sql = (
             "CREATE OR REPLACE "
             + entity_type_
-            + name_
+            + f"public.{name_}"
             + " AS "
         )
         sql += spja

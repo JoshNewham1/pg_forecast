@@ -70,3 +70,6 @@ find src/TFB/ts_benchmark/baselines/python_competitor \
         ln -sf "$(realpath "$f")" "$target"
     done
     ' sh {} +
+
+# Copy over changes to JoinBoost/main (executor.py)
+cp src/JoinBoost/src/joinboost/* eval/JoinBoost/src/joinboost/
