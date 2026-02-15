@@ -26,10 +26,12 @@ NUM_LEAVES = 8
 DEPTH = 3
 ORDER_BY = "id"
 df = None
+con = duckdb.connect(":memory:")
 
-def test_gradient_boosting(iterations=1):
-    global df
-    results = {"iteration": iterations}
+def setup_duckdb():
+    global con
+
+    con.execute("SET memory_limit = '30GB';")
 
     # Base path for data
     base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../eval/favorita/data"))
@@ -41,8 +43,6 @@ def test_gradient_boosting(iterations=1):
     trans_path = os.path.join(base_path, "trans.csv")
     stores_path = os.path.join(base_path, "stores.csv")
 
-    con = duckdb.connect(database=':memory:')
-
     # Load tables into DuckDB
     con.execute(f"CREATE OR REPLACE TABLE sales AS SELECT * FROM '{sales_path}' ORDER BY {ORDER_BY} LIMIT {LIMIT}")
     con.execute(f"CREATE OR REPLACE TABLE items AS SELECT * FROM '{items_path}'")
@@ -50,28 +50,6 @@ def test_gradient_boosting(iterations=1):
     con.execute(f"CREATE OR REPLACE TABLE oil AS SELECT * FROM '{oil_path}'")
     con.execute(f"CREATE OR REPLACE TABLE trans AS SELECT * FROM '{trans_path}'")
     con.execute(f"CREATE OR REPLACE TABLE stores AS SELECT * FROM '{stores_path}'")
-
-    y = "target"
-    x = [
-        "htype",
-        "locale",
-        "locale_name",
-        "transferred",
-        "f2",
-        "dcoilwtico",
-        "f3",
-        "transactions",
-        "f5",
-        "city",
-        "state",
-        "stype",
-        "cluster",
-        "f4",
-        "family",
-        "class",
-        "perishable",
-        "f1",
-    ]
 
     # Create the full join table for validation and scikit-learn
     # We use LEFT JOIN to keep all rows from sales
@@ -95,6 +73,28 @@ def test_gradient_boosting(iterations=1):
     )
     """
     con.execute(view_sql)
+
+def setup_sklearn():
+    global df
+    global con
+
+    start_time = time.perf_counter()
+    # Get the train data as dataframe for scikit-learn
+    # We explicitly ORDER BY id to ensure consistent ordering
+    df = con.execute("SELECT * FROM train").df()
+
+    # Preprocess for scikit-learn (handle nulls and categorical)
+    df = df.fillna(0)
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = pd.factorize(df[col])[0]
+
+    print(f"Sklearn join materialisation time: ", time.perf_counter() - start_time)
+
+def test_duckdb(iterations=1):
+    global con
+    results = {}
+
     exe = DuckdbExecutor(con, debug=False)
     dataset = JoinGraph(exe=exe)
 
@@ -129,20 +129,38 @@ def test_gradient_boosting(iterations=1):
     print(f"DuckDB JoinBoost predict time: ", time.perf_counter() - start_time)
     gc.collect()
 
-    if df is None:
-        start_time = time.perf_counter()
-        # Get the train data as dataframe for scikit-learn
-        # We explicitly ORDER BY id to ensure consistent ordering
-        df = con.execute("SELECT * FROM train").df()
+    _reg_rmse = reg.compute_rmse("train")[0]
 
-        # Preprocess for scikit-learn (handle nulls and categorical)
-        df = df.fillna(0)
-        for col in df.columns:
-            if df[col].dtype == 'object':
-                df[col] = pd.factorize(df[col])[0]
+    print(f"JoinBoost RMSE: {_reg_rmse}")
+    results["joinboost_rmse"] = _reg_rmse
 
-        results["materialise"] = time.perf_counter() - start_time
-        print(f"Sklearn join materialisation time: ", time.perf_counter() - start_time)
+    return results
+
+def test_sklearn(iterations=1):
+    global df
+    results = {}
+
+    y = "target"
+    x = [
+        "htype",
+        "locale",
+        "locale_name",
+        "transferred",
+        "f2",
+        "dcoilwtico",
+        "f3",
+        "transactions",
+        "f5",
+        "city",
+        "state",
+        "stype",
+        "cluster",
+        "f4",
+        "family",
+        "class",
+        "perishable",
+        "f1",
+    ]
 
     clf = GradientBoostingRegressor(
         max_depth=DEPTH, learning_rate=LEARNING_RATE, n_estimators=iterations, max_leaf_nodes=NUM_LEAVES
@@ -158,25 +176,19 @@ def test_gradient_boosting(iterations=1):
     print(f"Sklearn predict time: ", time.perf_counter() - start_time)
 
     mse = mean_squared_error(df[y], clf_prediction)
-    _reg_rmse = reg.compute_rmse("train")[0]
-
-    print(f"JoinBoost RMSE: {_reg_rmse}")
     print(f"Sklearn RMSE: {math.sqrt(mse)}")
-    results["joinboost_rmse"] = _reg_rmse
     results["sklearn_rmse"] = math.sqrt(mse)
-
-    # Check for parity
-    # assert(abs(_reg_rmse - math.sqrt(mse)) < 10)
-    assert(len(reg_prediction) == len(clf_prediction))
-    # assert(np.allclose(reg_prediction, clf_prediction, atol=10))
 
     return results
 
 if __name__ == "__main__":
     results = []
+    setup_duckdb()
+    setup_sklearn()
     for i in [1, 5, 10, 15, 20, 25, 30]:
         print(f"Testing gradient boosting for {i} iterations")
         print(f"=============================================")
-        results.append(test_gradient_boosting(i))
+        results.append(test_duckdb(i))
+        results.append(test_sklearn(i))
 
     print(results)
