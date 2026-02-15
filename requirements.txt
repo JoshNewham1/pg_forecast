@@ -1,3 +1,5 @@
+# TFB *requires* Python 3.12.3
+
 # TFB Requirements
 darts==0.25.0
 u8darts
