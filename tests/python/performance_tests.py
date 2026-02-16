@@ -641,7 +641,7 @@ MULTIVAR_CASES = [
 ]
 
 @pytest.mark.parametrize("competitor_server, sut", MULTIVAR_CASES, indirect=True)
-@pytest.mark.parametrize("page_size,num_records,n_lags,n_features,single_target", [(10_000, 50_000, 5, 100, True)])
+@pytest.mark.parametrize("page_size,num_records,n_lags,n_features,single_target", [(10_000, 1_000_000, 5, 5, True), (10_000, 50_000, 5, 50, False)])
 def test_multivar_batch_insert(multivar_runner, page_size, num_records, n_lags, n_features, single_target, competitor_server):
     result = multivar_runner.run_batch(page_size, num_records)
 
