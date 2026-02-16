@@ -28,11 +28,12 @@ DEPTH = 3
 ITERATIONS = 50
 
 class JoinBoostSUT:
-    def __init__(self, model_name: str = "ts_joinboost", lags: int = 5, n_features: int = 50, predict_single_target: bool = False):
+    def __init__(self, model_name: str = "ts_joinboost", lags: int = 5, n_features: int = 50, predict_single_target: bool = False, is_incremental: bool = True):
         self.model_name = model_name
         self.lags = lags
         self.n_features = n_features
         self.predict_single_target = predict_single_target
+        self.is_incremental = is_incremental
 
         load_dotenv()
 
@@ -137,11 +138,12 @@ class JoinBoostSUT:
         
         # Incremental logic
         last_processed_date = None
-        try:
-            res = self.conn.execute(text(f"SELECT MAX(date) FROM {self.train_table}")).fetchone()
-            if res: last_processed_date = res[0]
-        except Exception:
-            pass
+        if self.is_incremental:
+            try:
+                res = self.conn.execute(text(f"SELECT MAX(date) FROM {self.train_table}")).fetchone()
+                if res: last_processed_date = res[0]
+            except Exception:
+                pass
 
         select_clause = ["date"]
         cols_to_train = []
@@ -155,7 +157,7 @@ class JoinBoostSUT:
 
         conds = [f"{c} IS NOT NULL" for c in cols_to_train]
         
-        if last_processed_date is None:
+        if last_processed_date is None:  # non-incremental
             materialize_sql = f"""
             DROP TABLE IF EXISTS {self.train_table} CASCADE;
             CREATE UNLOGGED TABLE {self.train_table} AS
@@ -164,8 +166,7 @@ class JoinBoostSUT:
             CREATE UNIQUE INDEX idx_{self.train_table}_date ON {self.train_table} (date DESC);
             """
             self.conn.execute(text(materialize_sql))
-        else:
-            # Incremental append
+        else:  # incremental
             interval_res = self.conn.execute(text(f"SELECT date FROM {self.base_table} ORDER BY date DESC LIMIT 2")).fetchall()
             lookback = (interval_res[0][0] - interval_res[1][0]) * (self.lags + 1) if len(interval_res) == 2 else timedelta(hours=1)
 

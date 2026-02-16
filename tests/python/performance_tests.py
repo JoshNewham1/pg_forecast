@@ -539,8 +539,17 @@ def timescale_python_geometric_sut():
         pass
 
 @pytest.fixture
-def pg_joinboost_sut(n_lags, n_features, single_target):
-    sut = JoinBoostSUT(lags=n_lags, n_features=n_features, predict_single_target=single_target)
+def pg_joinboost_sut_incremental(n_lags, n_features, single_target):
+    sut = JoinBoostSUT(lags=n_lags, n_features=n_features, predict_single_target=single_target, is_incremental=True)
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
+
+@pytest.fixture
+def pg_joinboost_sut_non_incremental(n_lags, n_features, single_target):
+    sut = JoinBoostSUT(lags=n_lags, n_features=n_features, predict_single_target=single_target, is_incremental=False)
     yield sut
     try:
         sut.teardown_single()
@@ -635,7 +644,8 @@ def test_univar_batch_insert(univar_runner, page_size, num_records, competitor_s
 
 MULTIVAR_CASES = [
     ("python_xgboost", "python_sut"),
-    ("python_xgboost", "pg_joinboost_sut"),
+    ("python_xgboost", "pg_joinboost_sut_incremental"),
+    ("python_xgboost", "pg_joinboost_sut_non_incremental"),
     ("python_xgboost", "ts_joinboost_sut"),
     ("python_joinboost", "duckdb_joinboost_sut"),
 ]

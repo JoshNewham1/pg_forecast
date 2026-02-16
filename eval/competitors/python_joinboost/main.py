@@ -36,6 +36,11 @@ app = FastAPI()
 # In-memory application state
 # -----------------------------
 
+LEARNING_RATE = 0.1
+NUM_LEAVES = 8
+DEPTH = 3
+ITERATIONS = 50
+
 class State:
     def __init__(self):
         self.data = pd.DataFrame()
@@ -135,7 +140,7 @@ class JoinBoostTimeSeriesModel:
             
             # Train
             # Using GradientBoosting
-            reg = GradientBoosting(learning_rate=0.05, max_depth=4, n_estimators=100)
+            reg = GradientBoosting(learning_rate=LEARNING_RATE, max_depth=DEPTH, n_estimators=ITERATIONS, num_leaves=NUM_LEAVES)
             reg.fit(dataset)
             
             self.models[target] = reg
