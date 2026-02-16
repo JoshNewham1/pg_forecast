@@ -5,9 +5,11 @@ import numpy as np
 import duckdb
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error
+import xgboost as xgb
 import sys
 import os
 import gc
+import pyarrow.parquet as pq
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -27,6 +29,7 @@ LEARNING_RATE = 0.1
 NUM_LEAVES = 8
 DEPTH = 3
 ORDER_BY = "id"
+XGB_EXPORT_PATH = "xgb_train.parquet"
 df = None
 con = duckdb.connect("favorita.db")
 engine = None
@@ -148,6 +151,47 @@ def setup_sklearn():
             df[col] = pd.factorize(df[col])[0]
 
     print(f"Sklearn join materialisation time: ", time.perf_counter() - start_time)
+
+def setup_xgboost():
+    global con
+
+    y_col = "target"
+    x_cols = [
+        "htype",
+        "locale",
+        "locale_name",
+        "transferred",
+        "f2",
+        "dcoilwtico",
+        "f3",
+        "transactions",
+        "f5",
+        "city",
+        "state",
+        "stype",
+        "cluster",
+        "f4",
+        "family",
+        "class",
+        "perishable",
+        "f1",
+    ]
+
+    if os.path.exists(XGB_EXPORT_PATH):
+        return
+
+    start_time = time.perf_counter()
+
+    con.execute(f"""
+        COPY (
+            SELECT {y_col}, {", ".join(x_cols)}
+            FROM train
+            ORDER BY id
+        )
+        TO '{XGB_EXPORT_PATH}' (FORMAT PARQUET);
+    """)
+
+    print(f"XGBoost export time: {time.perf_counter() - start_time}")
 
 def test_duckdb(iterations=1, predict=False):
     global con
@@ -313,17 +357,129 @@ def test_sklearn(iterations=1, predict=False):
 
     return results
 
+def test_xgboost_in_memory(iterations=1, predict=False):
+    global df
+    results = {}
+
+    if df is None:
+        print("Run setup_sklearn() first to test XGBoost in memory")
+        return
+
+    y_col = "target"
+    # Filter features to match the other benchmarks
+    x_cols = [col for col in df.columns if col not in ["id", "target"]]
+
+    # We use the already materialized and factorized 'df' from setup_sklearn
+    start_time = time.perf_counter()
+    dtrain = xgb.DMatrix(df[x_cols], label=df[y_col])
+    results["xgboost_mem_prep"] = time.perf_counter() - start_time
+
+    # TRAIN
+    params = {
+        "objective": "reg:squarederror",
+        "learning_rate": LEARNING_RATE,
+        "max_depth": DEPTH,
+        "tree_method": "hist", # Matches the out-of-core version
+    }
+
+    start_train = time.perf_counter()
+    model = xgb.train(params, dtrain, num_boost_round=iterations)
+    results["xgboost_mem_fit"] = time.perf_counter() - start_train
+    print(f"XGBoost In-Memory fit time: {results['xgboost_mem_fit']}")
+
+    # RMSE
+    preds = model.predict(dtrain)
+    rmse = np.sqrt(mean_squared_error(df[y_col], preds))
+    print(f"XGBoost In-Memory RMSE: {rmse}")
+    results["xgboost_mem_rmse"] = rmse
+
+    return results
+
+def test_xgboost_out_of_core(iterations=1, predict=False):
+    results = {}
+
+    if not os.path.exists(XGB_EXPORT_PATH):
+        raise RuntimeError("Run setup_xgboost() first.")
+
+    # 1. Define the Iterator following the XGBoost DataIter interface
+    class ParquetIterator(xgb.DataIter):
+        def __init__(self, path, batch_size=100_000):
+            self.path = path
+            self.batch_size = batch_size
+            self._it = None
+            super().__init__()
+
+        def next(self, input_data):
+            # Initialize the pyarrow iterator on first call
+            if self._it is None:
+                parquet_file = pq.ParquetFile(self.path)
+                # iter_batches returns an iterator of RecordBatches
+                self._it = parquet_file.iter_batches(batch_size=self.batch_size)
+            
+            try:
+                # Get next batch and convert to Pandas for XGBoost
+                batch = next(self._it)
+                df_batch = batch.to_pandas()
+                
+                y = df_batch["target"]
+                X = df_batch.drop(columns=["target"])
+                
+                # Important: Ensure categorical columns are typed correctly if present
+                # for col in X.select_dtypes("object").columns:
+                #    X[col] = X[col].astype("category")
+
+                input_data(data=X, label=y)
+                return 1
+            except StopIteration:
+                return 0
+
+        def reset(self):
+            self._it = None
+
+    # Define QuantileDMatrix (for out-of-core execution)
+    # with ParquetIterator above, then train
+    start_time = time.perf_counter()
+    it = ParquetIterator(XGB_EXPORT_PATH)
+    dtrain = xgb.QuantileDMatrix(it, enable_categorical=True)
+
+    params = {
+        "objective": "reg:squarederror",
+        "eta": LEARNING_RATE,
+        "max_depth": DEPTH,
+        "tree_method": "hist", 
+        "eval_metric": "rmse",
+    }
+
+    model = xgb.train(params, dtrain, num_boost_round=iterations)
+    
+    results["xgboost_fit"] = time.perf_counter() - start_time
+    print(f"XGBoost fit time: {results['xgboost_fit']}")
+
+    # Prediction for RMSE
+    start_time = time.perf_counter()
+    preds = model.predict(dtrain)
+    results["xgboost_pred"] = time.perf_counter() - start_time
+    print(f"XGBoost prediction time: {results['xgboost_pred']}")
+
+    rmse = np.sqrt(np.mean((preds - dtrain.get_label()) ** 2))
+    print(f"XGBoost RMSE: {rmse}")
+    
+    return results
+
 if __name__ == "__main__":
     results = []
     setup_duckdb()
     setup_sklearn()
-    # setup_timescale_first_time()
-    # setup_timescale()
+    setup_xgboost()
+    setup_timescale_first_time()
+    setup_timescale()
     for i in [1, 5, 10, 15, 20, 25, 30]:
         print(f"Testing gradient boosting for {i} iterations")
         print(f"=============================================")
-        # results.append(test_duckdb(i))
-        # results.append(test_timescale(i))
+        results.append(test_duckdb(i))
+        results.append(test_timescale(i))
         results.append(test_sklearn(i))
+        results.append(test_xgboost_out_of_core(i))
+        results.append(test_xgboost_in_memory(i))
 
     print(results)
