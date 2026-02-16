@@ -5,8 +5,8 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../JoinBoost/src")))
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Dict, List, Union, Any
+from pydantic import BaseModel, model_validator
+from typing import Dict, List, Union, Any, Optional
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -244,9 +244,29 @@ class JoinBoostTimeSeriesModel:
 # -----------------------------
 
 class Record(BaseModel):
-    index: int
-    timestamp: datetime
-    values: Dict[str, float]
+    index: Optional[int] = None
+    timestamp: Optional[datetime] = None
+    values: Optional[Dict[str, Any]] = None
+    
+    # Univariate fields from Monash dataset
+    time_index: Optional[int] = None
+    global_index: Optional[int] = None
+    start_timestamp: Optional[datetime] = None
+    value: Optional[Any] = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def validate_record(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # If it has 'value' but not 'values', it's univariate
+            if 'value' in data and 'values' not in data:
+                if 'index' not in data:
+                    data['index'] = data.get('global_index') or data.get('time_index') or 0
+                if 'timestamp' not in data:
+                    data['timestamp'] = data.get('start_timestamp')
+                if 'values' not in data:
+                    data['values'] = {'value': data['value']}
+        return data
     
 class BatchRecords(BaseModel):
     records: List[Record]
@@ -293,7 +313,12 @@ def add_single(record: Record):
 
 @app.post("/add_batch")
 def add_batch(data: dict):
-    _add_records(data.get("records", []))
+    # Try to parse as BatchRecords if it's a dict
+    if "records" in data:
+        recs = [Record.model_validate(r) for r in data["records"]]
+        _add_records(recs)
+    else:
+        _add_records(data.get("records", []))
     return {"status": "ok"}
 
 @app.post("/forecast")
@@ -349,11 +374,11 @@ def _add_records(records: Union[list[Record], list[dict]]):
     data_list = []
     for r in records:
         if isinstance(r, Record):
-            row = r.values.copy()
+            row = r.values.copy() if r.values else {}
             row['date'] = r.timestamp
         else:
-            row = r['values'].copy()
-            row['date'] = r['timestamp']
+            row = r['values'].copy() if 'values' in r else ({'value': r['value']} if 'value' in r else {})
+            row['date'] = r.get('timestamp') or r.get('start_timestamp')
         
         # Lowercase keys
         new_row = {}

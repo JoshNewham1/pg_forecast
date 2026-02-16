@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, model_validator
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Optional, Any
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -147,20 +147,25 @@ class XGBTimeSeriesModel:
             features = []
 
             for f in range(window.shape[1]):
-                for l in range(self.lags):
-                    features.append(window[-l, f])
+                # Build features in same order as _make_supervised
+                # _make_supervised uses: for l in range(self.lags, 0, -1): values[t-l, f]
+                # If window is [t-lags, ..., t-1], then window[0] is t-lags, window[lags-1] is t-1.
+                for l in range(self.lags, 0, -1):
+                    features.append(window[self.lags - l, f])
                     if len(features) >= self.max_features:
                         break
                 if len(features) >= self.max_features:
                     break
 
             x = np.array(features).reshape(1, -1)
-            y_hat = self.model.predict(x)[0]
+            y_hat = self.model.predict(x)
+            
             if y_hat.ndim == 1:
                 y_hat = y_hat.reshape(1, -1)
-
-            preds.append(y_hat)
-            window = np.vstack([window[1:], y_hat])
+            
+            y_hat_row = y_hat[0]
+            preds.append(y_hat_row)
+            window = np.vstack([window[1:], y_hat_row])
 
         return np.array(preds)
 
@@ -178,10 +183,30 @@ class XGBTimeSeriesModel:
 # -----------------------------
 
 class Record(BaseModel):
-    index: int
-    timestamp: datetime
-    values: Dict[str, float]
+    index: Optional[int] = None
+    timestamp: Optional[datetime] = None
+    values: Optional[Dict[str, Any]] = None
     
+    # Univariate fields from Monash dataset
+    time_index: Optional[int] = None
+    global_index: Optional[int] = None
+    start_timestamp: Optional[datetime] = None
+    value: Optional[Any] = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def validate_record(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # If it has 'value' but not 'values', it's univariate
+            if 'value' in data and 'values' not in data:
+                if 'index' not in data:
+                    data['index'] = data.get('global_index') or data.get('time_index') or 0
+                if 'timestamp' not in data:
+                    data['timestamp'] = data.get('start_timestamp')
+                if 'values' not in data:
+                    data['values'] = {'value': data['value']}
+        return data
+
 class BatchRecords(BaseModel):
     records: List[Record]
 
@@ -227,7 +252,12 @@ def add_single(record: Record):
 
 @app.post("/add_batch")
 def add_batch(data: dict):
-    _add_records(data.get("records", []))
+    # Try to parse as BatchRecords if it's a dict
+    if "records" in data:
+        recs = [Record.model_validate(r) for r in data["records"]]
+        _add_records(recs)
+    else:
+        _add_records(data.get("records", []))
     return {"status": "ok"}
 
 @app.post("/forecast")
@@ -252,7 +282,11 @@ def forecast(req: ForecastRequest):
 
         forecast_val = None
         if isinstance(row, np.ndarray):
-            forecast_val = dict(zip(feature_cols, row.tolist()))
+            # Map back to original columns
+            # The model predicts math.ceil(len(features)/lags) targets
+            # We should match this with feature_cols
+            n_targets = row.shape[0]
+            forecast_val = dict(zip(feature_cols[:n_targets], row.tolist()))
         else: # single value
             forecast_val = float(row)
 
@@ -293,11 +327,11 @@ def _add_records(records: Union[list[Record], list[dict]]):
     data_list = []
     for r in records:
         if isinstance(r, Record):
-            row = r.values.copy()
+            row = r.values.copy() if r.values else {}
             row['date'] = r.timestamp
         else:
-            row = r['values'].copy()
-            row['date'] = r['timestamp']
+            row = r['values'].copy() if 'values' in r else ({'value': r['value']} if 'value' in r else {})
+            row['date'] = r.get('timestamp') or r.get('start_timestamp')
         
         # Lowercase keys (except date)
         new_row = {}
