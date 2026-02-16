@@ -27,7 +27,7 @@ NUM_LEAVES = 8
 DEPTH = 3
 ITERATIONS = 50
 
-class TSJoinBoostSUT:
+class JoinBoostSUT:
     def __init__(self, model_name: str = "ts_joinboost", lags: int = 5, n_features: int = 50, predict_single_target: bool = False):
         self.model_name = model_name
         self.lags = lags
@@ -88,21 +88,15 @@ class TSJoinBoostSUT:
             n_targets = math.ceil(min(len(all_targets) * self.lags, self.n_features) / self.lags)
             self.target_cols = all_targets[:n_targets]
         
-        logger.info(f"TSJoinBoost Target columns: {self.target_cols}")
+        logger.info(f"JoinBoost Target columns: {self.target_cols}")
 
         cols_ddl = ", ".join([f"{k} DOUBLE PRECISION" for k in self.target_cols])
         ddl = f"""
         DROP TABLE IF EXISTS {self.base_table} CASCADE;
         CREATE TABLE {self.base_table} (date TIMESTAMP NOT NULL, {cols_ddl});
-        SELECT create_hypertable('{self.base_table}', 'date', if_not_exists => TRUE);
         
         -- Indexing the base table for fast window function materialization
         CREATE INDEX idx_{self.base_table}_date ON {self.base_table} (date DESC);
-        
-        ALTER TABLE {self.base_table} SET (
-            timescaledb.compress, 
-            timescaledb.compress_orderby = 'date DESC'
-        );
         
         DROP TABLE IF EXISTS {self.train_table} CASCADE;
         """
@@ -202,7 +196,7 @@ class TSJoinBoostSUT:
             self.models[target] = reg
             self.last_training_view = self.train_table
             
-        logger.info(f"TSJoinBoost Fit complete in {time.perf_counter()-start_total:.4f}s")
+        logger.info(f"JoinBoost Fit complete in {time.perf_counter()-start_total:.4f}s")
 
         # Cleanup jb_ tables to free up temp_buffers and catalog space
         self._cleanup_temp_tables()

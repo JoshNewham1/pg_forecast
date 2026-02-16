@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 import pytest
 import requests
 import subprocess
-from joinboost_sut import JoinBoostSUT
+from pg_joinboost_sut import JoinBoostSUT
 from ts_joinboost_sut import TSJoinBoostSUT
 
 logger = logging.getLogger(__name__)

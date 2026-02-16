@@ -20,7 +20,7 @@ from joinboost.joingraph import JoinGraph
 from joinboost.app import GradientBoosting
 from joinboost.aggregator import agg_to_sql
 
-from ts_joinboost_adapter import PostgresExecutor
+from joinboost_adapter import PostgresExecutor
 
 LIMIT = 80_000_000
 LEARNING_RATE = 0.1

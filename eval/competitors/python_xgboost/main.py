@@ -47,9 +47,11 @@ class XGBTimeSeriesModel:
         self.max_features = max_features
         self.single_target = single_target
         self.model = XGBRegressor(
-            n_estimators=100,
-            max_depth=4,
-            learning_rate=0.05
+            n_estimators=50,
+            max_depth=3,
+            learning_rate=0.1,
+            max_leaves=8,
+            max_bin=1000
         )
         self.train_X = None
         self.train_y = None
