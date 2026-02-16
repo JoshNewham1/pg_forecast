@@ -45,41 +45,46 @@ CREATE TABLE fav.stores (
 
 CREATE TABLE fav.trans (
     date DATE,
-    store_nbr INT REFERENCES stores(store_nbr),
+    store_nbr INT REFERENCES fav.stores(store_nbr),
     transactions INT,
     f5 INT,
     PRIMARY KEY(date, store_nbr)
 );
 
 CREATE TABLE fav.sales (
-    id INT PRIMARY KEY,
+    id INT,
     date DATE,
-    store_nbr INT REFERENCES stores(store_nbr),
-    item_nbr INT REFERENCES items(item_nbr),
+    store_nbr INT REFERENCES fav.stores(store_nbr),
+    item_nbr INT REFERENCES fav.items(item_nbr),
     unit_sales NUMERIC,
     onpromotion BOOLEAN,
-    target NUMERIC
+    target NUMERIC,
+    CONSTRAINT sales_pk PRIMARY KEY (id, date)
 );
+
+CREATE INDEX IF NOT EXISTS idx_trans_split ON fav.trans (date, store_nbr, transactions);
+CREATE INDEX IF NOT EXISTS idx_holidays_date ON fav.holidays (date);
+CREATE INDEX IF NOT EXISTS idx_sales_lookup ON fav.sales (date, store_nbr, item_nbr);
 
 -- -- ==========================================
 -- -- Load CSVs
 -- -- ==========================================
-COPY holidays(date,htype,locale,locale_name,description,transferred)
+COPY fav.holidays(date,htype,locale,locale_name,description,transferred)
 FROM '/home/josh/diss/eval/favorita/data/holidays.csv' DELIMITER ',' CSV HEADER;
 
-COPY items(item_nbr,family,class,perishable)
+COPY fav.items(item_nbr,family,class,perishable)
 FROM '/home/josh/diss/eval/favorita/data/items.csv' DELIMITER ',' CSV HEADER;
 
-COPY oil(date,dcoilwtico)
+COPY fav.oil(date,dcoilwtico)
 FROM '/home/josh/diss/eval/favorita/data/oil.csv' DELIMITER ',' CSV HEADER;
 
-COPY stores(store_nbr,city,state,stype,cluster)
+COPY fav.stores(store_nbr,city,state,stype,cluster)
 FROM '/home/josh/diss/eval/favorita/data/stores.csv' DELIMITER ',' CSV HEADER;
 
-COPY trans(date,store_nbr,transactions)
+COPY fav.trans(date,store_nbr,transactions)
 FROM '/home/josh/diss/eval/favorita/data/trans.csv' DELIMITER ',' CSV HEADER;
 
-COPY sales(id,date,store_nbr,item_nbr,unit_sales,onpromotion)
+COPY fav.sales(id,date,store_nbr,item_nbr,unit_sales,onpromotion)
 FROM '/home/josh/diss/eval/favorita/data/sales.csv' DELIMITER ',' CSV HEADER;
 
 -- ==========================================

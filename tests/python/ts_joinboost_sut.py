@@ -6,8 +6,7 @@ import numpy as np
 import time
 import math
 from datetime import datetime, timedelta
-from typing import Dict, List, Any
-from decimal import Decimal
+from typing import Dict, List
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
@@ -19,103 +18,14 @@ from joinboost.aggregator import value_to_sql, agg_to_sql, selection_to_sql, is_
 from joinboost.joingraph import JoinGraph
 from joinboost.app import GradientBoosting
 
+from ts_joinboost_adapter import PostgresExecutor
+
 logger = logging.getLogger(__name__)
 
-class PostgresExecutor(DuckdbExecutor):
-    def __init__(self, conn, debug=False):
-        super().__init__(conn, debug)
-        self.prefix = "joinboost_tmp_"
-        self.query_stats = []
-
-    def get_schema(self, table: str) -> list:
-        sql = f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table}'"
-        result = self._execute_query(sql)
-        return [row[0] for row in result]
-
-    def add_table(self, table: str, table_address):
-        if isinstance(table_address, pd.DataFrame):
-            table_address.to_sql(table, self.conn, if_exists='replace', index=False)
-        else:
-            raise Exception("PostgresExecutor.add_table only supports pandas DataFrame")
-
-    def delete_table(self, table: str):
-        self.check_table(table)
-        sql = "DROP TABLE IF EXISTS " + table + " CASCADE;"
-        self._execute_query(sql)
-
-    def _execute_query(self, q):
-        q = q.replace("AS DOUBLE", "AS DOUBLE PRECISION")
-        start = time.perf_counter()
-        
-        # We assume the connection is in AUTOCOMMIT mode to avoid transaction blocks
-        result = self.conn.execute(text(q))
-        
-        duration = time.perf_counter() - start
-        self.query_stats.append({"query": q[:100].replace("\n", " "), "duration": duration})
-        
-        if q.strip().upper().startswith("SELECT") or q.strip().upper().startswith("WITH") or "RETURNING" in q.strip().upper():
-            rows = result.fetchall()
-            return [tuple(float(v) if isinstance(v, Decimal) else v for v in row) for row in rows]
-        else:
-            return None
-
-    def log_stats(self):
-        if not self.query_stats:
-            return
-        total_time = sum(s["duration"] for s in self.query_stats)
-        logger.info(f"--- Query Profiling (Total: {total_time:.4f}s, Count: {len(self.query_stats)}) ---")
-        sorted_stats = sorted(self.query_stats, key=lambda x: x["duration"], reverse=True)
-        for i, s in enumerate(sorted_stats[:5]):
-            logger.info(f"Slow Query #{i+1} ({s['duration']:.4f}s): {s['query']}...")
-        self.query_stats = []
-
-    def spja_query(self, spja_data: SPJAData, parenthesize: bool = True):
-        parsed_aggregate_expressions = []
-        for target_col, aggExp in spja_data.aggregate_expressions.items():
-            window_clause = " OVER joinboost_window " if spja_data.window_by and is_agg(aggExp.agg) else ""
-            rename_expr = (" AS " + value_to_sql(target_col, qualified=False)) if target_col is not None else ""
-            parsed_aggregate_expressions.append(agg_to_sql(aggExp, qualified=spja_data.qualified) + window_clause + rename_expr)
-
-        sql = "SELECT " + ", ".join(parsed_aggregate_expressions) + "\n"
-        sql += "FROM " + ",".join(spja_data.from_tables) + "\n"
-
-        if len(spja_data.select_conds) > 0 or len(spja_data.join_conds) > 0 or spja_data.sample_rate is not None:
-            should_qualify = spja_data.qualified
-            if len(spja_data.from_tables) == 1:
-                should_qualify = False
-            conds = [selection_to_sql(cond, qualified=should_qualify) for cond in spja_data.select_conds + spja_data.join_conds]
-            if spja_data.sample_rate is not None:
-                conds.append(f"random() < {spja_data.sample_rate}")
-            sql += "WHERE " + " AND ".join(conds) + "\n"
-
-        if len(spja_data.window_by) > 0:
-            sql += ("WINDOW joinboost_window AS (ORDER BY " + ",".join([value_to_sql(att, qualified=False) for att in spja_data.window_by]) + ")\n")
-        if len(spja_data.group_by) > 0:
-            sql += "GROUP BY " + ",".join([value_to_sql(att) for att in spja_data.group_by]) + "\n"
-        if len(spja_data.order_by) > 0:
-            sql += ("ORDER BY " + ",".join([f"{col} {order}" for (col, order) in spja_data.order_by])+ "\n")
-        if spja_data.limit is not None:
-            sql += "LIMIT " + str(spja_data.limit) + "\n"
-        if parenthesize:
-            sql = f"({sql})"
-        return sql
-
-    def _spja_query_to_table(self, spja_data: SPJAData) -> str:
-        spja = self.spja_query(spja_data, parenthesize=False)
-        name_ = self.get_next_name()
-        if spja_data.replace:
-            self._execute_query(f"DROP TABLE IF EXISTS {name_} CASCADE")
-        sql = "CREATE TABLE " + name_ + " AS " + spja
-        self._execute_query(sql)
-        return name_
-
-    def _spja_query_as_view(self, spja_data: SPJAData):
-        spja = self.spja_query(spja_data, parenthesize=False)
-        name_ = self.get_next_name()
-        sql = "CREATE OR REPLACE VIEW " + name_ + " AS " + spja
-        self._execute_query(sql)
-        return name_
-
+LEARNING_RATE = 0.1
+NUM_LEAVES = 8
+DEPTH = 3
+ITERATIONS = 50
 
 class TSJoinBoostSUT:
     def __init__(self, model_name: str = "ts_joinboost", lags: int = 5, n_features: int = 50, predict_single_target: bool = False):
@@ -123,6 +33,7 @@ class TSJoinBoostSUT:
         self.lags = lags
         self.n_features = n_features
         self.predict_single_target = predict_single_target
+
         load_dotenv()
 
         TEST_DB_USERNAME = os.getenv("TEST_DB_USERNAME")
@@ -146,6 +57,13 @@ class TSJoinBoostSUT:
         self.executor = PostgresExecutor(self.conn)
         self.target_cols = []
         self.models = {}
+
+        # NOTE: Settings optimised for 16 threads, 32GB RAM. They might want tweaking
+        self.conn.execute(text("SET jit = on;"))
+        self.conn.execute(text("SET max_parallel_workers_per_gather = 8;"))
+        self.conn.execute(text("SET max_parallel_workers = 12;"))
+        self.conn.execute(text("SET work_mem = '512MB';"))
+        self.conn.execute(text("SET temp_buffers = '1GB';"))
 
     def __del__(self):
         if hasattr(self, 'conn') and self.conn:
@@ -175,9 +93,16 @@ class TSJoinBoostSUT:
         cols_ddl = ", ".join([f"{k} DOUBLE PRECISION" for k in self.target_cols])
         ddl = f"""
         DROP TABLE IF EXISTS {self.base_table} CASCADE;
-        CREATE TABLE {self.base_table} (date TIMESTAMP PRIMARY KEY, {cols_ddl});
+        CREATE TABLE {self.base_table} (date TIMESTAMP NOT NULL, {cols_ddl});
         SELECT create_hypertable('{self.base_table}', 'date', if_not_exists => TRUE);
-        ALTER TABLE {self.base_table} SET (timescaledb.compress, timescaledb.compress_orderby = 'date DESC');
+        
+        -- Indexing the base table for fast window function materialization
+        CREATE INDEX idx_{self.base_table}_date ON {self.base_table} (date DESC);
+        
+        ALTER TABLE {self.base_table} SET (
+            timescaledb.compress, 
+            timescaledb.compress_orderby = 'date DESC'
+        );
         
         DROP TABLE IF EXISTS {self.train_table} CASCADE;
         """
@@ -237,14 +162,12 @@ class TSJoinBoostSUT:
         conds = [f"{c} IS NOT NULL" for c in cols_to_train]
         
         if last_processed_date is None:
-            # Full materialization
             materialize_sql = f"""
             DROP TABLE IF EXISTS {self.train_table} CASCADE;
-            CREATE TABLE {self.train_table} AS
+            CREATE UNLOGGED TABLE {self.train_table} AS
             SELECT * FROM (SELECT {', '.join(select_clause)} FROM {self.base_table}) t
             WHERE {' AND '.join(conds)};
-            SELECT create_hypertable('{self.train_table}', 'date', if_not_exists => TRUE, migrate_data => true);
-            ALTER TABLE {self.train_table} ADD PRIMARY KEY (date);
+            CREATE UNIQUE INDEX idx_{self.train_table}_date ON {self.train_table} (date DESC);
             """
             self.conn.execute(text(materialize_sql))
         else:
@@ -268,28 +191,28 @@ class TSJoinBoostSUT:
         for target in self.target_cols:
             # Re-compress
             try:
-                compress_sql = f"""
-                ALTER TABLE {self.train_table} SET (
-                    timescaledb.compress, 
-                    timescaledb.compress_orderby = 'date DESC',
-                    timescaledb.compress_segmentby = '{target}'
-                );
-                SELECT compress_chunk(i) FROM show_chunks('{self.train_table}') i WHERE NOT is_compressed(i);
-                ANALYZE {self.train_table};
-                """
-                self.conn.execute(text(compress_sql))
+                self.conn.execute(text(f"ANALYZE {self.train_table};"))
             except Exception:
                 pass
 
             dataset = JoinGraph(self.executor)
             dataset.add_relation(self.train_table, cols_to_train, y=target)
-            reg = GradientBoosting(learning_rate=0.05, max_depth=4, n_estimators=100)
+            reg = GradientBoosting(learning_rate=LEARNING_RATE, max_depth=DEPTH, n_estimators=ITERATIONS, num_leaves=NUM_LEAVES)
             reg.fit(dataset)
             self.models[target] = reg
             self.last_training_view = self.train_table
             
         logger.info(f"TSJoinBoost Fit complete in {time.perf_counter()-start_total:.4f}s")
-        self.executor.log_stats()
+
+        # Cleanup jb_ tables to free up temp_buffers and catalog space
+        self._cleanup_temp_tables()
+
+    def _cleanup_temp_tables(self):
+        res = self.conn.execute(text(
+            "SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'jb_%'"
+        )).fetchall()
+        for row in res:
+            self.conn.execute(text(f"DROP TABLE IF EXISTS {row[0]} CASCADE"))
 
     def forecast(self, horizon: int) -> List[Dict[str, float]]:
         self._train()
