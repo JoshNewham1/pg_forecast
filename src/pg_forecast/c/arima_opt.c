@@ -5,10 +5,18 @@
 #include <nlopt.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 
 double _arima_objective_no_grad(unsigned n, const double *x, double *grad, void *data)
 {
     css_data_t *d = (css_data_t *)data;
+
+    time_t now = time(NULL);
+    if (difftime(now, d->start_time) > ARIMA_OPTIMISER_MAX_TIME) {
+        nlopt_force_stop(d->opt);
+        return INFINITY;
+    }
+
     double *phi = (double *)x;
     double c = d->include_c ? x[d->p + d->q] : 0.0;
     double* theta = (double *)(x + d->p);
@@ -21,23 +29,33 @@ double _arima_objective_no_grad(unsigned n, const double *x, double *grad, void 
 double _arima_objective_grad(unsigned n, const double *x, double *grad, void *data)
 {
     css_data_t *d = (css_data_t *)data;
+
+    time_t now = time(NULL);
+    if (difftime(now, d->start_time) > ARIMA_OPTIMISER_MAX_TIME) {
+        nlopt_force_stop(d->opt);
+        return INFINITY;
+    }
+
     double *phi = (double *)x;
     double* theta = (double *)(x + d->p);
     double c = d->include_c ? x[d->p + d->q] : 0.0;
     double* resid = (double *)(d->resid);
-    
+
     return css(d->vals, phi, theta, d->p, d->q, d->include_c, c, d->n_vals, grad, resid);
 }
 
 opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool include_c,
-                                nlopt_algorithm algorithm, const char* algorithm_name,
-                                double (*objective)(unsigned, const double*, double*, void*))
+                          nlopt_algorithm algorithm, const char* algorithm_name,
+                          double (*objective)(unsigned, const double*, double*, void*))
 {
     int n_params = p + q + (include_c ? 1 : 0);
     nlopt_opt opt = nlopt_create(algorithm, n_params);
     double* resid = palloc(n_vals * sizeof(double));
 
     css_data_t data = {vals, n_vals, p, q, include_c, resid};
+    data.opt = opt;
+    data.start_time = time(NULL);
+
     nlopt_set_min_objective(opt, objective, &data);
 
     // Lower and upper bounds (stationarity assumed to be enforced)
@@ -86,10 +104,16 @@ opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool include_c
     }
 
     double result;
-    if (nlopt_optimize(opt, x, &result) < 0)
+    int nlopt_status = nlopt_optimize(opt, x, &result);
+
+    if (nlopt_status == NLOPT_FORCED_STOP)
     {
+        ereport(WARNING,
+                errmsg("NLopt %s stopped after 60 seconds", algorithm_name));
+    } 
+    else if (nlopt_status < 0) {
         ereport(ERROR,
-        errmsg("NLopt %s failed", algorithm_name));
+                errmsg("NLopt %s failed", algorithm_name));
     }
 
     nlopt_destroy(opt);

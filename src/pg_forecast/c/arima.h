@@ -12,6 +12,8 @@ typedef struct {
     int q;
     bool include_c;
     double *resid;
+    nlopt_opt opt;
+    time_t start_time;
 } css_data_t;
 
 typedef struct {
