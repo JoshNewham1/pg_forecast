@@ -46,9 +46,25 @@ class PostgresExecutor(DuckdbExecutor):
         # Optimisation (assuming no NULLs in joins)
         q = q.replace('IS NOT DISTINCT FROM', '=')
 
+        # CTAS Rewrite for MVCC Avoidance (performs CASE in memory instead of in UPDATE)
+        if "UPDATE" in q.upper() and "JB_TMP_0" in q.upper() and "SET S =" in q.upper():
+            # Extract the math inside the UPDATE statement
+            case_statement = q[q.upper().find("(CASE"):].rstrip("; ")
+            
+            # jb_tmp_0 schema from logs: s, c, item_nbr, date, store_nbr
+            q = f"""
+            BEGIN;
+            CREATE UNLOGGED TABLE jb_tmp_0_new AS 
+            SELECT c, item_nbr, date, store_nbr, 
+                   s - {case_statement} AS s
+            FROM jb_tmp_0;
+            
+            DROP TABLE jb_tmp_0 CASCADE;
+            ALTER TABLE jb_tmp_0_new RENAME TO jb_tmp_0;
+            COMMIT;
+            """
+
         start = time.perf_counter()
-        if self.debug:
-            print(f"SQL: {q}")
             
         try:
             result = self.conn.execute(text(q))
@@ -61,12 +77,13 @@ class PostgresExecutor(DuckdbExecutor):
             result = self.conn.execute(text(q))
 
         if self.debug:
-            print(f"Time: {time.perf_counter() - start:.4f}s")
+            with open("joinboost.log", "a") as f:
+                f.write(f"SQL: {q} \n")
+                f.write(f"Time: {time.perf_counter() - start:.4f}s \n")
             
         if q.strip().upper().startswith(("SELECT", "WITH", "RETURNING")):
             return result.fetchall()
         else:
-            # SQLAlchemy with psycopg2 requires commit for DDL/Inserts if not autocommit
             if not self.conn.in_transaction():
                 self.conn.commit()
             return None
@@ -88,18 +105,9 @@ class PostgresExecutor(DuckdbExecutor):
         sql = f"CREATE UNLOGGED TABLE {name_} AS {spja}"
         self._execute_query(sql)
         
-        # 3. CRITICAL: Analyze and Index
-        # If the table has columns we usually join on, index them immediately.
-        # JoinBoost usually joins on 'date' and 'store_nbr' or 'item_nbr'
-        cols = self.get_schema(name_)
-        join_keys = [c for c in ['date', 'store_nbr', 'item_nbr', 'id'] if c in cols]
-        
-        if join_keys:
-            idx_name = f"idx_{name_}_{'_'.join(join_keys)}"
-            # We use a combined index for the join keys
-            self._execute_query(f"CREATE INDEX {idx_name} ON {name_} ({', '.join(join_keys)})")
-            # Update statistics so the planner knows the index exists and is useful
-            self._execute_query(f"ANALYZE {name_}")
+        # Building B-Trees on these temp tables forces Postgres into Nested Loops 
+        # and kills performance on 80M rows. We rely on Hash Joins via work_mem instead.
+        self._execute_query(f"ANALYZE {name_}")
             
         return name_
 

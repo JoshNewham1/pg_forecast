@@ -80,7 +80,7 @@ def setup_duckdb():
     """
     con.execute(view_sql)
 
-def setup_timescale():
+def setup_postgres():
     global engine
     load_dotenv()
     TEST_DB_USERNAME = os.getenv("TEST_DB_USERNAME")
@@ -247,10 +247,14 @@ def test_timescale(iterations=1, predict=False):
     with engine.connect() as conn:
         # Enable JIT and Parallelism for aggregates
         # NOTE: Settings optimised for 16 threads, 32GB RAM. They might want tweaking
-        conn.execute(text("SET jit = on;"))
+        conn.execute(text("SET jit = off;"))
         conn.execute(text("SET max_parallel_workers_per_gather = 8;"))
         conn.execute(text("SET max_parallel_workers = 12;"))
-        conn.execute(text("SET work_mem = '512MB';"))
+        conn.execute(text("SET parallel_setup_cost = 0;"))
+        conn.execute(text("SET parallel_tuple_cost = 0;"))
+        conn.execute(text("SET min_parallel_table_scan_size = '1MB';"))
+        conn.execute(text("SET max_parallel_workers = 12;"))
+        conn.execute(text("SET work_mem = '2GB';"))
         conn.execute(text("SET temp_buffers = '1GB';"))
         
         exe = PostgresExecutor(conn, debug=False)
@@ -270,6 +274,83 @@ def test_timescale(iterations=1, predict=False):
         dataset.add_join("fav.trans", "fav.stores", ["store_nbr"], ["store_nbr"])
         dataset.add_join("fav.trans", "fav.holidays", ["date"], ["date"])
         dataset.add_join("fav.holidays", "fav.oil", ["date"], ["date"])
+
+        reg = GradientBoosting(
+            learning_rate=LEARNING_RATE, num_leaves=NUM_LEAVES, max_depth=DEPTH, n_estimators=iterations
+        )
+
+        # FIT
+        start_time = time.perf_counter()
+        reg.fit(dataset)
+        results["timescale_fit"] = time.perf_counter() - start_time
+        print(f"Timescale JoinBoost fit time: {results['timescale_fit']}")
+
+        # PREDICT (In-Database)
+        if predict:
+            start_pred = time.perf_counter()
+            pred_agg = reg.get_prediction_aggregate()
+            pred_sql = agg_to_sql(pred_agg, qualified=False)
+            reg_prediction = exe._execute_query(f"SELECT {pred_sql} FROM train ORDER BY id")
+            print(f"Prediction shape: {len(reg_prediction)}")
+            results["pred_time"] = time.perf_counter() - start_pred
+            print(f"Timescale Predict Time: {results['pred_time']}")
+
+        # RMSE Calculation
+        rmse = reg.compute_rmse("fav.train")[0]
+        print(f"Timescale RMSE: {rmse}")
+        results["rmse"] = rmse
+        
+        # CLEANUP: Delete all jb_* temp tables
+        print("Cleaning up intermediate JoinBoost tables...")
+        cleanup_query = """
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_name LIKE 'jb_%';
+        """
+        temp_tables = exe._execute_query(cleanup_query)
+        if temp_tables:
+            for (tbl,) in temp_tables:
+                exe._execute_query(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+            print(f"Removed {len(temp_tables)} temporary tables.")
+    
+    return results
+
+def test_citus(iterations=1, predict=False):
+    global engine
+    results = {}
+    
+    # Use the optimized PostgresExecutor
+    with engine.connect() as conn:
+        # Enable JIT and Parallelism for aggregates
+        # NOTE: Settings optimised for 16 threads, 32GB RAM. They might want tweaking
+        conn.execute(text("SET jit = off;"))
+        conn.execute(text("SET max_parallel_workers_per_gather = 8;"))
+        conn.execute(text("SET max_parallel_workers = 12;"))
+        conn.execute(text("SET parallel_setup_cost = 0;"))
+        conn.execute(text("SET parallel_tuple_cost = 0;"))
+        conn.execute(text("SET min_parallel_table_scan_size = '1MB';"))
+        conn.execute(text("SET max_parallel_workers = 12;"))
+        conn.execute(text("SET work_mem = '2GB';"))
+        conn.execute(text("SET temp_buffers = '1GB';"))
+        conn.execute(text("SET columnar.compression_decode_buffer_size = '1GB';"))
+        
+        exe = PostgresExecutor(conn, debug=False)
+        dataset = JoinGraph(exe=exe)
+
+        # Define schema
+        dataset.add_relation("fav.citus_sales", [], y='target')
+        dataset.add_relation("fav.citus_holidays", ["htype", "locale", "locale_name", "transferred", "f2"])
+        dataset.add_relation("fav.citus_oil", ["dcoilwtico", "f3"])
+        dataset.add_relation("fav.citus_trans", ["transactions", "f5"])
+        dataset.add_relation("fav.citus_stores", ["city", "state", "stype", "cluster", "f4"])
+        dataset.add_relation("fav.citus_items", ["family", "class", "perishable", "f1"])
+
+        # Define joins
+        dataset.add_join("fav.citus_sales", "fav.citus_items", ["item_nbr"], ["item_nbr"])
+        dataset.add_join("fav.citus_sales", "fav.citus_trans", ["date", "store_nbr"], ["date", "store_nbr"])
+        dataset.add_join("fav.citus_trans", "fav.citus_stores", ["store_nbr"], ["store_nbr"])
+        dataset.add_join("fav.citus_trans", "fav.citus_holidays", ["date"], ["date"])
+        dataset.add_join("fav.citus_holidays", "fav.citus_oil", ["date"], ["date"])
 
         reg = GradientBoosting(
             learning_rate=LEARNING_RATE, num_leaves=NUM_LEAVES, max_depth=DEPTH, n_estimators=iterations
@@ -472,7 +553,7 @@ if __name__ == "__main__":
     setup_sklearn()
     setup_xgboost()
     setup_timescale_first_time()
-    setup_timescale()
+    setup_postgres()
     for i in [1, 5, 10, 15, 20, 25, 30]:
         print(f"Testing gradient boosting for {i} iterations")
         print(f"=============================================")
