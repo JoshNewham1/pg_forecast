@@ -193,6 +193,19 @@ def setup_xgboost():
 
     print(f"XGBoost export time: {time.perf_counter() - start_time}")
 
+def set_postgres_optimisations(conn):
+    # Enable JIT and Parallelism for aggregates
+    # NOTE: Settings optimised for 16 threads, 32GB RAM. They might want tweaking
+    conn.execute(text("SET jit = off;"))
+    conn.execute(text("SET max_parallel_workers_per_gather = 8;"))
+    conn.execute(text("SET max_parallel_workers = 12;"))
+    conn.execute(text("SET parallel_setup_cost = 0;"))
+    conn.execute(text("SET parallel_tuple_cost = 0;"))
+    conn.execute(text("SET min_parallel_table_scan_size = '1MB';"))
+    conn.execute(text("SET max_parallel_workers = 12;"))
+    conn.execute(text("SET work_mem = '2GB';"))
+    conn.execute(text("SET temp_buffers = '1GB';"))
+
 def test_duckdb(iterations=1, predict=False):
     global con
     results = {}
@@ -247,15 +260,7 @@ def test_timescale(iterations=1, predict=False):
     with engine.connect() as conn:
         # Enable JIT and Parallelism for aggregates
         # NOTE: Settings optimised for 16 threads, 32GB RAM. They might want tweaking
-        conn.execute(text("SET jit = off;"))
-        conn.execute(text("SET max_parallel_workers_per_gather = 8;"))
-        conn.execute(text("SET max_parallel_workers = 12;"))
-        conn.execute(text("SET parallel_setup_cost = 0;"))
-        conn.execute(text("SET parallel_tuple_cost = 0;"))
-        conn.execute(text("SET min_parallel_table_scan_size = '1MB';"))
-        conn.execute(text("SET max_parallel_workers = 12;"))
-        conn.execute(text("SET work_mem = '2GB';"))
-        conn.execute(text("SET temp_buffers = '1GB';"))
+        set_postgres_optimisations(conn)
         
         exe = PostgresExecutor(conn, debug=False)
         dataset = JoinGraph(exe=exe)
@@ -321,17 +326,7 @@ def test_citus(iterations=1, predict=False):
     
     # Use the optimized PostgresExecutor
     with engine.connect() as conn:
-        # Enable JIT and Parallelism for aggregates
-        # NOTE: Settings optimised for 16 threads, 32GB RAM. They might want tweaking
-        conn.execute(text("SET jit = off;"))
-        conn.execute(text("SET max_parallel_workers_per_gather = 8;"))
-        conn.execute(text("SET max_parallel_workers = 12;"))
-        conn.execute(text("SET parallel_setup_cost = 0;"))
-        conn.execute(text("SET parallel_tuple_cost = 0;"))
-        conn.execute(text("SET min_parallel_table_scan_size = '1MB';"))
-        conn.execute(text("SET max_parallel_workers = 12;"))
-        conn.execute(text("SET work_mem = '2GB';"))
-        conn.execute(text("SET temp_buffers = '1GB';"))
+        set_postgres_optimisations(conn)
         conn.execute(text("SET columnar.compression_decode_buffer_size = '1GB';"))
         
         exe = PostgresExecutor(conn, debug=False)
@@ -559,6 +554,7 @@ if __name__ == "__main__":
         print(f"=============================================")
         results.append(test_duckdb(i))
         results.append(test_timescale(i))
+        results.append(test_citus(i))
         results.append(test_sklearn(i))
         results.append(test_xgboost_out_of_core(i))
         results.append(test_xgboost_in_memory(i))
