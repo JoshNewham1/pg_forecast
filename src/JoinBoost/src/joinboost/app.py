@@ -809,6 +809,8 @@ class GradientBoosting(DecisionTree):
         Maximum depth of each decision tree. Defaults to 6.
     n_estimators : int, optional
         Number of boosting stages or decision trees to be run. Essentially, how many times the boosting procedure should be executed. Defaults to 1.
+    incremental_estimators : int, optional
+        Number of trees to add during warm start (incremental update). If None, uses n_estimators. Defaults to None.
     debug : bool, optional
         If set to True, enables debugging mode. Defaults to False.
     partition_early : bool, optional
@@ -822,6 +824,7 @@ class GradientBoosting(DecisionTree):
         learning_rate: float = 1,
         max_depth: int = 6,
         n_estimators: int = 1,
+        incremental_estimators: int = None,
         debug: bool = False,
         partition_early: bool = False,
         enable_batch_optimization: bool = False, # This is only applicable for pandas right now
@@ -836,11 +839,14 @@ class GradientBoosting(DecisionTree):
                          enable_batch_optimization=enable_batch_optimization
                          )
         self.n_estimators = n_estimators
+        self.incremental_estimators = incremental_estimators if incremental_estimators is not None else n_estimators
 
     def _fit(self, jg: JoinGraph, skip_preprocess=False, warm_start=False, filter_expression=None):
         super()._fit(jg, skip_preprocess=skip_preprocess, warm_start=warm_start, filter_expression=filter_expression)
 
-        for _ in range(self.n_estimators - 1):
+        # Use incremental_estimators for warm start, n_estimators for initial training
+        num_trees = self.incremental_estimators if warm_start else self.n_estimators
+        for _ in range(num_trees - 1):
             self.train_one()
 
     def _update_error(self):

@@ -31,6 +31,8 @@ and PostgreSQL support.
 
 *`GradientBoosting._fit()`*:
 - Propagates `warm_start` and `filter_expression` to parent
+- Trains `incremental_estimators` trees, instead of `n_estimators` to improve performance
+  and provide a hyperparameter allowing the user to choose between accuracy and train time
 
 *`GradientBoosting._update_error()`*:
 - **Critical optimisation**: Changed from per-leaf UPDATE queries to single CASE expression UPDATE
@@ -144,6 +146,24 @@ else:
 ```
 
 This computes the initial residuals that go into the temp table. For warm start, we subtract the full model prediction, not just the mean.
+
+---
+
+## GradientBoosting._fit `incremental_estimators` Parameter
+
+Controls how many trees are added per incremental update.
+
+### Purpose
+
+Without this parameter, each incremental update adds `n_estimators` trees (e.g., 50). After 10 batches, the model would have 500 trees, leading to:
+- Increasing prediction latency
+- Larger model size
+- More complex residual calculations
+
+With `incremental_estimators=5`, each update adds only 5 trees:
+- Batch 1: 50 trees (initial training uses `n_estimators`)
+- Batch 2: 55 trees (adds 5)
+- Batch 3: 60 trees (adds 5)
 
 ---
 
