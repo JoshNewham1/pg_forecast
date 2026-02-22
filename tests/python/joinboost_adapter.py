@@ -1,10 +1,8 @@
 import re
 import time
-import pandas as pd
 from sqlalchemy import text
 import sys
 import os
-import decimal
 import psycopg2
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../eval/JoinBoost/src")))

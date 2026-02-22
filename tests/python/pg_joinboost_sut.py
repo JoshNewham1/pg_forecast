@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 # Add JoinBoost to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../eval/JoinBoost/src")))
 
-from joinboost.aggregator import agg_to_sql
+from joinboost.aggregator import agg_to_sql, SelectionExpression, SELECTION, QualifiedAttribute
 from joinboost.joingraph import JoinGraph
 from joinboost.app import GradientBoosting
 
@@ -58,9 +58,10 @@ class JoinBoostSUT:
         self.executor = PostgresExecutor(self.conn)
         self.target_cols = []
         self.models = {}
+        self.trained = False
 
         # NOTE: Settings optimised for 16 threads, 32GB RAM. They might want tweaking
-        self.conn.execute(text("SET jit = on;"))
+        self.conn.execute(text("SET jit = off;"))
         self.conn.execute(text("SET max_parallel_workers_per_gather = 8;"))
         self.conn.execute(text("SET max_parallel_workers = 12;"))
         self.conn.execute(text("SET work_mem = '512MB';"))
@@ -104,7 +105,6 @@ class JoinBoostSUT:
         self.conn.execute(text(ddl))
 
         self.add_batch(seed_records)
-        self._train()
 
     def add_single(self, record: Dict[str, float]):
         self.add_batch([record])
@@ -138,12 +138,11 @@ class JoinBoostSUT:
         
         # Incremental logic
         last_processed_date = None
-        if self.is_incremental:
-            try:
-                res = self.conn.execute(text(f"SELECT MAX(date) FROM {self.train_table}")).fetchone()
-                if res: last_processed_date = res[0]
-            except Exception:
-                pass
+        try:
+            res = self.conn.execute(text(f"SELECT MAX(date) FROM {self.train_table}")).fetchone()
+            if res: last_processed_date = res[0]
+        except Exception:
+            pass
 
         select_clause = ["date"]
         cols_to_train = []
@@ -157,7 +156,9 @@ class JoinBoostSUT:
 
         conds = [f"{c} IS NOT NULL" for c in cols_to_train]
         
-        if last_processed_date is None:  # non-incremental
+        training_table = self.train_table
+
+        if last_processed_date is None:  # non-incremental or first run
             materialize_sql = f"""
             DROP TABLE IF EXISTS {self.train_table} CASCADE;
             CREATE UNLOGGED TABLE {self.train_table} AS
@@ -166,37 +167,46 @@ class JoinBoostSUT:
             CREATE UNIQUE INDEX idx_{self.train_table}_date ON {self.train_table} (date DESC);
             """
             self.conn.execute(text(materialize_sql))
-        else:  # incremental
-            interval_res = self.conn.execute(text(f"SELECT date FROM {self.base_table} ORDER BY date DESC LIMIT 2")).fetchall()
-            lookback = (interval_res[0][0] - interval_res[1][0]) * (self.lags + 1) if len(interval_res) == 2 else timedelta(hours=1)
-
+        else:
             inc_sql = f"""
             INSERT INTO {self.train_table}
             SELECT * FROM (
                 SELECT {', '.join(select_clause)} 
                 FROM {self.base_table} 
-                WHERE date > '{last_processed_date - lookback}'::timestamp
             ) t
             WHERE date > '{last_processed_date}'::timestamp AND {' AND '.join(conds)}
             ON CONFLICT (date) DO NOTHING;
             """
             self.conn.execute(text(inc_sql))
 
-        self.models = {}
         for target in self.target_cols:
             # Re-compress
             try:
-                self.conn.execute(text(f"ANALYZE {self.train_table};"))
+                self.conn.execute(text(f"ANALYZE {training_table};"))
             except Exception:
                 pass
 
             dataset = JoinGraph(self.executor)
-            dataset.add_relation(self.train_table, cols_to_train, y=target)
-            reg = GradientBoosting(learning_rate=LEARNING_RATE, max_depth=DEPTH, n_estimators=ITERATIONS, num_leaves=NUM_LEAVES)
-            reg.fit(dataset)
-            self.models[target] = reg
+            dataset.add_relation(training_table, cols_to_train, y=target)
+            
+            if not self.trained or not self.is_incremental:
+                reg = GradientBoosting(learning_rate=LEARNING_RATE, max_depth=DEPTH, n_estimators=ITERATIONS, num_leaves=NUM_LEAVES)
+                reg.fit(dataset, warm_start=False, skip_preprocess=True)
+                self.models[target] = reg
+            else:
+                reg = self.models[target]
+                filter_expression = None
+                if last_processed_date:
+                    filter_expression = SelectionExpression(
+                        SELECTION.GREATER, 
+                        (QualifiedAttribute(dataset.target_relation, 'date'), 
+                         f"'{last_processed_date}'::timestamp")
+                    )
+                reg.fit(dataset, warm_start=True, filter_expression=filter_expression)
+            
             self.last_training_view = self.train_table
             
+        self.trained = True
         logger.info(f"JoinBoost Fit complete in {time.perf_counter()-start_total:.4f}s")
 
         # Cleanup jb_ tables to free up temp_buffers and catalog space

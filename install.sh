@@ -71,5 +71,6 @@ find src/TFB/ts_benchmark/baselines/python_competitor \
     done
     ' sh {} +
 
-# Copy over changes to JoinBoost/main (executor.py)
+# Copy over changes to JoinBoost/main (executor.py, main.py)
+# This includes support for PostgreSQL and incremental updates
 cp src/JoinBoost/src/joinboost/* eval/JoinBoost/src/joinboost/
