@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS fav.citus_holidays (
     locale TEXT,
     locale_name TEXT,
     description TEXT,
-    transferred INTEGER,
+    transferred BOOLEAN,
     f2 INT
 );
 
@@ -109,12 +109,12 @@ CREATE TABLE IF NOT EXISTS fav.citus_sales (
     store_nbr INT,
     item_nbr INT,
     unit_sales NUMERIC,
-    onpromotion INT,
+    onpromotion BOOLEAN,
     target NUMERIC,
     PRIMARY KEY (store_nbr, date, id)
 ) 
 USING columnar
-WITH (compression = 'zstd', compression_level = 3, stripe_row_limit = 2000000, chunk_group_row_limit = 100000);;
+WITH (columnar.compression = 'zstd', columnar.compression_level = 3, columnar.stripe_row_limit = 2000000, columnar.chunk_group_row_limit = 100000);
 
 SELECT create_distributed_table(
     'fav.citus_sales',
@@ -136,9 +136,3 @@ ON fav.citus_sales (date);
 
 CREATE INDEX IF NOT EXISTS citus_sales_item_idx
 ON fav.citus_sales (item_nbr);
-
-ALTER TABLE fav.citus_sales
-SET (columnar.compression = 'zstd');
-
-ALTER TABLE fav.citus_trans
-SET (columnar.compression = 'zstd');
