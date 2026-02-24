@@ -7,12 +7,18 @@
 #include <string.h>
 #include <time.h>
 
+static inline double _calculate_timeout(int n)
+{
+    return ARIMA_OPTIMISER_BASE_TIME + 
+        (max(n - ARIMA_OPTIMISER_BASE_ROWS, 0) * ARIMA_OPTIMISER_ROW_MULTIPLIER);
+}
+
 double _arima_objective_no_grad(unsigned n, const double *x, double *grad, void *data)
 {
     css_data_t *d = (css_data_t *)data;
 
     time_t now = time(NULL);
-    if (difftime(now, d->start_time) > ARIMA_OPTIMISER_MAX_TIME) {
+    if (difftime(now, d->start_time) > _calculate_timeout(n)) {
         nlopt_force_stop(d->opt);
         return INFINITY;
     }
@@ -31,7 +37,7 @@ double _arima_objective_grad(unsigned n, const double *x, double *grad, void *da
     css_data_t *d = (css_data_t *)data;
 
     time_t now = time(NULL);
-    if (difftime(now, d->start_time) > ARIMA_OPTIMISER_MAX_TIME) {
+    if (difftime(now, d->start_time) > _calculate_timeout(n)) {
         nlopt_force_stop(d->opt);
         return INFINITY;
     }
@@ -57,6 +63,7 @@ opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool include_c
     data.start_time = time(NULL);
 
     nlopt_set_min_objective(opt, objective, &data);
+    nlopt_set_xtol_rel(opt, ARIMA_OPTIMISER_XTOL_REL);
 
     // Lower and upper bounds (stationarity assumed to be enforced)
     double *lb = palloc(sizeof(double) * n_params);
@@ -88,15 +95,11 @@ opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool include_c
 
     if (p > 0)
     {
-        double *phi_init = yule_walker(vals, n_vals, p);
-        for (int i = 0; i < p; i++) x[i] = phi_init[i];
-        pfree(phi_init);
+        for (int i = 0; i < p; i++) x[i] = 0.1;
     }
     if (q > 0)
     {
-        double *theta_init = ma_initial_guess(vals, n_vals, p, q, mean);
-        for (int i = 0; i < q; i++) x[p+i] = theta_init[i];
-        pfree(theta_init);
+        for (int i = 0; i < q; i++) x[p+i] = 0.1;
     }
     if (include_c)
     {
@@ -109,9 +112,10 @@ opt_result_t _arima_nlopt(double* vals, int n_vals, int p, int q, bool include_c
     if (nlopt_status == NLOPT_FORCED_STOP)
     {
         ereport(WARNING,
-                errmsg("NLopt %s stopped after 60 seconds", algorithm_name));
+                errmsg("NLopt %s timed out", algorithm_name));
     } 
-    else if (nlopt_status < 0) {
+    else if (nlopt_status < 0) 
+    {
         ereport(ERROR,
                 errmsg("NLopt %s failed", algorithm_name));
     }

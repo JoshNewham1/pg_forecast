@@ -145,6 +145,16 @@ arima_optimise(PG_FUNCTION_ARGS)
         opt_objective = _arima_objective_grad;
         opt_algorithm = NLOPT_LD_LBFGS;
     }
+    else if (strcmp(arima_method, "SLSQP") == 0)
+    {
+        opt_objective = _arima_objective_grad;
+        opt_algorithm = NLOPT_LD_SLSQP;
+    }
+    else if (strcmp(arima_method, "MMA") == 0)
+    {
+        opt_objective = _arima_objective_grad;
+        opt_algorithm = NLOPT_LD_MMA;
+    }
     else if (strcmp(arima_method, "Subplex") == 0)
     {
         opt_objective = _arima_objective_grad;

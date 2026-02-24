@@ -178,8 +178,6 @@ css_incremental(arima_inc_state_t *state, double* phi, double* theta, double y_t
     bool ready = arima_incremental_difference(state, y_t, &y_diff);
     double e_t = y_diff - c;
 
-    elog(DEBUG1, "css_incremental after differencing: p = %d, q = %d", state->p, state->q);
-
     // Differencing warm-up: skip CSS and lag updates
     if (!ready)
         return state;
@@ -233,7 +231,6 @@ css_incremental(arima_inc_state_t *state, double* phi, double* theta, double y_t
     if (!isfinite(state->css))
     {
         state->css = INFINITY;
-        elog(WARNING, "css_incremental: CSS infinity at t=%d", state->t);
     }
 
     return state;

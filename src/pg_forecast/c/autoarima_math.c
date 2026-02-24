@@ -60,6 +60,11 @@ static int _kpss_autolag(double *resid, int n)
     int autolags = (int)(gamma_hat * pow((double)n, 1.0 / 3.0));
     if (autolags >= n) autolags = n - 1;
 
+    // Cap lags at n^1/4, inspired by Schwert (1989)
+    int max_lag = (int)(12.0 * pow(n / 100.0, 0.25));
+    if (autolags > max_lag)
+        autolags = max_lag;
+
     return autolags;
 }
 
