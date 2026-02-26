@@ -50,12 +50,23 @@ class PostgresExecutor(DuckdbExecutor):
         if "UPDATE" in q.upper() and "JB_TMP_0" in q.upper() and "SET S =" in q.upper():
             # Extract the math inside the UPDATE statement
             case_statement = q[q.upper().find("(CASE"):].rstrip("; ")
+
+            # Fetch column list dynamically (excluding s)
+            schema = self.conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'jb_tmp_0' AND table_schema = 'public'
+                ORDER BY ordinal_position
+            """))
+            cols = [r[0] for r in schema.fetchall()]
+            non_s_cols = [c for c in cols if c.lower() != "s"]
+            select_cols = ", ".join(non_s_cols)
             
             # jb_tmp_0 schema from logs: s, c, item_nbr, date, store_nbr
             q = f"""
             BEGIN;
             CREATE UNLOGGED TABLE jb_tmp_0_new AS 
-            SELECT c, item_nbr, date, store_nbr, 
+            SELECT {select_cols}, 
                    s - {case_statement} AS s
             FROM jb_tmp_0;
             
