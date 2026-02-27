@@ -1,4 +1,4 @@
-# Incremental JoinBoost Implementation
+# JoinBoost Source Changes
 
 This document summarises the changes made to JoinBoost and the adapter to enable incremental (constant-time) model updates
 and PostgreSQL support.
@@ -42,6 +42,10 @@ and PostgreSQL support.
 **4. `executor.py` - Minor Fixes for PostgreSQL support**
 - Added `DISTINCT_IDENTITY` aggregator support
 - Fixed `COUNT` for multi-column args
+
+**5. `aggregator.py` - CASE Expression Syntax Fix**
+- Added default `1=1` condition to `Aggregator.CASE` when the condition list is empty.
+- Prevents `psycopg2.errors.SyntaxError: syntax error at or near "THEN"` in PostgreSQL when a leaf node has no annotations (e.g., during initial training or specific tree structures).
 
 ---
 
@@ -193,3 +197,25 @@ self.cjt.exe._execute_query(f"UPDATE {target_relation} SET {update_exp}")
 ```
 
 **Result**: Only 50 UPDATEs per batch (one per tree), reducing row versions 8x. Fit times became nearly constant: 7-8s across all batches.
+
+---
+
+### CASE Expression Syntax Fix (`aggregator.py`)
+
+**Problem**: When `GradientBoosting._update_error` generated a `CASE` expression for a tree where a leaf had no conditions (common in the first tree or specific splits), it produced `WHEN THEN ...`, which is invalid SQL in PostgreSQL.
+
+**Solution**:
+```python
+if not conds:
+    conds = "1=1"
+```
+
+**Why?** In PostgreSQL, `CASE` requires a condition after `WHEN`. If JoinBoost determines a leaf applies to all rows (empty annotations), `1=1` ensures the `THEN` clause is executed correctly while maintaining valid syntax.
+
+---
+
+### Test Framework Robustness (`performance_tests.py`)
+
+**Problem**: Multivariate datasets (like `wind_farms_minutely`) contain `'NULL'` strings for missing values. The benchmark runner's loss calculation failed with `ValueError: could not convert string to float: 'NULL'`.
+
+**Solution**: Added explicit checks for `'NULL'` strings in `get_forecast_value_from_response` to treat them as `0.0`. This prevents crashes during long-running performance benchmarks when encountering sparse data.

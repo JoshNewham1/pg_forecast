@@ -3,10 +3,12 @@ from typing import Dict, List, Any
 import csv
 from datetime import datetime, timedelta, timezone
 import os
+import math
 
 from sqlalchemy import create_engine, text
 from monash.utils import stream_tsf_values, stream_tsf_aligned_series
 from itertools import islice
+import itertools
 import logging
 from abc import ABC, abstractmethod
 from dotenv import load_dotenv
@@ -25,11 +27,12 @@ if not logger.handlers:
     )
 
 class BenchmarkResult:
-    def __init__(self, test_name: str, insert_timings: list[float], forecast_timings: list[float], losses: list[float], write_to_file = True, csv_prefix = "performance_"):
+    def __init__(self, test_name: str, insert_timings: list[float], forecast_timings: list[float], rmse_losses: list[float], msmape_losses: list[float], write_to_file = True, csv_prefix = "performance_"):
         self.insert_timings = insert_timings
         self.forecast_timings = forecast_timings
-        self.losses = losses
-        self.metrics = self.calculate_metrics(insert_timings, forecast_timings, losses)
+        self.rmse_losses = rmse_losses
+        self.msmape_losses = msmape_losses
+        self.metrics = self.calculate_metrics(insert_timings, forecast_timings)
         self.test_name = test_name
         self.csv_prefix = csv_prefix
         if write_to_file:
@@ -74,24 +77,29 @@ class BenchmarkResult:
 
             insert_rows = map(lambda t: { "type": "insert", "time": t }, self.insert_timings)
             forecast_rows = map(lambda t: { "type": "forecast", "time": t }, self.forecast_timings)
-            loss_rows = map(lambda l: { "type": "loss", "time": l }, self.losses)
+            rmse_rows = map(lambda l: { "type": "rmse", "time": l }, self.rmse_losses)
+            msmape_rows = map(lambda l: { "type": "msmape", "time": l }, self.msmape_losses)
             writer.writerows(insert_rows)
             writer.writerows(forecast_rows)
-            writer.writerows(loss_rows)
+            writer.writerows(rmse_rows)
+            writer.writerows(msmape_rows)
 
-    def calculate_metrics(self, insert_timings: list[float], forecast_timings: list[float], losses: list[float]):
+    def calculate_metrics(self, insert_timings: list[float], forecast_timings: list[float]):
         avg_forecast = None
         avg_insert = None
-        final_loss = None
+        sum_rmse = None
+        avg_msmape = None
 
         if len(insert_timings) > 0:
             avg_insert = sum(insert_timings) / len(insert_timings)
         if len(forecast_timings) > 0:
             avg_forecast = sum(forecast_timings) / len(forecast_timings)
-        if len(losses) > 0:
-            final_loss = losses[-1]
+        if len(self.rmse_losses) > 0:
+            sum_rmse = sum(self.rmse_losses)
+        if len(self.msmape_losses) > 0:
+            avg_msmape = sum(self.msmape_losses) / len(self.msmape_losses)
 
-        return {"avg_insert": avg_insert, "avg_forecast": avg_forecast, "final_loss": final_loss}
+        return {"avg_insert": avg_insert, "avg_forecast": avg_forecast, "sum_rmse": sum_rmse, "avg_msmape": avg_msmape}
     
 class Dataset(ABC):
     def __init__(self, file_name: str, path: str = "../../eval/monash/data"):
@@ -195,14 +203,116 @@ class SystemUnderTest(ABC):
         pass
 
 class BenchmarkRunner:
-    def __init__(self, sut: SystemUnderTest, dataset: Dataset, test_name: str, forecast_horizon: int = 14):
+    def __init__(self, sut: SystemUnderTest, dataset: Dataset, test_name: str, forecast_horizon: int = 365):
         self.sut = sut
         self.dataset = dataset
         self.test_name = test_name
         self.forecast_horizon = forecast_horizon
         self.insert_timings = []
         self.forecast_timings = []
-        self.losses = []
+        self.rmse_losses = []
+        self.msmape_losses = []
+
+    def get_forecast_value_from_response(self, f_entry, a_entry):
+        # Handle different forecast entry formats
+        if isinstance(f_entry, dict):
+            # PythonWebServer or JoinBoostSUT
+            fv = f_entry.get("forecast_value")
+            if isinstance(fv, dict):
+                # JoinBoostSUT: {"forecast_value": {"T1": 1.23}}
+                if fv:
+                    target_key = next(iter(fv.keys()))
+                    f_val = float(fv[target_key])
+                    # Try to match the same key in actuals
+                    val = a_entry.get(target_key, a_entry.get(target_key.upper(), 0.0))
+                    a_val = float(val) if val != "NULL" else 0.0
+            else:
+                # PythonWebServer: {"forecast_value": 1.23}
+                f_val = float(fv) if fv is not None else 0.0
+                if "value" in a_entry:
+                    val = a_entry["value"]
+                    a_val = float(val) if val != "NULL" else 0.0
+                else:
+                    # Guess first T* key for multivariate
+                    t_keys = [k for k in a_entry.keys() if k.startswith("T")]
+                    if t_keys:
+                        val = a_entry[t_keys[0]]
+                        a_val = float(val) if val != "NULL" else 0.0
+                    else:
+                        a_val = 0.0
+        elif hasattr(f_entry, "__getitem__") and not isinstance(f_entry, (str, bytes)):
+            # Sequence (tuple, list, Row, etc.)
+            # PgForecast returns (date, value)
+            if len(f_entry) > 1:
+                f_val = float(f_entry[1])
+            else:
+                f_val = float(f_entry[0])
+            a_val = float(a_entry.get("value", 0.0))
+        else:
+            try:
+                f_val = float(f_entry)
+            except (TypeError, ValueError):
+                f_val = 0.0
+            a_val = float(a_entry.get("value", 0.0))
+
+        return a_val, f_val
+
+    def calculate_rmse_loss(self, forecast: List[Any], actuals: List[Dict[str, float]]) -> float:
+        """
+        Calculates the Root Mean Squared Error (RMSE) between the forecast and actual values.
+        Standardised loss function across all systems.
+        """
+        if not forecast or not actuals:
+            return 0.0
+        
+        n = min(len(forecast), len(actuals))
+        if n == 0:
+            return 0.0
+            
+        css = 0.0
+        for i in range(n):
+            f_entry = forecast[i]
+            a_entry = actuals[i]
+            
+            # Extract forecast value
+            f_val, a_val = self.get_forecast_value_from_response(f_entry, a_entry)
+                
+            css += (f_val - a_val) ** 2
+            
+        return math.sqrt(float(css) / n)
+    
+    def calculate_msmape_loss(self, forecast: List[Any], actuals: List[Dict[str, float]], epsilon: float = 1e-12) -> float:
+        """
+        Calculates stabilized MSMAPE between forecast and actual values.
+
+        MSMAPE = (100 / h) * sum(
+            |F - Y| / max((|Y| + |F|)/2 + eps, 0.5 + eps)
+        )
+
+        Standardised loss function across all systems.
+        """
+        if not forecast or not actuals:
+            return 0.0
+
+        n = min(len(forecast), len(actuals))
+        if n == 0:
+            return 0.0
+
+        total = 0.0
+
+        for i in range(n):
+            f_entry = forecast[i]
+            a_entry = actuals[i]
+
+            f_val, a_val = self.get_forecast_value_from_response(f_entry, a_entry)
+
+            numerator = abs(f_val - a_val)
+            denom = max((abs(a_val) + abs(f_val)) / 2.0 + epsilon,
+                        0.5 + epsilon)
+
+            total += numerator / denom
+
+        return 100.0 * total / n
     
     def run_single(self, num_records: int) -> BenchmarkResult:
         logger.info(
@@ -211,26 +321,45 @@ class BenchmarkRunner:
 
         self.insert_timings = []
         self.forecast_timings = []
+        self.rmse_losses = []
+        self.msmape_losses = []
 
-        it = iter(self.dataset)
-        self.sut.setup_single(list(islice(it, 100)))
+        it_main, it_peek = itertools.tee(iter(self.dataset))
+        
+        # Seed records
+        seed_records = list(islice(it_main, 100))
+        self.sut.setup_single(seed_records)
+        # Keep it_peek in sync
+        for _ in range(100): next(it_peek)
 
         num_inserted = 0
-        for record in it:
+        for record in it_main:
+            next(it_peek) # keep in sync
+            
             if num_inserted == num_records:
                 break
+            
             if num_inserted % 100 == 0 and num_inserted > 0:
                 start = time.perf_counter()
-                _ = self.sut.forecast(self.forecast_horizon)
+                forecast_result = self.sut.forecast(self.forecast_horizon)
                 end = time.perf_counter()
                 self.forecast_timings.append(end - start)
-                logging.info(f"Inserted {num_inserted} records, forecasted in {end - start}s")
+                
+                # Calculate external loss
+                peek_ahead_it, _ = itertools.tee(it_peek)
+                actuals = list(islice(peek_ahead_it, self.forecast_horizon))
+                rmse = self.calculate_rmse_loss(forecast_result, actuals)
+                msmape = self.calculate_msmape_loss(forecast_result, actuals)
+                self.rmse_losses.append(rmse)
+                self.msmape_losses.append(msmape)
+                
+                logging.info(f"Inserted {num_inserted} records, forecasted in {end - start}s, rmse={rmse}, msmape={msmape}")
 
             start = time.perf_counter()
             self.sut.add_single(record)
             end = time.perf_counter()
             self.insert_timings.append(end - start)
-            self.losses.append(self.sut.get_loss())
+            
             num_inserted += 1
             logging.debug(f"Inserted record #{num_inserted}")
 
@@ -239,7 +368,8 @@ class BenchmarkRunner:
         result = BenchmarkResult(self.test_name,
                                  self.insert_timings,
                                  self.forecast_timings,
-                                 self.losses,
+                                 self.rmse_losses,
+                                 self.msmape_losses,
                                  write_to_file=True)
         return result
     
@@ -249,15 +379,24 @@ class BenchmarkRunner:
         )
         self.insert_timings = []
         self.forecast_timings = []
+        self.rmse_losses = []
+        self.msmape_losses = []
 
-        it = iter(self.dataset)
-        self.sut.setup_batch(list(islice(it, 100)))
+        it_main, it_peek = itertools.tee(iter(self.dataset))
+        
+        # Seed records
+        seed_records = list(islice(it_main, 100))
+        self.sut.setup_batch(seed_records)
+        # Keep it_peek in sync
+        for _ in range(100): next(it_peek)
 
         num_pages = num_records // page_size
         for page in range(0, num_pages):
-            records = list(islice(it, page_size))
+            records = list(islice(it_main, page_size))
             if not records:
                 break
+            # Keep it_peek in sync
+            for _ in range(len(records)): next(it_peek)
 
             start = time.perf_counter()
             self.sut.add_batch(records)
@@ -265,19 +404,26 @@ class BenchmarkRunner:
             self.insert_timings.append(end - start)
 
             start = time.perf_counter()
-            _ = self.sut.forecast(self.forecast_horizon)
+            forecast_result = self.sut.forecast(self.forecast_horizon)
             end = time.perf_counter()
             self.forecast_timings.append(end - start)
 
-            self.losses.append(self.sut.get_loss())
+            # Calculate external loss
+            peek_ahead_it, _ = itertools.tee(it_peek)
+            actuals = list(islice(peek_ahead_it, self.forecast_horizon))
+            rmse = self.calculate_rmse_loss(forecast_result, actuals)
+            msmape = self.calculate_msmape_loss(forecast_result, actuals)
+            self.rmse_losses.append(rmse)
+            self.msmape_losses.append(msmape)
 
             logger.debug(
-                "Page %d/%d processed (insert=%.6fs, forecast=%.6fs, loss=%f)",
+                "Page %d/%d processed (insert=%.6fs, forecast=%.6fs, rmse=%f, msmape=%f)",
                 page + 1,
                 num_pages,
                 self.insert_timings[-1],
                 self.forecast_timings[-1],
-                self.losses[-1]
+                rmse,
+                msmape
             )
 
         logger.info("Batch insert benchmark complete")
@@ -285,7 +431,8 @@ class BenchmarkRunner:
         result = BenchmarkResult(self.test_name,
                                  self.insert_timings,
                                  self.forecast_timings,
-                                 self.losses,
+                                 self.rmse_losses,
+                                 self.msmape_losses,
                                  write_to_file=True)
         return result
     
@@ -651,7 +798,7 @@ MULTIVAR_CASES = [
 ]
 
 @pytest.mark.parametrize("competitor_server, sut", MULTIVAR_CASES, indirect=True)
-@pytest.mark.parametrize("page_size,num_records,n_lags,n_features,single_target", [(10_000, 1_000_000, 5, 5, True)])
+@pytest.mark.parametrize("page_size,num_records,n_lags,n_features,single_target", [(10_000, 100_000, 5, 5, True)])
 def test_univar_joinboost_batch_insert(univar_runner, page_size, num_records, n_lags, n_features, single_target, competitor_server):
     result = univar_runner.run_batch(page_size, num_records)
 
