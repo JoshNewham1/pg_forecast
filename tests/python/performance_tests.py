@@ -690,7 +690,19 @@ def timescale_python_geometric_sut():
 def python_xgboost_sut(competitor_server, n_lags, n_features, single_target):
     sut = PythonWebServer()
     
-    sut._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features, "single_target": single_target})
+    sut._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features, "single_target": single_target, "incremental": False})
+
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
+
+@pytest.fixture
+def python_xgboost_incremental_sut(competitor_server, n_lags, n_features, single_target):
+    sut = PythonWebServer()
+    
+    sut._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features, "single_target": single_target, "incremental": True})
 
     yield sut
     try:
@@ -804,6 +816,7 @@ def test_univar_batch_insert(univar_runner, page_size, num_records, competitor_s
 
 MULTIVAR_CASES = [
     ("python_xgboost", "python_xgboost_sut"),
+    ("python_xgboost", "python_xgboost_incremental_sut"),
     ("python_xgboost", "pg_joinboost_sut_incremental"),
     ("python_xgboost", "pg_joinboost_sut_non_incremental"),
     ("python_xgboost", "ts_joinboost_sut"),

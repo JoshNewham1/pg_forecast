@@ -35,6 +35,8 @@ class State:
         self.n_lags = 5
         self.n_features = 50
         self.single_target = False
+        self.incremental = False
+        self.last_train_len = 0
 
 state = State()
 
@@ -105,6 +107,9 @@ class XGBTimeSeriesModel:
             n_target_features = math.ceil(len(features) / self.lags)
             y.append(values[t, :n_target_features])
 
+        if not X:
+            return np.array([]), np.array([])
+            
         self.n_lagged_features_ = len(X[0])
 
         return np.array(X), np.array(y)
@@ -179,6 +184,42 @@ class XGBTimeSeriesModel:
         
         return self.train_y - preds
 
+
+class XGBIncrementalTimeSeriesModel(XGBTimeSeriesModel):
+    """
+    Extends XGBTimeSeriesModel to support incremental / online learning.
+    Only adds new trees on new observations without retraining old ones.
+    """
+    def update(self, new_values: np.ndarray, n_new_trees: int = 10):
+        """
+        Incrementally train model with new data, adding trees only.
+        """
+        if self.model is None or self.train_X is None:
+            raise ValueError("Model not fitted yet. Call fit() first.")
+
+        # Convert new data into supervised format
+        X_new, y_new = self._make_supervised(new_values)
+        if len(X_new) == 0:
+            logger.warning("Not enough new data for incremental update")
+            return
+
+        # Add new trees starting from the existing model
+        # Note: XGBRegressor.fit with xgb_model adds trees to the existing booster
+        self.model.fit(
+            X_new,
+            y_new,
+            xgb_model=self.model.get_booster(),  # continue training
+            verbose=True
+        )
+
+        # Update training history for residuals
+        self.train_X = np.vstack([self.train_X, X_new])
+        self.train_y = np.vstack([self.train_y, y_new])
+
+        # Update last_window for rolling predictions
+        n_target = y_new.shape[1]
+        self.last_window = new_values[-self.lags :, :n_target]
+
 # -----------------------------
 # API models
 # -----------------------------
@@ -219,6 +260,7 @@ class Config(BaseModel):
     n_lags: int
     n_features: int
     single_target: bool = False
+    incremental: bool = False
 
 # -----------------------------
 # API endpoints
@@ -234,7 +276,8 @@ def set_config(config: Config):
     state.n_lags = config.n_lags
     state.n_features = config.n_features
     state.single_target = config.single_target
-    return {"status": "ok", "mode": state.mode, "n_lags": state.n_lags, "n_features": state.n_features, "single_target": state.single_target}
+    state.incremental = config.incremental
+    return {"status": "ok", "mode": state.mode, "n_lags": state.n_lags, "n_features": state.n_features, "single_target": state.single_target, "incremental": state.incremental}
 
 @app.post("/setup_single")
 def setup_single(records: List[Record]):
@@ -319,6 +362,7 @@ def teardown():
 def _reset_state():
     state.data = pd.DataFrame()
     state.model = None
+    state.last_train_len = 0
     logger.info("State reset")
 
 def _add_records(records: Union[list[Record], list[dict]]):
@@ -348,7 +392,7 @@ def _add_records(records: Union[list[Record], list[dict]]):
     df.replace("NULL", np.nan, inplace=True)
 
     # Forward fill (Last Observation Carried Forward)
-    df.fillna(method='ffill', inplace=True)
+    df.ffill(inplace=True)
 
     # Fill any remaining NaNs (at the start) with 0
     df.fillna(0.0, inplace=True)
@@ -356,19 +400,29 @@ def _add_records(records: Union[list[Record], list[dict]]):
     state.data = pd.concat([state.data, df], ignore_index=True)
 
 def _train():
-    logger.info(f"Training XGBoost on {len(state.data)} rows")
+    logger.info(f"Training XGBoost on {len(state.data)} rows (incremental={state.incremental})")
 
     feature_cols = [c for c in state.data.columns if c != "date" and c != "values"]
     values = state.data[feature_cols].astype(np.float32).to_numpy(copy=True)
 
-    # Reset model before retraining
-    state.model = XGBTimeSeriesModel(
-        state.n_lags,
-        state.n_features,
-        state.single_target
-    )
-    
-    state.model.fit(values)
+    if state.incremental and state.model is not None:
+        # Incremental update
+        if len(state.data) > state.last_train_len:
+            # We need at least lags + 1 data points to get new supervised samples
+            new_data_start = max(0, state.last_train_len - state.n_lags)
+            new_values = values[new_data_start:]
+            state.model.update(new_values)
+            state.last_train_len = len(state.data)
+    else:
+        # Full retrain or first fit
+        model_class = XGBIncrementalTimeSeriesModel if state.incremental else XGBTimeSeriesModel
+        state.model = model_class(
+            state.n_lags,
+            state.n_features,
+            state.single_target
+        )
+        state.model.fit(values)
+        state.last_train_len = len(state.data)
 
 
 # -----------------------------
