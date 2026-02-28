@@ -213,8 +213,12 @@ class BenchmarkRunner:
         self.rmse_losses = []
         self.msmape_losses = []
 
-    def get_forecast_value_from_response(self, f_entry, a_entry):
-        # Handle different forecast entry formats
+    def get_forecast_values_from_response(self, f_entry, a_entry) -> List[tuple[float, float]]:
+        """
+        Extracts (actual, forecast) pairs from entries. 
+        Supports both univariate and multivariate data.
+        """
+
         if isinstance(f_entry, dict):
             # PythonWebServer or JoinBoostSUT
             fv = f_entry.get("forecast_value")
@@ -275,7 +279,7 @@ class BenchmarkRunner:
             a_entry = actuals[i]
             
             # Extract forecast value
-            f_val, a_val = self.get_forecast_value_from_response(f_entry, a_entry)
+            f_val, a_val = self.get_forecast_values_from_response(f_entry, a_entry)
                 
             css += (f_val - a_val) ** 2
             
@@ -304,7 +308,7 @@ class BenchmarkRunner:
             f_entry = forecast[i]
             a_entry = actuals[i]
 
-            f_val, a_val = self.get_forecast_value_from_response(f_entry, a_entry)
+            f_val, a_val = self.get_forecast_values_from_response(f_entry, a_entry)
 
             numerator = abs(f_val - a_val)
             denom = max((abs(a_val) + abs(f_val)) / 2.0 + epsilon,
@@ -652,13 +656,10 @@ def pgforecast_timescale_sut():
         pass
 
 @pytest.fixture
-def python_sut(competitor_server, n_lags, n_features, single_target):
+def python_sut(competitor_server):
     sut = PythonWebServer()
     
-    if n_lags is not None and n_features is not None:
-        sut._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features, "single_target": single_target})
-    else:
-        sut.set_mode("naive")
+    sut.set_mode("naive")
 
     yield sut
     try:
@@ -679,6 +680,18 @@ def python_geometric_sut(competitor_server):
 @pytest.fixture
 def timescale_python_geometric_sut():
     sut = PgForecast(model_name="pyautoarima", with_timescale=True)
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
+
+@pytest.fixture
+def python_xgboost_sut(competitor_server, n_lags, n_features, single_target):
+    sut = PythonWebServer()
+    
+    sut._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features, "single_target": single_target})
+
     yield sut
     try:
         sut.teardown_single()
@@ -790,7 +803,7 @@ def test_univar_batch_insert(univar_runner, page_size, num_records, competitor_s
     assert result.metrics["avg_forecast"] > 0.0
 
 MULTIVAR_CASES = [
-    ("python_xgboost", "python_sut"),
+    ("python_xgboost", "python_xgboost_sut"),
     ("python_xgboost", "pg_joinboost_sut_incremental"),
     ("python_xgboost", "pg_joinboost_sut_non_incremental"),
     ("python_xgboost", "ts_joinboost_sut"),
@@ -798,7 +811,7 @@ MULTIVAR_CASES = [
 ]
 
 @pytest.mark.parametrize("competitor_server, sut", MULTIVAR_CASES, indirect=True)
-@pytest.mark.parametrize("page_size,num_records,n_lags,n_features,single_target", [(10_000, 100_000, 5, 5, True)])
+@pytest.mark.parametrize("page_size,num_records,n_lags,n_features,single_target", [(10_000, 1_000_000, 5, 5, True)])
 def test_univar_joinboost_batch_insert(univar_runner, page_size, num_records, n_lags, n_features, single_target, competitor_server):
     result = univar_runner.run_batch(page_size, num_records)
 
@@ -817,7 +830,7 @@ def test_univar_joinboost_batch_insert(univar_runner, page_size, num_records, n_
     assert result.metrics["avg_forecast"] > 0.0
 
 @pytest.mark.parametrize("competitor_server, sut", MULTIVAR_CASES, indirect=True)
-@pytest.mark.parametrize("page_size,num_records,n_lags,n_features,single_target", [(10_000, 50_000, 5, 50, False)])
+@pytest.mark.parametrize("page_size,num_records,n_lags,n_features,single_target", [(10_000, 100_000, 5, 50, False)])
 def test_multivar_batch_insert(multivar_runner, page_size, num_records, n_lags, n_features, single_target, competitor_server):
     result = multivar_runner.run_batch(page_size, num_records)
 

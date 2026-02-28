@@ -38,6 +38,11 @@ class QualifiedAttribute:
             return self.attribute_name == other
         return self.table_name == other.table_name and self.attribute_name == other.attribute_name
 
+    def __lt__(self, other):
+        if not isinstance(other, QualifiedAttribute):
+            return NotImplemented
+        return (self.table_name, self.attribute_name) < (other.table_name, other.attribute_name)
+
     def __hash__(self):
         return hash(self.__str__())
 

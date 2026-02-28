@@ -55,7 +55,7 @@ class PostgresExecutor(DuckdbExecutor):
             schema = self.conn.execute(text("""
                 SELECT column_name
                 FROM information_schema.columns
-                WHERE table_name = 'jb_tmp_0' AND table_schema = 'public'
+                WHERE table_name = 'jb_tmp_0' AND table_schema = current_schema()
                 ORDER BY ordinal_position
             """))
             cols = [r[0] for r in schema.fetchall()]

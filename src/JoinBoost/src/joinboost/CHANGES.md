@@ -46,6 +46,7 @@ and PostgreSQL support.
 **5. `aggregator.py` - CASE Expression Syntax Fix**
 - Added default `1=1` condition to `Aggregator.CASE` when the condition list is empty.
 - Prevents `psycopg2.errors.SyntaxError: syntax error at or near "THEN"` in PostgreSQL when a leaf node has no annotations (e.g., during initial training or specific tree structures).
+- Add `__lt__(self, other)` for `QualifiedAttribute` to prevent bug where this can't be added to the priority queue
 
 ---
 

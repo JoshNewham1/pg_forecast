@@ -51,7 +51,8 @@ class XGBTimeSeriesModel:
             max_depth=3,
             learning_rate=0.1,
             max_leaves=8,
-            max_bin=1000
+            max_bin=1000,
+            random_state=42
         )
         self.train_X = None
         self.train_y = None

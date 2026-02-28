@@ -277,6 +277,7 @@ def _add_records(records: List[Record]):
 
 def _train():
     logger.info(f"Training AutoARIMA on {len(state.data)} points")
+    np.random.seed(42)
     model = pm.auto_arima(
         state.data["value"],
         seasonal=False,

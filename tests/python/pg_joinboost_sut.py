@@ -26,7 +26,7 @@ LEARNING_RATE = 0.1
 NUM_LEAVES = 8
 DEPTH = 3
 ITERATIONS = 50
-INCREMENTAL_ITERATIONS = 50  # Number of trees to add per incremental update
+INCREMENTAL_ITERATIONS = 10  # Number of trees to add per incremental update
 
 class JoinBoostSUT:
     def __init__(self, model_name: str = "ts_joinboost", lags: int = 5, n_features: int = 50, predict_single_target: bool = False, is_incremental: bool = True):
