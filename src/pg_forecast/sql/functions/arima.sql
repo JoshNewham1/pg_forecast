@@ -282,7 +282,10 @@ BEGIN
     RETURN QUERY
         SELECT
             last_date + (i * forecast_step) AS forecast_date,
-            arr_forecasts[i] AS forecast_value
+            CASE
+                WHEN log_transform THEN POWER(10, arr_forecasts[i]) - 1
+                ELSE arr_forecasts[i]
+            END AS forecast_value
         FROM generate_series(1, horizon) AS i;
 END;
 $$ LANGUAGE plpgsql;
@@ -347,7 +350,7 @@ BEGIN
         SELECT
             last_date + (i * forecast_step) AS forecast_date,
             CASE
-                WHEN log_transform THEN POWER(10, arr_forecasts[i] - 1)
+                WHEN log_transform THEN POWER(10, arr_forecasts[i]) - 1
                 ELSE arr_forecasts[i]
             END AS forecast_value
         FROM generate_series(1, horizon) AS i;

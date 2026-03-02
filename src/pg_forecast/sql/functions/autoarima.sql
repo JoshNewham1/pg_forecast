@@ -109,7 +109,7 @@ BEGIN
     ) INTO v_skew;
 
     IF v_min_val >= 0 AND (v_std_dev / v_mean > 1) THEN
-        RAISE DEBUG 'Automatic log transform enabled';
+        RAISE DEBUG 'Automatic log transform enabled, CV = %', v_std_dev/v_mean;
         v_is_log := TRUE;
     END IF;
 
