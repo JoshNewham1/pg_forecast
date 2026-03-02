@@ -64,6 +64,7 @@ RETURNS autoarima_rec
 SECURITY DEFINER
 AS $$
 DECLARE
+    AUTO_LOG_CV_THRESHOLD DOUBLE PRECISION := 0.3;
     MAX_DIFF CONSTANT INT := 2;
     MAX_KPSS_TRIES CONSTANT INT := 3;
 
@@ -71,7 +72,7 @@ DECLARE
     v_std_dev DOUBLE PRECISION;
     v_mean DOUBLE PRECISION;
     n_vals INT;
-    v_skew DOUBLE PRECISION;
+    v_cv DOUBLE PRECISION;
     v_is_log BOOLEAN := FALSE;
     v_log_tmp_col TEXT;
 
@@ -102,14 +103,9 @@ BEGIN
         value_col, value_col, value_col, source_table
     ) INTO v_min_val, v_std_dev, v_mean, n_vals;
 
-    EXECUTE FORMAT(
-        'SELECT COALESCE(SUM(POWER(%I - %L, 3))/%L / NULLIF(POWER(%L, 3), 0), 0)
-        FROM %I',
-        value_col, v_mean, n_vals, v_std_dev, source_table
-    ) INTO v_skew;
-
-    IF v_min_val >= 0 AND (v_std_dev / v_mean > 1) THEN
-        RAISE DEBUG 'Automatic log transform enabled, CV = %', v_std_dev/v_mean;
+    v_cv := COALESCE(v_std_dev / NULLIF(v_mean, 0.0), 0.0);
+    IF v_min_val >= 0 AND v_cv > AUTO_LOG_CV_THRESHOLD THEN
+        RAISE DEBUG 'Automatic log transform enabled';
         v_is_log := TRUE;
     END IF;
 

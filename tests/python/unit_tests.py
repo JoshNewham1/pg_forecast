@@ -169,7 +169,7 @@ def arima_forecast_query(last_vals: list[float], last_residuals: list[float], p:
                                       p=p, q=q, c=c, phi=phi, theta=theta, horizon=horizon)
 
 
-def arima_query(p: int, d: int, q: int, horizon: int, include_mean=True, optimiser="Nelder-Mead", table="pg_forecast_unit_test"):
+def arima_query(p: int, d: int, q: int, horizon: int, include_mean=True, optimiser="Nelder-Mead", log_transform=False, table="pg_forecast_unit_test"):
     """
     Build a SQLAlchemy text query to call arima on pg_forecast_unit_test.
     """
@@ -184,10 +184,11 @@ def arima_query(p: int, d: int, q: int, horizon: int, include_mean=True, optimis
             date_col := 't',
             value_col := 'value',
             include_mean := {include_mean},
-            optimiser := '{optimiser}'
+            optimiser := '{optimiser}',
+            log_transform := :logt
         )
     """
-    return text(query_str).bindparams(p=p, q=q, d=d, horizon=horizon)
+    return text(query_str).bindparams(p=p, q=q, d=d, horizon=horizon, logt=log_transform)
 
 
 def assert_close(actual, expected, tolerance=1e-3, name="value"):
@@ -755,9 +756,11 @@ def test_autoarima_matches_manual_arima_on_differenced_series(test_engine):
     setup_nonstationary_dataset(test_engine)
 
     with test_engine.connect() as conn:
-        # Step 1: Train AutoARIMA to get optimum p, d, q
+        horizon = 4
+
+        # Step 1: Train AutoARIMA to get optimum p, d, q, c, use_log_transform
         auto_query = text("""
-            SELECT p, d, q
+            SELECT p, d, q, c, use_log_transform
             FROM autoarima_train(
                 source_table := 'pg_forecast_unit_test',
                 date_col := 't',
@@ -765,36 +768,29 @@ def test_autoarima_matches_manual_arima_on_differenced_series(test_engine):
             );
         """)
         auto_result = conn.execute(auto_query).fetchone()
-        auto_p, auto_d, auto_q = auto_result
+        auto_p, auto_d, auto_q, auto_c, auto_use_log = auto_result
+        conn.commit()
 
         assert auto_d > 0, "AutoARIMA found undifferenced forecast, d = " + str(auto_d)
 
-        # Step 2: Get AutoARIMA forecast
-        horizon = 4
+        # Step 2: Get AutoARIMA forecast via autoarima_train_and_forecast
+        # This retrains using the best parameters found above
         auto_forecast_query = text("""
-            SELECT create_forecast(
-                model_name := 'autoarima',
-                input_table := 'pg_forecast_unit_test',
-                date_column := 't',
-                value_column := 'value'
-            );
             SELECT forecast_value
-            FROM run_forecast(
-                model_name := 'autoarima',
-                input_table := 'pg_forecast_unit_test',
-                date_column := 't',
-                value_column := 'value',
-                horizon := :horizon
+            FROM autoarima_train_and_forecast(
+                horizon := :horizon,
+                source_table := 'pg_forecast_unit_test',
+                date_col := 't',
+                value_col := 'value'
             );
-        """).bindparams(
-            horizon=horizon
-        )
+        """).bindparams(horizon=horizon)
         auto_forecast = conn.execute(auto_forecast_query).fetchall()
         auto_forecast = [row[0] for row in auto_forecast]  # extract floats
 
-        # Step 3: Train and forecast manually using ARIMA with same parameters
+        # Step 3: Train and forecast manually using manual ARIMA with same parameters
+        include_mean = auto_c != 0
         manual_query = arima_query(
-            p=auto_p, d=auto_d, q=auto_q, horizon=horizon, include_mean=True, optimiser="L-BFGS"
+            p=auto_p, d=auto_d, q=auto_q, horizon=horizon, include_mean=include_mean, optimiser="L-BFGS", log_transform=auto_use_log
         )
         manual_forecast = [row[1] for row in conn.execute(manual_query).fetchall()]
 
