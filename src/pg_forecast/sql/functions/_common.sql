@@ -70,8 +70,9 @@ BEGIN
         EXECUTE format(
             'SELECT 
                 m.id,
+                m.use_log_transform,
                 a.d, a.c, 
-                a.phi, a.theta, 
+                a.phi, a.theta,
                 (a.incremental_state).p,
                 (a.incremental_state).q,
                 (a.incremental_state).e_lags AS residuals,
@@ -102,7 +103,8 @@ BEGIN
                     date_column,
                     value_column,
                     horizon,
-                    forecast_step
+                    forecast_step,
+                    rec_model.use_log_transform
                 )
         RETURN;
     ELSIF model_name = 'pyautoarima' THEN
@@ -245,26 +247,33 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE FUNCTION series_to_array(
+CREATE OR REPLACE FUNCTION series_to_array(
     source_table TEXT,
     date_col TEXT,
     value_col TEXT,
-    drop_nulls BOOLEAN DEFAULT FALSE
+    drop_nulls BOOLEAN DEFAULT FALSE,
+    log_transform BOOLEAN DEFAULT FALSE
 ) RETURNS DOUBLE PRECISION[] AS $$
-DECLARE arr DOUBLE PRECISION[];
+DECLARE
+    arr DOUBLE PRECISION[];
+    value_expr TEXT := format('%I', value_col);
+    where_clause TEXT := 'WHERE 1=1';
 BEGIN
-    IF drop_nulls THEN
-        EXECUTE format(
-            'SELECT array_agg(%I ORDER BY %I) FROM %I WHERE %I IS NOT NULL',
-            value_col, date_col, source_table, value_col
-        ) INTO arr;
-    ELSE
-        EXECUTE format(
-            'SELECT array_agg(%I ORDER BY %I) FROM %I',
-            value_col, date_col, source_table
-        ) INTO arr;
+    IF log_transform THEN
+        -- Add 1 to avoid log(0)
+        value_expr := format('LOG(%I + 1)', value_col);
     END IF;
 
+    IF drop_nulls THEN
+        where_clause := format('WHERE %I IS NOT NULL', value_col);
+    END IF;
+
+    EXECUTE format(
+        'SELECT array_agg(%s ORDER BY %I) FROM %I %s',
+        value_expr, date_col, source_table, value_col, where_clause
+    ) INTO arr;
+
+    -- Handle empty result
     IF arr IS NULL OR cardinality(arr) = 0 THEN
         RAISE EXCEPTION 'ARIMA: no data found in % for columns %, %',
             source_table, date_col, value_col;

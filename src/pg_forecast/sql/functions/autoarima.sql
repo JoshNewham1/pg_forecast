@@ -16,7 +16,8 @@ CREATE TYPE autoarima_rec AS (
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
     css DOUBLE PRECISION,
-    aicc DOUBLE PRECISION
+    aicc DOUBLE PRECISION,
+    use_log_transform BOOLEAN -- To pass to other functions
 );
 
 /* -------------------------------------------------------------------------
@@ -66,8 +67,15 @@ DECLARE
     MAX_DIFF CONSTANT INT := 2;
     MAX_KPSS_TRIES CONSTANT INT := 3;
 
-    arr_vals DOUBLE PRECISION[];
+    v_min_val DOUBLE PRECISION;
+    v_std_dev DOUBLE PRECISION;
+    v_mean DOUBLE PRECISION;
     n_vals INT;
+    v_skew DOUBLE PRECISION;
+    v_is_log BOOLEAN := FALSE;
+    v_log_tmp_col TEXT;
+
+    arr_vals DOUBLE PRECISION[];
     arr_diff_vals DOUBLE PRECISION[];
     v_p INT;
     v_d INT := 0;
@@ -86,10 +94,27 @@ DECLARE
 BEGIN
     -- Safety precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
-    -- Aggregate the series into an array, dropping NULLs
-    arr_vals := series_to_array(source_table, date_col, value_col, TRUE);
 
-    n_vals := array_length(arr_vals, 1);
+    -- Log transform if appropriate
+    EXECUTE FORMAT(
+        'SELECT MIN(%I) AS min_val, STDDEV_POP(%I) AS std_dev, AVG(%I) AS mean, COUNT(1) AS n
+        FROM %I',
+        value_col, value_col, value_col, source_table
+    ) INTO v_min_val, v_std_dev, v_mean, n_vals;
+
+    EXECUTE FORMAT(
+        'SELECT COALESCE(SUM(POWER(%I - %L, 3))/%L / NULLIF(POWER(%L, 3), 0), 0)
+        FROM %I',
+        value_col, v_mean, n_vals, v_std_dev, source_table
+    ) INTO v_skew;
+
+    IF v_min_val >= 0 AND (v_std_dev / v_mean > 1) THEN
+        RAISE DEBUG 'Automatic log transform enabled';
+        v_is_log := TRUE;
+    END IF;
+
+    -- Aggregate the series into an array, dropping NULLs
+    arr_vals := series_to_array(source_table, date_col, value_col, TRUE, v_is_log);
 
     -- Determine the number of differences with repeated KPSS tests
     arr_diff_vals := arr_vals;
@@ -123,12 +148,12 @@ BEGIN
             (0, 0), (2, 2), (1, 0), (0, 1)
         ) AS m(p, q)
     LOOP
-        trained := arima_train(rec_candidate.p, v_d, rec_candidate.q, source_table, date_col, value_col, include_c, TRUE);
+        trained := arima_train(rec_candidate.p, v_d, rec_candidate.q, source_table, date_col, value_col, include_c, TRUE, v_is_log);
         n_params := autoarima_param_count(rec_candidate.p, rec_candidate.q, include_c);
         model_aicc := aicc(trained.css, rec_candidate.p, rec_candidate.q, n_params, n_vals);
 
         INSERT INTO tmp_autoarima (
-            p, d, q, c, phi, theta, css, aicc
+            p, d, q, c, phi, theta, css, aicc, use_log_transform
         ) VALUES (
             rec_candidate.p,
             v_d,
@@ -137,20 +162,21 @@ BEGIN
             trained.phi,
             trained.theta,
             trained.css,
-            model_aicc
+            model_aicc,
+            v_is_log
         );
     END LOOP;
 
     -- If d <= 1, ARIMA(0, d, 0) without a constant is also fitted
     IF v_d <= 1 THEN
-        trained := arima_train(0, v_d, 0, source_table, date_col, value_col, FALSE, TRUE);
+        trained := arima_train(0, v_d, 0, source_table, date_col, value_col, FALSE, TRUE, v_is_log);
         n_params := 0;
         model_aicc := aicc(trained.css, 0, 0, n_params, n_vals);
 
         INSERT INTO tmp_autoarima (
-            p, d, q, c, phi, theta, css, aicc
+            p, d, q, c, phi, theta, css, aicc, use_log_transform
         ) VALUES (
-            0, v_d, 0, 0, trained.phi, trained.theta, trained.css, model_aicc
+            0, v_d, 0, 0, trained.phi, trained.theta, trained.css, model_aicc, v_is_log
         );
     END IF;
 
@@ -188,15 +214,15 @@ BEGIN
             );
 
             RAISE DEBUG 'AutoARIMA: Training ARIMA(%, %, %)', v_p, v_d, v_q;
-            trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, include_c, TRUE);
+            trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, include_c, TRUE, v_is_log);
             n_params := autoarima_param_count(v_p, v_q, include_c);
             model_aicc := aicc(trained.css, v_p, v_q, n_params, n_vals);
             RAISE DEBUG 'AutoARIMA: Trained ARIMA(%, %, %) with CSS % and AICc %', v_p, v_d, v_q, trained.css, model_aicc;
 
             INSERT INTO tmp_autoarima (
-                p, d, q, c, phi, theta, css, aicc
+                p, d, q, c, phi, theta, css, aicc, use_log_transform
             ) VALUES (
-                v_p, v_d, v_q, trained.c, trained.phi, trained.theta, trained.css, model_aicc
+                v_p, v_d, v_q, trained.c, trained.phi, trained.theta, trained.css, model_aicc, v_is_log
             );
 
             IF model_aicc < best_aicc THEN
@@ -210,15 +236,15 @@ BEGIN
         v_q := rec_current.q;
 
         RAISE DEBUG 'AutoARIMA: Training ARIMA(%, %, %)', v_p, v_d, v_q;
-        trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, NOT include_c, TRUE);
+        trained := arima_train(v_p, v_d, v_q, source_table, date_col, value_col, NOT include_c, TRUE, v_is_log);
         n_params := autoarima_param_count(v_p, v_q, NOT include_c);
         model_aicc := aicc(trained.css, v_p, v_q, n_params, n_vals);
         RAISE DEBUG 'AutoARIMA: Trained ARIMA(%, %, %) with phi = %, theta = %', v_p, v_d, v_q, trained.phi, trained.theta;
 
         INSERT INTO tmp_autoarima (
-            p, d, q, c, phi, theta, css, aicc
+            p, d, q, c, phi, theta, css, aicc, use_log_transform
         ) VALUES (
-            v_p, v_d, v_q, trained.c, trained.phi, trained.theta, trained.css, model_aicc
+            v_p, v_d, v_q, trained.c, trained.phi, trained.theta, trained.css, model_aicc, v_is_log
         );
 
         SELECT *
@@ -235,12 +261,13 @@ BEGIN
     END LOOP;
 
     -- Create entry in models & stats tables to incrementally update CSS
-    INSERT INTO models("model_type", "input_table", "date_column", "value_column")
+    INSERT INTO models("model_type", "input_table", "date_column", "value_column", "use_log_transform")
     VALUES (
         'autoarima'::model,
         source_table,
         date_col,
-        value_col
+        value_col,
+        v_is_log
     )
     ON CONFLICT (model_type, input_table, date_column, value_column)
     DO UPDATE SET model_type = models.model_type  -- No op
@@ -249,7 +276,7 @@ BEGIN
 
     -- Get starting incremental state (from every value in the table)
     RAISE DEBUG 'Best model: ARIMA(%, %, %) with phi = %, theta = %, CSS = %', rec_current.p, rec_current.d, rec_current.q, rec_current.phi, rec_current.theta, rec_current.css;
-    v_incremental_state := css_incremental_full_table(source_table, value_col, date_col, rec_current.phi, rec_current.theta, rec_current.c, rec_current.d);
+    v_incremental_state := css_incremental_full_table(source_table, value_col, date_col, rec_current.phi, rec_current.theta, rec_current.c, rec_current.d, v_is_log);
 
     -- Deactivate any existing models
     UPDATE model_arima_stats
@@ -304,6 +331,6 @@ BEGIN
     SELECT * FROM 
     arima_train_and_forecast(best_model.p, best_model.d, best_model.q,
                             horizon, source_table, date_col, value_col,
-                            include_mean);
+                            include_mean, best_model.use_log_transform);
 END;
 $$ LANGUAGE plpgsql;

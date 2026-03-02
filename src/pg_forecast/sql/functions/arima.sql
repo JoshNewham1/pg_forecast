@@ -169,6 +169,7 @@ CREATE OR REPLACE FUNCTION arima_train(
     value_col TEXT,    -- Numerical value column
     include_mean BOOLEAN DEFAULT TRUE,
     silent_error BOOLEAN DEFAULT FALSE,
+    log_transform BOOLEAN DEFAULT FALSE,
     optimiser TEXT DEFAULT 'L-BFGS'
 )
 RETURNS arima_optimise_result AS $$
@@ -180,7 +181,7 @@ BEGIN
     v_ncond := GREATEST(p, q);
 
     -- Aggregate the series into an array, dropping NULLs
-    arr_vals := series_to_array(source_table, date_col, value_col, TRUE);
+    arr_vals := series_to_array(source_table, date_col, value_col, TRUE, log_transform);
 
     IF d > 0 THEN
         arr_vals := arima_difference(arr_vals, d);
@@ -213,6 +214,7 @@ CREATE OR REPLACE FUNCTION arima_train_and_forecast(
     date_col TEXT,     -- Timestamp column
     value_col TEXT,    -- Numerical value column
     include_mean BOOLEAN DEFAULT TRUE,
+    log_transform BOOLEAN DEFAULT FALSE,
     optimiser TEXT DEFAULT 'L-BFGS',
     forecast_step INTERVAL DEFAULT '1 day'
 )
@@ -231,7 +233,7 @@ BEGIN
     v_ncond := GREATEST(p, q);
 
     -- Aggregate the series into an array, dropping NULLs
-    arr_vals := series_to_array(source_table, date_col, value_col, TRUE);
+    arr_vals := series_to_array(source_table, date_col, value_col, TRUE, log_transform);
 
     IF d > 0 THEN
         arr_initial_vals := arr_vals[1:d];
@@ -294,7 +296,8 @@ CREATE OR REPLACE FUNCTION arima_run_forecast(
     date_col TEXT,     -- Timestamp column
     value_col TEXT,    -- Numerical value column
     horizon INT,
-    forecast_step INTERVAL
+    forecast_step INTERVAL,
+    log_transform BOOLEAN
 )
 RETURNS TABLE(forecast_date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
 DECLARE
@@ -310,7 +313,7 @@ BEGIN
     v_ncond := GREATEST(p, q);
 
     -- Aggregate the series into an array, dropping NULLs
-    arr_vals := series_to_array(source_table, date_col, value_col, TRUE);
+    arr_vals := series_to_array(source_table, date_col, value_col, TRUE, log_transform);
 
     IF d > 0 THEN
         arr_initial_vals := arr_vals[1:d];
@@ -343,7 +346,10 @@ BEGIN
     RETURN QUERY
         SELECT
             last_date + (i * forecast_step) AS forecast_date,
-            arr_forecasts[i] AS forecast_value
+            CASE
+                WHEN log_transform THEN POWER(10, arr_forecasts[i] - 1)
+                ELSE arr_forecasts[i]
+            END AS forecast_value
         FROM generate_series(1, horizon) AS i;
 END;
 $$ LANGUAGE plpgsql;
@@ -384,20 +390,28 @@ CREATE OR REPLACE FUNCTION css_incremental_full_table(
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
     c DOUBLE PRECISION DEFAULT 0, -- 0 if no constant term required
-    d INT DEFAULT 0
+    d INT DEFAULT 0,
+    log_transform BOOLEAN DEFAULT FALSE
 )
 RETURNS css_incremental_state AS $$
 DECLARE
-    v_query TEXT;
+    value_expr TEXT;
     rec_state RECORD;
 BEGIN
+    IF log_transform THEN
+        -- Add 1 to avoid log(0)
+        value_expr := format('LOG(%I + 1)', value_col);
+    ELSE
+        value_expr := format('%I', value_col);
+    END IF;
+
     EXECUTE format(
-        'SELECT (css_incremental(%I, %L, %L, %L, %L) OVER (ORDER BY %I)) AS s
+        'SELECT (css_incremental(%s, %L, %L, %L, %L) OVER (ORDER BY %I)) AS s
          FROM %I
          ORDER BY %I DESC
          LIMIT 1',
 
-        value_col, phi, theta, c, d, date_col,
+        value_expr, phi, theta, c, d, date_col,
         source_table, date_col, date_col
     ) INTO rec_state;
     RAISE DEBUG 'Incremental CSS: %', (rec_state.s).css;
@@ -459,6 +473,7 @@ BEGIN
         m.input_table,
         m.value_column,
         m.date_column,
+        m.use_log_transform,
         s.*
     INTO rec_centre
     FROM model_arima_stats s
@@ -490,7 +505,7 @@ BEGIN
                 (CASE WHEN v_theta[i - cardinality(v_phi)] >= 0 THEN tolerance ELSE -tolerance END);
         END IF;
 
-        v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new, rec_centre.c, rec_centre.d);
+        v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new, rec_centre.c, rec_centre.d, rec_centre.use_log_transform);
 
         INSERT INTO arima_vertices(arima_id, vertex_id, phi, theta, incremental_state)
         VALUES (centre_id, i, v_phi_new, v_theta_new, v_state_new);
@@ -515,7 +530,7 @@ BEGIN
     SELECT COALESCE(array_agg(val * v_scale_factor), '{}') INTO v_theta_new 
     FROM unnest(v_theta) val;
 
-    v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new, rec_centre.c, rec_centre.d);
+    v_state_new := css_incremental_full_table(rec_centre.input_table, rec_centre.value_column, rec_centre.date_column, v_phi_new, v_theta_new, rec_centre.c, rec_centre.d, rec_centre.use_log_transform);
 
     INSERT INTO arima_vertices(arima_id, vertex_id, phi, theta, incremental_state)
     VALUES (centre_id, v_d+1, v_phi_new, v_theta_new, v_state_new);
@@ -526,6 +541,7 @@ CREATE OR REPLACE FUNCTION arima_updated_states(
     target_model_id BIGINT,
     new_ys DOUBLE PRECISION[],
     arima_id BIGINT,
+    log_transform BOOLEAN,
     OUT vertex_id BIGINT,
     OUT new_state css_incremental_state
 )
@@ -546,7 +562,12 @@ AS $$
         WHERE v.arima_id = arima_id
     ),
     ys AS (
-        SELECT y, ord
+        SELECT
+            CASE
+                WHEN log_transform THEN LOG(y + 1)
+                ELSE y 
+            END AS y,
+            ord
         FROM unnest(new_ys) WITH ORDINALITY AS u(y, ord)
     ),
     recurse AS (
@@ -611,7 +632,7 @@ BEGIN
     -- and we don't mistakenly calculate t+1 ahead when querying again (further down)
     CREATE TEMP TABLE tmp_arima_states ON COMMIT DROP AS
     SELECT vertex_id, new_state
-    FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id);
+    FROM arima_updated_states(target_model_id, new_ys, rec_model.arima_id, rec_model.use_log_transform);
 
     SELECT (new_state).css INTO v_centre_css FROM tmp_arima_states WHERE vertex_id IS NULL;
     SELECT MIN((new_state).css) INTO v_min_vertex_css FROM tmp_arima_states WHERE vertex_id IS NOT NULL;
