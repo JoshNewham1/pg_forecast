@@ -283,7 +283,10 @@ BEGIN
         SELECT
             last_date + (i * forecast_step) AS forecast_date,
             CASE
-                WHEN log_transform THEN POWER(10, arr_forecasts[i]) - 1
+                WHEN log_transform AND arr_forecasts[i] <= 308 AND arr_forecasts[i] >= -308
+                    THEN POWER(10, arr_forecasts[i]) - 1
+                WHEN log_transform THEN -- Out of bounds
+                    'Infinity'::DOUBLE PRECISION
                 ELSE arr_forecasts[i]
             END AS forecast_value
         FROM generate_series(1, horizon) AS i;
@@ -350,7 +353,10 @@ BEGIN
         SELECT
             last_date + (i * forecast_step) AS forecast_date,
             CASE
-                WHEN log_transform THEN POWER(10, arr_forecasts[i]) - 1
+                WHEN log_transform AND arr_forecasts[i] <= 308 AND arr_forecasts[i] >= -308
+                    THEN POWER(10, arr_forecasts[i]) - 1
+                WHEN log_transform THEN -- Out of bounds
+                    'Infinity'::DOUBLE PRECISION
                 ELSE arr_forecasts[i]
             END AS forecast_value
         FROM generate_series(1, horizon) AS i;
