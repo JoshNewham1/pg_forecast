@@ -824,6 +824,23 @@ MULTIVAR_CASES = [
 ]
 
 @pytest.mark.parametrize("competitor_server, sut", MULTIVAR_CASES, indirect=True)
+@pytest.mark.parametrize("num_records,n_lags,n_features,single_target", [(10_000, 1, 10, True)])
+def test_multivar_single_insert(multivar_runner, num_records, n_lags, n_features, single_target, competitor_server):
+    result = multivar_runner.run_single(num_records)
+
+    # Type & structure
+    assert isinstance(result, BenchmarkResult)
+    assert isinstance(result.metrics, dict)
+
+    # Derived expectations
+    assert len(result.insert_timings) == num_records
+
+    assert result.metrics["avg_insert"] is not None
+    assert result.metrics["avg_insert"] > 0.0
+    assert result.metrics["avg_forecast"] is not None
+    assert result.metrics["avg_forecast"] > 0.0
+
+@pytest.mark.parametrize("competitor_server, sut", MULTIVAR_CASES, indirect=True)
 @pytest.mark.parametrize("page_size,num_records,n_lags,n_features,single_target", [(10_000, 1_000_000, 5, 5, True)])
 def test_univar_joinboost_batch_insert(univar_runner, page_size, num_records, n_lags, n_features, single_target, competitor_server):
     result = univar_runner.run_batch(page_size, num_records)
