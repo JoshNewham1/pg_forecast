@@ -5,6 +5,7 @@ from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, Any, List
 import types
+from decimal import Decimal
 
 import pandas as pd
 
@@ -503,6 +504,8 @@ class DuckdbExecutor(Executor):
         result = None
         try:
             result = self.conn.fetchall()
+            if result:
+                result = [tuple(float(v) if isinstance(v, Decimal) else v for v in row) for row in result]
             if self.debug:
                 print(result)
         except Exception as e:

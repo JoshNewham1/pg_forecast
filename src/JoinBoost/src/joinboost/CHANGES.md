@@ -199,6 +199,11 @@ self.cjt.exe._execute_query(f"UPDATE {target_relation} SET {update_exp}")
 
 **Result**: Only 50 UPDATEs per batch (one per tree), reducing row versions 8x. Fit times became nearly constant: 7-8s across all batches.
 
+**6. `executor.py` & `app.py` - DuckDB Performance & Robustness**
+- Added `float()` cast to `DecisionTree._build_model` and `GradientBoosting._update_error` to handle `Decimal` types returned by DuckDB.
+- Modified `DuckdbExecutor._execute_query` to automatically convert `Decimal` values in result rows to `float`.
+- Improved compatibility with DuckDB's aggregate return types, preventing `TypeError` during training.
+
 ---
 
 ### CASE Expression Syntax Fix (`aggregator.py`)
@@ -220,3 +225,13 @@ if not conds:
 **Problem**: Multivariate datasets (like `wind_farms_minutely`) contain `'NULL'` strings for missing values. The benchmark runner's loss calculation failed with `ValueError: could not convert string to float: 'NULL'`.
 
 **Solution**: Added explicit checks for `'NULL'` strings in `get_forecast_value_from_response` to treat them as `0.0`. This prevents crashes during long-running performance benchmarks when encountering sparse data.
+
+### DuckDB Performance & Robustness (`executor.py`, `app.py`)
+
+**Problem**: DuckDB returns `decimal.Decimal` types for certain aggregate operations (like `SUM` or `AVG` on high-precision columns). JoinBoost's Python logic sometimes expects `float`, leading to `TypeError: unsupported operand type(s) for *: 'decimal.Decimal' and 'float'`.
+
+**Solution**: 
+1.  In `executor.py`, the `DuckdbExecutor._execute_query` now traverses result rows and converts any `Decimal` instances to `float`.
+2.  In `app.py`, explicit `float()` casts were added when computing leaf predictions (`g / h`) to ensure downstream multiplication with `learning_rate` (a `float`) succeeds.
+
+**Why?** This ensures JoinBoost works seamlessly with DuckDB regardless of the input data types, while maintaining the precision of DuckDB's internal calculations until the results are needed in Python.

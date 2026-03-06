@@ -14,10 +14,13 @@ import logging
 import duckdb
 import math
 import shutil
+import time
+import re
 
 from joinboost.joingraph import JoinGraph
 from joinboost.app import DecisionTree, GradientBoosting
 from joinboost.aggregator import agg_to_sql
+from joinboost.executor import DuckdbExecutor
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -31,6 +34,33 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+class OptimizedDuckdbExecutor(DuckdbExecutor):
+    def _execute_query(self, q):
+        # CTAS Rewrite for DuckDB (performs CASE in memory instead of in UPDATE)
+        # DuckDB UPDATE is slow, CTAS is fast.
+        if "UPDATE" in q.upper() and "SET S =" in q.upper():
+            # Extract the math inside the UPDATE statement
+            start_case = q.upper().find("(CASE")
+            if start_case != -1:
+                case_statement = q[start_case:].rstrip("; \n")
+                # Find table name: UPDATE <table_name> SET
+                parts = q.split()
+                try:
+                    update_idx = next(i for i, p in enumerate(parts) if p.upper() == "UPDATE")
+                    table_name = parts[update_idx + 1]
+                    
+                    # Get column names (excluding s)
+                    cols = [col[1] for col in self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
+                    non_s_cols = [c for c in cols if c.lower() != "s"]
+                    select_cols = ", ".join(non_s_cols)
+                    
+                    new_q = f"CREATE TABLE {table_name}_new AS SELECT {select_cols}, s - {case_statement} AS s FROM {table_name}; DROP TABLE {table_name}; ALTER TABLE {table_name}_new RENAME TO {table_name};"
+                    return self.conn.execute(new_q)
+                except Exception as e:
+                    logger.error(f"CTAS optimization failed: {e}")
+        
+        return super()._execute_query(q)
 
 # -----------------------------
 # In-memory application state
@@ -51,6 +81,7 @@ class State:
         self.single_target = False
         # DuckDB connection
         self.con = duckdb.connect(database=':memory:')
+        self.executor = OptimizedDuckdbExecutor(self.con)
 
 state = State()
 
@@ -71,6 +102,7 @@ class JoinBoostTimeSeriesModel:
 
     def fit(self, df: pd.DataFrame):
         # Prepare data with lags
+        t_start = time.perf_counter()
         
         # Identify feature columns (everything except date)
         # In the input df, 'values' contains the target(s) if it exists.
@@ -128,96 +160,130 @@ class JoinBoostTimeSeriesModel:
         table_name = "train_data"
         self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
         self.con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM lagged_data_view")
+        t_prepare = time.perf_counter()
         
         # Train a model for each target column
         for target in self.target_cols:
             logger.info(f"Training JoinBoost model for target {target} with features {self.feature_cols_used}")
             
             # Create JoinGraph
-            dataset = JoinGraph(self.con)
+            dataset = JoinGraph(state.executor)
             
             dataset.add_relation(table_name, self.feature_cols_used, y=target)
             
             # Train
             # Using GradientBoosting
             reg = GradientBoosting(learning_rate=LEARNING_RATE, max_depth=DEPTH, n_estimators=ITERATIONS, num_leaves=NUM_LEAVES)
-            reg.fit(dataset)
+            reg.fit(dataset, skip_preprocess=True)
             
             self.models[target] = reg
+        
+        t_train = time.perf_counter()
+        logger.info(f"JoinBoost Fit complete: prepare={t_prepare-t_start:.4f}s, train={t_train-t_prepare:.4f}s")
             
         # Store last window for prediction
         # We need the last 'lags' rows of the original dataframe
         self.last_window = df.iloc[-self.lags:].copy()
 
     def predict(self, n_periods: int):
-        preds = []
+        t_start = time.perf_counter()
+        if not self.target_cols:
+            return []
         
-        # We need a working copy of history that we append predictions to
-        # history needs to contain the target columns
-        current_history = self.last_window.copy()
+        # Optimization: use recursive CTE for efficiency
+        # Combine all targets' SQLs
+        target_case_sqls = {}
+        all_lags = {}  # col -> max_lag
         
-        for _ in range(n_periods):
-            # Construct feature row for t+1
-            row_dict = {}
-            for col in self.target_cols:
-                for i in range(1, self.lags + 1):
-                    # history[-1] is t, history[-2] is t-1
-                    # lag_1 is t => -1
-                    # lag_i is -i
-                    if len(current_history) < i:
-                         # Should not happen if self.lags is correct
-                         val = 0.0
-                    else:
-                        val = current_history.iloc[-i][col]
-                    col_name = f"{col}_lag_{i}"
-                    row_dict[col_name] = val
+        for target, model in self.models.items():
+            pred_agg = model.get_prediction_aggregate()
+            # DuckDB is fine with AS DOUBLE (which JoinBoost emits by default)
+            case_sql = agg_to_sql(pred_agg, qualified=False)
+            target_case_sqls[target] = case_sql
             
-            # Filter features
-            # We only keep features that are in self.feature_cols_used
-            # But we must ensure they are present in row_dict
+            for feat in re.findall(r'\b[a-z0-9_]+_lag_\d+\b', case_sql):
+                parts = feat.split('_lag_')
+                col_name = parts[0]
+                lag_num = int(parts[1])
+                all_lags[col_name] = max(all_lags.get(col_name, 0), lag_num)
+        
+        required_features = sorted([f"{c}_lag_{i}" for c, m in all_lags.items() for i in range(1, m + 1)])
+        
+        # seed data from self.last_window
+        df_seed = self.last_window.copy()
+        df_seed.columns = [c.lower() for c in df_seed.columns]
+        
+        # Construct seed SQL
+        last_row = df_seed.iloc[-1]
+        seed_vals = [f"CAST('{last_row['date']}' AS TIMESTAMP) as date"]
+        for target in self.target_cols:
+             seed_vals.append(f"CAST({last_row[target]} AS DOUBLE) as {target}")
+        
+        for feat in required_features:
+            parts = feat.split('_lag_')
+            col = parts[0]
+            lag = int(parts[1])
+            val = df_seed.iloc[-1 - lag][col] if lag < len(df_seed) else 0.0
+            seed_vals.append(f"CAST({val} AS DOUBLE) as {feat}")
+        
+        seed_sql = f"SELECT {', '.join(seed_vals)}, 0 as step"
+        
+        if len(df_seed) >= 2:
+            step_interval = pd.to_datetime(df_seed.iloc[-1]['date']) - pd.to_datetime(df_seed.iloc[-2]['date'])
+            interval_str = f"INTERVAL '{int(step_interval.total_seconds())} seconds'"
+        else:
+            interval_str = "INTERVAL '1 day'"
             
-            # Add dummy target columns
-            for target in self.target_cols:
-                row_dict[target] = 0.0
+        recursive_cols = [f"date + {interval_str}"]
+        for target in self.target_cols:
+             recursive_cols.append(f"({target_case_sqls[target]})")
+        
+        for feat in required_features:
+            parts = feat.split('_lag_')
+            col = parts[0]
+            lag = int(parts[1])
+            if col in self.target_cols:
+                if lag == 1:
+                    recursive_cols.append(col)
+                else:
+                    recursive_cols.append(f"{col}_lag_{lag-1}")
+            else:
+                recursive_cols.append(feat)
+        
+        recursive_cols.append("step + 1")
+        
+        col_names = ["date"] + self.target_cols + required_features + ["step"]
+        recursive_select = ", ".join([f"{c} as {n}" for c, n in zip(recursive_cols, col_names)])
+        
+        full_sql = f"""
+        WITH RECURSIVE forecast_cte AS (
+            ({seed_sql})
+            UNION ALL
+            SELECT {recursive_select}
+            FROM forecast_cte
+            WHERE step < {n_periods}
+        )
+        SELECT * FROM forecast_cte WHERE step > 0 ORDER BY step ASC;
+        """
+        
+        try:
+            res = self.con.execute(full_sql).df()
             
-            pred_df = pd.DataFrame([row_dict])
+            preds = []
+            for _, row in res.iterrows():
+                step_preds = {}
+                for target in self.target_cols:
+                    step_preds[target] = float(row[target])
+                preds.append(step_preds)
             
-            # Register for prediction
-            pred_table = "pred_input"
-            self.con.register(pred_table, pred_df)
-            
-            step_preds = {}
-            for target, model in self.models.items():
-                jg = JoinGraph(self.con)
-                jg.add_relation(pred_table, self.feature_cols_used, y=target)
-                
-                # Predict
-                y_pred = model.predict(jg)
-                step_preds[target] = float(y_pred[0])
-            
-            preds.append(step_preds)
-            
-            # Update history
-            # Create a new row with predicted values
-            # We need to match the columns of current_history (date + targets)
-            # We can ignore date for history purposes as we only index by position
-            # But pandas concat requires matching columns
-            
-            new_row = step_preds.copy()
-            # Add dummy date
-            new_row['date'] = datetime.now() # Not used
-            
-            new_row_df = pd.DataFrame([new_row])
-            # Align columns
-            new_row_df = new_row_df[current_history.columns]
-            
-            current_history = pd.concat([current_history, new_row_df], ignore_index=True)
-            
-            # Keep only last 'lags' rows
-            if len(current_history) > self.lags:
-                current_history = current_history.iloc[-self.lags:]
-                
-        return preds
+            t_end = time.perf_counter()
+            logger.info(f"Recursive prediction complete in {t_end-t_start:.4f}s")
+            return preds
+        except Exception as e:
+            logger.error(f"Recursive prediction failed: {e}")
+            logger.error(f"SQL was: {full_sql}")
+            raise e
+
 
     def get_loss(self) -> float:
         total_sse = 0.0
@@ -401,7 +467,19 @@ def _add_records(records: Union[list[Record], list[dict]]):
 
     state.data = pd.concat([state.data, df], ignore_index=True)
 
+def _cleanup_temp_tables():
+    # JoinBoost creates many temporary tables/views with 'joinboost_tmp_' prefix
+    # and some others like 'train_data'
+    try:
+        res = state.con.execute("SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'joinboost_tmp_%' OR table_name LIKE 'train_data%'").fetchall()
+        for row in res:
+            state.con.execute(f"DROP TABLE IF EXISTS {row[0]} CASCADE")
+            state.con.execute(f"DROP VIEW IF EXISTS {row[0]} CASCADE")
+    except Exception as e:
+        logger.error(f"Cleanup failed: {e}")
+
 def _train():
+    _cleanup_temp_tables()
     logger.info(f"Training JoinBoost on {len(state.data)} rows")
     
     model = JoinBoostTimeSeriesModel(state.n_lags, state.n_features, state.con, state.single_target)

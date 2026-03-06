@@ -857,7 +857,7 @@ class GradientBoosting(DecisionTree):
         case_conditions = []
         for cur_cjt in self.leaf_nodes:
             g, h = cur_cjt.get_semi_ring().get_value()
-            pred = g / h * self.learning_rate
+            pred = float(g / h) * self.learning_rate
             
             # get the annotations for the current leaf
             # we need to combine join conditions and select conditions
