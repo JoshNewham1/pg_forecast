@@ -10,6 +10,7 @@ import sys
 import os
 import gc
 import pyarrow.parquet as pq
+import csv
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -24,18 +25,24 @@ from joinboost.aggregator import agg_to_sql
 
 from joinboost_adapter import PostgresExecutor
 
+RESULTS_FILE = "joinboost_results.csv"
 LIMIT = 80_000_000
 LEARNING_RATE = 0.1
 NUM_LEAVES = 8
 DEPTH = 3
 ORDER_BY = "id"
 XGB_EXPORT_PATH = "xgb_train.parquet"
+CSV_EXPORT_PATH = "train.csv"
+
+# DuckDB/XGBoost/Sklearn
 df = None
-con = duckdb.connect("favorita.db")
+con = None
+# JoinBoost
 engine = None
 
 def setup_duckdb():
     global con
+    con = duckdb.connect("favorita.db")
 
     con.execute("SET memory_limit = '30GB';")
 
@@ -60,7 +67,7 @@ def setup_duckdb():
     # Create the full join table for validation and scikit-learn
     # We use LEFT JOIN to keep all rows from sales
     view_sql = f"""
-    CREATE VIEW train AS (
+    CREATE OR REPLACE VIEW train AS (
     SELECT
         s.id,
         s.target,
@@ -92,6 +99,19 @@ def setup_postgres():
         f"postgresql+psycopg2://{TEST_DB_USERNAME}:{TEST_DB_PASSWORD}@"
         f"{TEST_DB_HOST}:{TEST_DB_PORT}/{TEST_DB_NAME}?options=-csearch_path%3Dfav,public"
     )
+
+def set_postgres_optimisations(conn):
+    # Enable JIT and Parallelism for aggregates
+    # NOTE: Settings optimised for 16 threads, 32GB RAM. They might want tweaking
+    conn.execute(text("SET jit = off;"))
+    conn.execute(text("SET max_parallel_workers_per_gather = 8;"))
+    conn.execute(text("SET max_parallel_workers = 12;"))
+    conn.execute(text("SET parallel_setup_cost = 0;"))
+    conn.execute(text("SET parallel_tuple_cost = 0;"))
+    conn.execute(text("SET min_parallel_table_scan_size = '1MB';"))
+    conn.execute(text("SET work_mem = '2GB';"))
+    conn.execute(text("SET temp_buffers = '1GB';"))
+    
 
 def setup_timescale_first_time():
     global engine
@@ -142,15 +162,17 @@ def setup_sklearn():
     start_time = time.perf_counter()
     # Get the train data as dataframe for scikit-learn
     # We explicitly ORDER BY id to ensure consistent ordering
-    df = con.execute("SELECT * FROM train").df()
+    if not os.path.exists(os.path.join(os.getcwd(), CSV_EXPORT_PATH)):
+        con.execute(f"""
+            COPY (
+                SELECT *
+                FROM train
+                ORDER BY id
+            )
+            TO '{CSV_EXPORT_PATH}' (FORMAT CSV);
+        """)
 
-    # Preprocess for scikit-learn (handle nulls and categorical)
-    df = df.fillna(0)
-    for col in df.columns:
-        if df[col].dtype == 'object':
-            df[col] = pd.factorize(df[col])[0]
-
-    print(f"Sklearn join materialisation time: ", time.perf_counter() - start_time)
+        print(f"Sklearn join materialisation time: ", time.perf_counter() - start_time)
 
 def setup_xgboost():
     global con
@@ -192,19 +214,6 @@ def setup_xgboost():
     """)
 
     print(f"XGBoost export time: {time.perf_counter() - start_time}")
-
-def set_postgres_optimisations(conn):
-    # Enable JIT and Parallelism for aggregates
-    # NOTE: Settings optimised for 16 threads, 32GB RAM. They might want tweaking
-    conn.execute(text("SET jit = off;"))
-    conn.execute(text("SET max_parallel_workers_per_gather = 8;"))
-    conn.execute(text("SET max_parallel_workers = 12;"))
-    conn.execute(text("SET parallel_setup_cost = 0;"))
-    conn.execute(text("SET parallel_tuple_cost = 0;"))
-    conn.execute(text("SET min_parallel_table_scan_size = '1MB';"))
-    conn.execute(text("SET max_parallel_workers = 12;"))
-    conn.execute(text("SET work_mem = '2GB';"))
-    conn.execute(text("SET temp_buffers = '1GB';"))
 
 def test_duckdb(iterations=1, predict=False):
     global con
@@ -252,8 +261,79 @@ def test_duckdb(iterations=1, predict=False):
 
     return results
 
+def test_postgres(iterations=1, predict=False):
+    global engine
+    global exe
+    global dataset
+    global reg
+    results = {}
+
+    with engine.connect() as conn:
+        set_postgres_optimisations(conn)
+
+        exe = PostgresExecutor(conn, debug=False)
+        dataset = JoinGraph(exe=exe)
+
+        # Define schema
+        dataset.add_relation("fav.pg_sales", [], y='target')
+        dataset.add_relation("fav.holidays", ["htype", "locale", "locale_name", "transferred", "f2"])
+        dataset.add_relation("fav.oil", ["dcoilwtico", "f3"])
+        dataset.add_relation("fav.trans", ["transactions", "f5"])
+        dataset.add_relation("fav.stores", ["city", "state", "stype", "cluster", "f4"])
+        dataset.add_relation("fav.items", ["family", "class", "perishable", "f1"])
+
+        # Define joins
+        dataset.add_join("fav.pg_sales", "fav.items", ["item_nbr"], ["item_nbr"])
+        dataset.add_join("fav.pg_sales", "fav.trans", ["date", "store_nbr"], ["date", "store_nbr"])
+        dataset.add_join("fav.trans", "fav.stores", ["store_nbr"], ["store_nbr"])
+        dataset.add_join("fav.trans", "fav.holidays", ["date"], ["date"])
+        dataset.add_join("fav.holidays", "fav.oil", ["date"], ["date"])
+
+        reg = GradientBoosting(
+            learning_rate=LEARNING_RATE, num_leaves=NUM_LEAVES, max_depth=DEPTH, n_estimators=iterations
+        )
+
+        # FIT
+        start_time = time.perf_counter()
+        reg.fit(dataset)
+        results["postgres_fit"] = time.perf_counter() - start_time
+        print(f"PostgreSQL JoinBoost fit time: {results['postgres_fit']}")
+
+        # PREDICT (In-Database)
+        if predict:
+            start_pred = time.perf_counter()
+            pred_agg = reg.get_prediction_aggregate()
+            pred_sql = agg_to_sql(pred_agg, qualified=False)
+            reg_prediction = exe._execute_query(f"SELECT {pred_sql} FROM train ORDER BY id")
+            print(f"Prediction shape: {len(reg_prediction)}")
+            results["pred_time"] = time.perf_counter() - start_pred
+            print(f"PostgreSQL Predict Time: {results['pred_time']}")
+
+        # RMSE Calculation
+        rmse = reg.compute_rmse("fav.train")[0]
+        print(f"PostgreSQL RMSE: {rmse}")
+        results["postgres_rmse"] = rmse
+        
+        # CLEANUP: Delete all jb_* temp tables
+        print("Cleaning up intermediate JoinBoost tables...")
+        cleanup_query = """
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_name LIKE 'jb_%';
+        """
+        temp_tables = exe._execute_query(cleanup_query)
+        if temp_tables:
+            for (tbl,) in temp_tables:
+                exe._execute_query(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+            print(f"Removed {len(temp_tables)} temporary tables.")
+    
+    return results
+
 def test_timescale(iterations=1, predict=False):
     global engine
+    global exe
+    global dataset
+    global reg
     results = {}
     
     # Use the optimized PostgresExecutor
@@ -303,7 +383,7 @@ def test_timescale(iterations=1, predict=False):
         # RMSE Calculation
         rmse = reg.compute_rmse("fav.train")[0]
         print(f"Timescale RMSE: {rmse}")
-        results["rmse"] = rmse
+        results["timescale_rmse"] = rmse
         
         # CLEANUP: Delete all jb_* temp tables
         print("Cleaning up intermediate JoinBoost tables...")
@@ -355,7 +435,7 @@ def test_citus(iterations=1, predict=False):
         start_time = time.perf_counter()
         reg.fit(dataset)
         results["timescale_fit"] = time.perf_counter() - start_time
-        print(f"Timescale JoinBoost fit time: {results['timescale_fit']}")
+        print(f"Citus JoinBoost fit time: {results['timescale_fit']}")
 
         # PREDICT (In-Database)
         if predict:
@@ -365,11 +445,11 @@ def test_citus(iterations=1, predict=False):
             reg_prediction = exe._execute_query(f"SELECT {pred_sql} FROM train ORDER BY id")
             print(f"Prediction shape: {len(reg_prediction)}")
             results["pred_time"] = time.perf_counter() - start_pred
-            print(f"Timescale Predict Time: {results['pred_time']}")
+            print(f"Citus Predict Time: {results['pred_time']}")
 
         # RMSE Calculation
         rmse = reg.compute_rmse("fav.train")[0]
-        print(f"Timescale RMSE: {rmse}")
+        print(f"Citus RMSE: {rmse}")
         results["rmse"] = rmse
         
         # CLEANUP: Delete all jb_* temp tables
@@ -388,8 +468,18 @@ def test_citus(iterations=1, predict=False):
     return results
 
 def test_sklearn(iterations=1, predict=False):
-    global df
+    # Preprocess for scikit-learn (handle nulls and categorical)
+    df = pd.read_csv(CSV_EXPORT_PATH)
     results = {}
+
+    if df is None:
+        print("Run setup_sklearn() first to test XGBoost in memory")
+        return
+    
+    df = df.fillna(0)
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = pd.factorize(df[col])[0]
 
     y = "target"
     x = [
@@ -434,12 +524,19 @@ def test_sklearn(iterations=1, predict=False):
     return results
 
 def test_xgboost_in_memory(iterations=1, predict=False):
-    global df
+    # Preprocess for scikit-learn (handle nulls and categorical)
+    df = pd.read_csv(CSV_EXPORT_PATH)
     results = {}
 
     if df is None:
         print("Run setup_sklearn() first to test XGBoost in memory")
         return
+    
+    df = df.fillna(0)
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = pd.factorize(df[col])[0]
+    print("XGBoost loaded CSV...")
 
     y_col = "target"
     # Filter features to match the other benchmarks
@@ -542,21 +639,115 @@ def test_xgboost_out_of_core(iterations=1, predict=False):
     
     return results
 
-if __name__ == "__main__":
-    results = []
-    setup_duckdb()
-    setup_sklearn()
-    setup_xgboost()
-    setup_timescale_first_time()
-    setup_postgres()
-    for i in [1, 5, 10, 15, 20, 25, 30]:
-        print(f"Testing gradient boosting for {i} iterations")
-        print(f"=============================================")
-        results.append(test_duckdb(i))
-        results.append(test_timescale(i))
-        results.append(test_citus(i))
-        results.append(test_sklearn(i))
-        results.append(test_xgboost_out_of_core(i))
-        results.append(test_xgboost_in_memory(i))
+def cleanup_artifacts():
+    files_to_delete = ["favorita.db", XGB_EXPORT_PATH, CSV_EXPORT_PATH]
 
-    print(results)
+    for file in files_to_delete:
+        if os.path.exists(file):
+            try:
+                os.remove(file)
+                print(f"Deleted existing file: {file}")
+            except Exception as e:
+                print(f"Failed to delete {file}: {e}")
+
+def append_results_to_file(model_name, iteration, result_dict):
+    file_exists = os.path.exists(RESULTS_FILE)
+
+    row = {
+        "model": model_name,
+        "iterations": iteration,
+        **result_dict
+    }
+
+    with open(RESULTS_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+
+        # Write header only if file doesn't exist
+        if not file_exists:
+            writer.writeheader()
+
+        writer.writerow(row)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python benchmark.py <model> <iterations>")
+        print("Available models: duckdb, postgres, timescale, citus, sklearn, xgb_mem, xgb_ooc")
+        sys.exit(1)
+
+    model = sys.argv[1].lower()
+    iterations = int(sys.argv[2])
+
+    valid_models = {
+        "duckdb",
+        "postgres",
+        "timescale",
+        "citus",
+        "sklearn",
+        "xgb_mem",
+        "xgb_ooc",
+    }
+
+    if model not in valid_models:
+        print(f"Invalid model '{model}'")
+        sys.exit(1)
+
+    print(f"Running benchmark for model: {model}")
+    print("=" * 60)
+
+    # Setup only what is required
+    if model == "duckdb":
+        setup_duckdb()
+
+    elif model in {"postgres", "timescale", "citus"}:
+        setup_postgres()
+
+    elif model == "sklearn":
+        setup_duckdb()
+        setup_sklearn()
+
+    elif model == "xgb_mem":
+        setup_duckdb()
+        setup_sklearn()
+
+    elif model == "xgb_ooc":
+        setup_duckdb()
+        setup_xgboost()
+    
+    print("Finished set up, waiting to start full test...")
+    time.sleep(30)
+
+    # Run selected model
+    for _ in range(iterations):
+        for i in [1, 5, 10, 15, 20, 25, 30]:
+            print(f"\nTesting {model} for {i} iterations")
+            print("-" * 60)
+
+            if model == "duckdb":
+                result = test_duckdb(i)
+
+            elif model == "postgres":
+                result = test_postgres(i)
+
+            elif model == "timescale":
+                result = test_timescale(i)
+
+            elif model == "citus":
+                result = test_citus(i)
+
+            elif model == "sklearn":
+                result = test_sklearn(i)
+
+            elif model == "xgb_mem":
+                result = test_xgboost_in_memory(i)
+
+            elif model == "xgb_ooc":
+                result = test_xgboost_out_of_core(i)
+
+            append_results_to_file(model, i, result)
+            gc.collect()
+            time.sleep(60)
+        gc.collect()
+        time.sleep(300)
+
+    print("\nBenchmark complete.")
