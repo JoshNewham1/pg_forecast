@@ -740,7 +740,17 @@ def ts_joinboost_sut(n_lags, n_features, single_target):
 @pytest.fixture
 def duckdb_joinboost_sut(competitor_server, n_lags, n_features, single_target):
     sut = PythonWebServer()
-    sut._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features, "single_target": single_target})
+    sut._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features, "single_target": single_target, "incremental": False})
+    yield sut
+    try:
+        sut.teardown_single()
+    except Exception:
+        pass
+
+@pytest.fixture
+def duckdb_joinboost_sut_incremental(competitor_server, n_lags, n_features, single_target):
+    sut = PythonWebServer()
+    sut._post("config", {"mode": "naive", "n_lags": n_lags, "n_features": n_features, "single_target": single_target, "incremental": True})
     yield sut
     try:
         sut.teardown_single()
@@ -821,6 +831,7 @@ MULTIVAR_CASES = [
     ("python_xgboost", "pg_joinboost_sut_non_incremental"),
     ("python_xgboost", "ts_joinboost_sut"),
     ("python_joinboost", "duckdb_joinboost_sut"),
+    ("python_joinboost", "duckdb_joinboost_sut_incremental"),
 ]
 
 @pytest.mark.parametrize("competitor_server, sut", MULTIVAR_CASES, indirect=True)

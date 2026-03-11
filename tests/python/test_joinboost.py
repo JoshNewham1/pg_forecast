@@ -45,6 +45,10 @@ def setup_duckdb():
     con = duckdb.connect("favorita.db")
 
     con.execute("SET memory_limit = '30GB';")
+    con.execute("SET wal_autocheckpoint = '256GB';")
+    con.execute("SET max_temp_directory_size = '128GB';")
+    con.execute("SET preserve_insertion_order = false;")
+    con.execute("SET threads = 16;")
 
     # Base path for data
     base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../eval/favorita/data"))
@@ -236,7 +240,7 @@ def test_duckdb(iterations=1, predict=False):
     dataset.add_join("holidays", "oil", ["date"], ["date"])
 
     reg = GradientBoosting(
-        learning_rate=LEARNING_RATE, num_leaves=NUM_LEAVES, max_depth=DEPTH, n_estimators=iterations, partition_early = True
+        learning_rate=LEARNING_RATE, num_leaves=NUM_LEAVES, max_depth=DEPTH, n_estimators=iterations
     )
 
     start_time = time.perf_counter()
