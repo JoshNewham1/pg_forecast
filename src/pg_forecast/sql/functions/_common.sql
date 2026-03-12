@@ -56,6 +56,7 @@ DECLARE
     v_opt_result arima_optimise_result;
     v_func_name TEXT;
     v_func_exists BOOLEAN;
+    v_last_date TIMESTAMP;
 BEGIN
     -- Safety precaution for SECURITY DEFINER
     PERFORM set_config('search_path', 'public,pg_temp', true);
@@ -76,6 +77,8 @@ BEGIN
                 (a.incremental_state).p,
                 (a.incremental_state).q,
                 (a.incremental_state).e_lags AS residuals,
+                (a.incremental_state).y_lags,
+                (a.incremental_state).diff_buf,
                 (a.incremental_state).css
             FROM models m
             INNER JOIN model_arima_stats a ON m.id = a.model_id AND a.is_active = TRUE
@@ -89,23 +92,33 @@ BEGIN
             RETURN;
         END IF;
 
-        v_opt_result := (rec_model.phi, rec_model.theta, rec_model.c, rec_model.residuals, rec_model.css);
+        -- Get the last timestamp to build forecast dates
+        EXECUTE format(
+            'SELECT MAX(%I) FROM %I',
+            date_column,
+            input_table
+        )
+        INTO v_last_date;
+
         RETURN QUERY
             SELECT 
                 *
             FROM
-                arima_run_forecast(
+                arima_run_forecast_incremental(
                     rec_model.p,
                     rec_model.d,
                     rec_model.q,
-                    v_opt_result,
-                    input_table,
-                    date_column,
-                    value_column,
+                    rec_model.phi,
+                    rec_model.theta,
+                    rec_model.c,
+                    rec_model.y_lags,
+                    rec_model.residuals,
+                    rec_model.diff_buf,
+                    v_last_date,
                     horizon,
                     forecast_step,
                     rec_model.use_log_transform
-                )
+                );
         RETURN;
     ELSIF model_name = 'pyautoarima' THEN
         v_func_name := model_name || '_forecast';
@@ -282,3 +295,9 @@ BEGIN
     RETURN arr;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION reverse_array(arr anyarray)
+RETURNS anyarray AS $$
+SELECT COALESCE(array_agg(x ORDER BY i DESC), '{}')
+FROM unnest(arr) WITH ORDINALITY AS t(x, i);
+$$ LANGUAGE sql IMMUTABLE;

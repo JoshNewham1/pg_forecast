@@ -169,6 +169,27 @@ def arima_forecast_query(last_vals: list[float], last_residuals: list[float], p:
                                       p=p, q=q, c=c, phi=phi, theta=theta, horizon=horizon)
 
 
+def arima_run_forecast_incremental_query(p, d, q, phi, theta, c, last_y_diffs, last_residuals, last_original_vals, last_date, horizon, forecast_step, log_transform):
+    """
+    Build a SQLAlchemy text query to call arima_run_forecast_incremental_v2.
+    """
+    query_str = """
+        SELECT * FROM arima_run_forecast_incremental_v2(
+            :p, :d, :q, :phi, :theta, :c, :last_y_diffs, :last_residuals, :last_original_vals, :last_date, :horizon, :forecast_step, :log_transform
+        )
+    """
+    return text(query_str).bindparams(
+        p=p, d=d, q=q, phi=phi, theta=theta, c=c,
+        last_y_diffs=last_y_diffs,
+        last_residuals=last_residuals,
+        last_original_vals=last_original_vals,
+        last_date=last_date,
+        horizon=horizon,
+        forecast_step=forecast_step,
+        log_transform=log_transform
+    )
+
+
 def arima_query(p: int, d: int, q: int, horizon: int, include_mean=True, optimiser="Nelder-Mead", log_transform=False, table="pg_forecast_unit_test"):
     """
     Build a SQLAlchemy text query to call arima on pg_forecast_unit_test.
@@ -567,6 +588,128 @@ def test_arima_forecast_p_2_q_2(test_engine):
                              12.46384978, 12.78481125, 13.11322754]
         for i, diff in enumerate(forecast):
             assert_close(diff, expected_forecast[i])
+
+
+def test_arima_run_forecast_incremental_p_2_d_0_q_2(test_engine):
+    p, d, q = 2, 0, 2
+    phi = [0.914982910934596, 0.113555903738228]
+    theta = [2.062502180358700, 0.710978584599870]
+    c = 0.0
+    last_y_diffs = [11.9, 11.7]  # y_t, y_{t-1}
+    last_residuals = [-0.016511328, -0.035082334]  # e_t, e_{t-1}
+    last_original_vals = [11.7, 11.9]
+    last_date = "2023-01-07 00:00:00"
+    horizon = 4
+    forecast_step = "1 day"
+    log_transform = False
+
+    query = arima_run_forecast_incremental_query(
+        p, d, q, phi, theta, c, last_y_diffs, last_residuals, last_original_vals, last_date, horizon, forecast_step, log_transform
+    )
+
+    with test_engine.connect() as conn:
+        result = conn.execute(query).fetchall()
+        forecast = [row[1] for row in result]
+        expected_forecast = [12.15790328, 12.46384978, 12.78481125, 13.11322754]
+        for i, val in enumerate(forecast):
+            assert_close(val, expected_forecast[i], name=f"Step {i+1}")
+
+
+def test_arima_run_forecast_incremental_p_2_d_1_q_2(test_engine):
+    p, d, q = 2, 1, 2
+    phi = [0.099934682, 0.674069236]
+    theta = [2.0, -2.0]
+    c = 0.0
+    last_y_diffs = [0.2, 0.2]  # most recent at START (y_7-y_6, y_6-y_5)
+    last_residuals = [0.0, 0.0]  # dummy
+    last_original_vals = [11.7, 11.9]  # most recent at END
+    last_date = "2023-01-07 00:00:00"
+    horizon = 4
+    forecast_step = "1 day"
+    log_transform = False
+
+    query = arima_run_forecast_incremental_query(
+        p, d, q, phi, theta, c, last_y_diffs, last_residuals, last_original_vals, last_date, horizon, forecast_step, log_transform
+    )
+
+    with test_engine.connect() as conn:
+        result = conn.execute(query).fetchall()
+        forecast = [row[1] for row in result]
+        expected_forecast = [12.0548007836, 12.2050845979, 12.324449609, 12.4376800093]
+        for i, val in enumerate(forecast):
+            assert_close(val, expected_forecast[i], name=f"Step {i+1}")
+
+
+def test_arima_run_forecast_incremental_null_repro(test_engine):
+    p, d, q = 0, 1, 0
+    phi = []
+    theta = []
+    c = 0.0
+    last_y_diffs = [0.0]
+    last_residuals = []
+    last_original_vals = []  # Empty! This should trigger an error if d > 0
+    last_date = "2023-01-07 00:00:00"
+    horizon = 2
+    forecast_step = "1 day"
+    log_transform = False
+
+    query = arima_run_forecast_incremental_query(
+        p, d, q, phi, theta, c, last_y_diffs, last_residuals, last_original_vals, last_date, horizon, forecast_step, log_transform
+    )
+
+    with test_engine.connect() as conn:
+        conn.execute(query).fetchall()
+
+
+def test_arima_incremental_matches_regular_p_2_d_1_q_2(test_engine):
+    """
+    Verify that arima_run_forecast_incremental matches arima_train_and_forecast
+    given the same parameters.
+    """
+    setup_basic_dataset(test_engine)
+    p, d, q = 2, 1, 2
+    horizon = 4
+    include_mean = False
+    log_transform = False
+
+    with test_engine.connect() as conn:
+        # 1. Get regular forecast
+        regular_query = arima_query(p, d, q, horizon, include_mean=include_mean, log_transform=log_transform)
+        regular_result = conn.execute(regular_query).fetchall()
+        regular_forecast = [row[1] for row in regular_result]
+
+        # 2. Get parameters and state for incremental forecast
+        # We'll use arima_train to get the same parameters as the regular query would find
+        train_query = text("""
+            SELECT phi, theta, c FROM arima_train(:p, :d, :q, 'pg_forecast_unit_test', 't', 'value', :include_mean)
+        """).bindparams(p=p, d=d, q=q, include_mean=include_mean)
+        phi, theta, c = conn.execute(train_query).fetchone()
+
+        # Get incremental state
+        state_query = text("""
+            SELECT (s).* FROM (
+                SELECT css_incremental_full_table('pg_forecast_unit_test', 'value', 't', :phi, :theta, :c, :d, :logt) as s
+            ) q
+        """).bindparams(phi=phi, theta=theta, c=c, d=d, logt=log_transform)
+        state_row = conn.execute(state_query).fetchone()
+        # css_incremental_state fields: t, p, q, y_lags, e_lags, css, d, n_diff, diff_buf
+        last_y_diffs = state_row[3]
+        last_residuals = state_row[4]
+        last_original_vals = state_row[8]
+
+        # Get last date
+        last_date = conn.execute(text("SELECT MAX(t) FROM pg_forecast_unit_test")).scalar()
+
+        # 3. Get incremental forecast
+        incremental_query = arima_run_forecast_incremental_query(
+            p, d, q, phi, theta, c, last_y_diffs, last_residuals, last_original_vals, last_date, horizon, "1 day", log_transform
+        )
+        incremental_result = conn.execute(incremental_query).fetchall()
+        incremental_forecast = [row[1] for row in incremental_result]
+
+    # 4. Compare
+    for i in range(horizon):
+        assert_close(incremental_forecast[i], regular_forecast[i], name=f"Step {i+1}")
 
 
 def test_arima_p_2_d_0_q_2(test_engine):

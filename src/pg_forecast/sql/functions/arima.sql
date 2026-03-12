@@ -293,6 +293,70 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION arima_run_forecast_incremental(
+    p INT,
+    d INT,
+    q INT,
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION,
+    last_y_diffs DOUBLE PRECISION[],       -- From incremental_state.y_lags (most recent at START)
+    last_residuals DOUBLE PRECISION[],     -- From incremental_state.e_lags (most recent at START)
+    last_original_vals DOUBLE PRECISION[], -- From incremental_state.diff_buf (most recent at END)
+    last_date TIMESTAMP,
+    horizon INT,
+    forecast_step INTERVAL,
+    log_transform BOOLEAN
+)
+RETURNS TABLE(forecast_date TIMESTAMP, forecast_value DOUBLE PRECISION) AS $$
+DECLARE
+    arr_forecasts DOUBLE PRECISION[];
+    arr_initial_vals DOUBLE PRECISION[];
+    arr_last_y_diffs_rev DOUBLE PRECISION[];
+    v_len_orig INT;
+BEGIN
+    -- Handle NULL inputs
+    phi := COALESCE(phi, '{}');
+    theta := COALESCE(theta, '{}');
+    last_y_diffs := COALESCE(last_y_diffs, '{}');
+    last_residuals := COALESCE(last_residuals, '{}');
+    last_original_vals := COALESCE(last_original_vals, '{}');
+
+    -- reverse y_lags because arima_forecast expects most recent at the end
+    arr_last_y_diffs_rev := reverse_array(last_y_diffs);
+
+    arr_forecasts := arima_forecast(arr_last_y_diffs_rev, last_residuals, p, q, c, phi, theta, horizon);
+
+    IF d > 0 THEN
+        v_len_orig := cardinality(last_original_vals);
+        IF v_len_orig < d THEN
+            RAISE EXCEPTION 'arima_run_forecast_incremental: not enough original values for integration (need %, got %)', d, v_len_orig;
+        END IF;
+
+        -- Take last d original values from diff_buf
+        arr_initial_vals := last_original_vals[v_len_orig - d + 1 : v_len_orig];
+        
+        arr_forecasts := arima_integrate(arr_forecasts, d, arr_initial_vals);
+        -- integrated array has size horizon + d. 
+        -- Indices 1..d are initial_vals, d+1..d+horizon are the forecasts.
+        arr_forecasts := arr_forecasts[d + 1 : d + horizon];
+    END IF;
+
+    -- Return table of dates and forecast values
+    RETURN QUERY
+        SELECT
+            last_date + (i * forecast_step) AS forecast_date,
+            CASE
+                WHEN log_transform AND arr_forecasts[i] IS NOT NULL AND arr_forecasts[i] <= 308 AND arr_forecasts[i] >= -308
+                    THEN POWER(10, arr_forecasts[i]) - 1
+                WHEN log_transform AND arr_forecasts[i] IS NOT NULL THEN -- Out of bounds
+                    'Infinity'::DOUBLE PRECISION
+                ELSE arr_forecasts[i]
+            END AS forecast_value
+        FROM generate_series(1, horizon) AS i;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION arima_run_forecast(
     p INT, -- Number of lagged y_t
     d INT, -- Number of times to difference

@@ -56,7 +56,7 @@ css_state_from_tuple(HeapTupleData *tup, TupleDesc desc)
     ArrayType *diff_buf_arr = DatumGetArrayTypeP(heap_getattr(tup, 9, desc, &is_null));
     if (is_null) ereport(ERROR, (errmsg("css_incremental: diff_buf cannot be NULL")));
     int n_diff_buf = ArrayGetNItems(ARR_NDIM(diff_buf_arr), ARR_DIMS(diff_buf_arr));
-    if (n_diff_buf > D_MAX)
+    if (n_diff_buf > D_MAX + 1)
         ereport(ERROR, (errmsg("css_incremental: diff_buf too long")));
     memcpy(s->diff_buf, ARR_DATA_PTR(diff_buf_arr), n_diff_buf * sizeof(double));
 
