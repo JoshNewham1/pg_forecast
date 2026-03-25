@@ -25,7 +25,8 @@ CREATE TYPE pyautoarima_fit_result AS (
     phi DOUBLE PRECISION[],
     theta DOUBLE PRECISION[],
     c DOUBLE PRECISION,
-    css DOUBLE PRECISION
+    css DOUBLE PRECISION,
+    model_pickle BYTEA
 );
 
 CREATE TYPE pyautoarima_incremental_state AS (
@@ -41,8 +42,9 @@ CREATE TYPE pyautoarima_incremental_state AS (
 --  Tables
 -- =========================================================
 
--- models table is created by pg_forecast core, with model_type as enum
--- We just ensure model_pyautoarima_stats references it correctly
+DROP TABLE IF EXISTS pyautoarima_vertices CASCADE;
+DROP TABLE IF EXISTS model_pyautoarima_stats CASCADE;
+DROP TABLE IF EXISTS pyautoarima_config CASCADE;
 
 CREATE TABLE model_pyautoarima_stats (
     id BIGSERIAL PRIMARY KEY,
@@ -52,6 +54,7 @@ CREATE TABLE model_pyautoarima_stats (
     d INT,
     c DOUBLE PRECISION,
     incremental_state pyautoarima_incremental_state,
+    model_pickle BYTEA,
     is_incremental BOOLEAN DEFAULT FALSE,
     is_active BOOLEAN,
     CONSTRAINT unique_model_pyautoarima_stats UNIQUE (model_id, phi, theta, d, c)
@@ -72,7 +75,7 @@ CREATE TABLE IF NOT EXISTS pyautoarima_config (
 );
 
 -- =========================================================
---  Python virtualenv
+--  Python virtualenv & Helpers
 -- =========================================================
 
 INSERT INTO pyautoarima_config (key, value)
@@ -83,17 +86,101 @@ CREATE OR REPLACE FUNCTION activate_python_venv()
 RETURNS VOID AS
 $$
 if 'venv_activated' not in GD:
+    import sys
+    import os
     venv = plpy.execute("SELECT value FROM pyautoarima_config WHERE key='venv'")[0]['value']
-    from sys import path
-    if venv not in path:
-        path.append(venv)
+    if venv not in sys.path:
+        sys.path.append(venv)
+    
+    import numpy as np
+    import pmdarima as pm
+    import pickle
+    
+    GD['np'] = np
+    GD['pm'] = pm
+    GD['pickle'] = pickle
+    
+    # Define the transition logic in GD to be reused efficiently
+    def transition(state_dict, y_raw, phi, theta, c):
+        np = GD['np']
+        p = state_dict['p']
+        q = state_dict['q']
+        diff_lags = np.array(state_dict['diff_lags'], dtype=float)
+        y_lags = np.array(state_dict['y_lags'], dtype=float)
+        e_lags = np.array(state_dict['e_lags'], dtype=float)
+        
+        # Differencing (any d)
+        x = y_raw
+        for i in range(len(diff_lags)):
+            delta = x - diff_lags[i]
+            diff_lags[i] = x
+            x = delta
+        y = x
+        
+        # Prediction
+        y_hat = c
+        if len(phi):
+            y_hat += phi @ y_lags
+        if len(theta):
+            y_hat += theta @ e_lags
+        
+        eps = y - y_hat
+        
+        # Lag updates
+        if len(y_lags):
+            y_lags[1:], y_lags[0] = y_lags[:-1], y
+        if len(e_lags):
+            e_lags[1:], e_lags[0] = e_lags[:-1], eps
+            
+        return {
+            'p': p, 'q': q,
+            'css': state_dict['css'] + eps * eps,
+            'y_lags': y_lags.tolist(),
+            'e_lags': e_lags.tolist(),
+            'diff_lags': diff_lags.tolist()
+        }
+    
+    GD['transition'] = transition
     GD['venv_activated'] = True
 $$
 LANGUAGE plpython3u VOLATILE;
 
 -- =========================================================
--- Incremental ARIMA update functions
+-- Incremental ARIMA functions
 -- =========================================================
+
+CREATE OR REPLACE FUNCTION pyautoarima_full_table_state(
+    ys DOUBLE PRECISION[],
+    phi DOUBLE PRECISION[],
+    theta DOUBLE PRECISION[],
+    c DOUBLE PRECISION,
+    p INT,
+    q INT,
+    d INT
+)
+RETURNS pyautoarima_incremental_state
+LANGUAGE plpython3u
+AS $$
+plpy.execute("SELECT activate_python_venv();")
+np = GD['np']
+transition = GD['transition']
+
+state = {
+    'p': p, 'q': q,
+    'css': 0.0,
+    'y_lags': [0.0] * p,
+    'e_lags': [0.0] * q,
+    'diff_lags': [0.0] * d
+}
+
+arr_phi = np.array(phi, dtype=float) if phi else np.array([], dtype=float)
+arr_theta = np.array(theta, dtype=float) if theta else np.array([], dtype=float)
+
+for y in ys:
+    state = transition(state, y, arr_phi, arr_theta, c)
+
+return state
+$$;
 
 CREATE OR REPLACE FUNCTION pyautoarima_generate_vertices(
     stats_id BIGINT,
@@ -110,91 +197,54 @@ RETURNS VOID
 LANGUAGE plpython3u
 AS $$
 plpy.execute("SELECT activate_python_venv();")
-if 'np' not in GD:
-    GD['np'] = __import__('numpy')
 np = GD['np']
+transition = GD['transition']
 
 arr_phi = np.array(phi if phi else [], dtype=float)
 arr_theta = np.array(theta if theta else [], dtype=float)
 params = np.concatenate([arr_phi, arr_theta])
 dim = len(params)
 
-def transition(state_dict, y_raw, phi_v, theta_v, c_val):
-    diff_lags = np.array(state_dict['diff_lags'], dtype=float) if state_dict['diff_lags'] else np.array([])
-    y_lags = np.array(state_dict['y_lags'], dtype=float) if state_dict['y_lags'] else np.array([])
-    e_lags = np.array(state_dict['e_lags'], dtype=float) if state_dict['e_lags'] else np.array([])
-    
-    x = y_raw
-    for i in range(len(diff_lags)):
-        delta = x - diff_lags[i]
-        diff_lags[i] = x
-        x = delta
-    
-    y = x
-    y_hat = c_val
-    if len(phi_v) > 0 and len(y_lags) > 0:
-        y_hat += np.dot(phi_v, y_lags)
-    if len(theta_v) > 0 and len(e_lags) > 0:
-        y_hat += np.dot(theta_v, e_lags)
-        
-    eps = y - y_hat
-    
-    if len(y_lags) > 0:
-        y_lags = np.roll(y_lags, 1)
-        y_lags[0] = y
-    if len(e_lags) > 0:
-        e_lags = np.roll(e_lags, 1)
-        e_lags[0] = eps
-        
-    return {
-        'p': state_dict['p'], 'q': state_dict['q'],
-        'css': state_dict['css'] + eps*eps,
-        'y_lags': list(y_lags),
-        'e_lags': list(e_lags),
-        'diff_lags': list(diff_lags)
-    }
-
-def get_full_state(ys, phi_v, theta_v, c_val, p_v, q_v, d_v):
+def get_full_state(p_vals, t_vals):
     state = {
-        'p': p_v, 'q': q_v,
+        'p': p, 'q': q,
         'css': 0.0,
-        'y_lags': [0.0]*p_v,
-        'e_lags': [0.0]*q_v,
-        'diff_lags': [0.0]*d_v
+        'y_lags': [0.0] * p,
+        'e_lags': [0.0] * q,
+        'diff_lags': [0.0] * d_order
     }
-    for y in ys:
-        state = transition(state, y, phi_v, theta_v, c_val)
+    for y in history:
+        state = transition(state, y, p_vals, t_vals, c)
     return state
 
-# 1. Coordinate Perturbations
+# Coordinate Perturbations
 for i in range(dim):
-    v_params = params.copy()
-    v_params[i] += tolerance if v_params[i] >= 0 else -tolerance
-    v_phi = v_params[:len(arr_phi)]
-    v_theta = v_params[len(arr_phi):]
-    v_state = get_full_state(history, v_phi, v_theta, c, p, q, d_order)
+    v = params.copy()
+    v[i] += tolerance if v[i] >= 0 else -tolerance
+    v_phi = v[:len(arr_phi)]
+    v_theta = v[len(arr_phi):]
+    
+    v_state = get_full_state(v_phi, v_theta)
     
     plpy.execute(plpy.prepare(
         "INSERT INTO pyautoarima_vertices (stats_id, vertex_index, phi, theta, incremental_state) VALUES ($1, $2, $3, $4, $5)",
         ["bigint", "int", "double precision[]", "double precision[]", "pyautoarima_incremental_state"]
-    ), [stats_id, i, list(v_phi), list(v_theta), v_state])
+    ), [stats_id, i, v_phi.tolist(), v_theta.tolist(), v_state])
 
-# (d+1)th Vertex
+# Scaling towards origin Vertex
 if dim > 0:
     dist = np.linalg.norm(params)
     scale = 1.0 - tolerance / dist if dist > tolerance else 0.5
-    v_params = params * scale
-    v_phi = v_params[:len(arr_phi)]
-    v_theta = v_params[len(arr_phi):]
-    v_state = get_full_state(history, v_phi, v_theta, c, p, q, d_order)
-
+    v = params * scale
+    v_phi = v[:len(arr_phi)]
+    v_theta = v[len(arr_phi):]
+    
+    v_state = get_full_state(v_phi, v_theta)
+    
     plpy.execute(plpy.prepare(
         "INSERT INTO pyautoarima_vertices (stats_id, vertex_index, phi, theta, incremental_state) VALUES ($1, $2, $3, $4, $5)",
         ["bigint", "int", "double precision[]", "double precision[]", "pyautoarima_incremental_state"]
-    ), [stats_id, dim, list(v_phi), list(v_theta), v_state])
-
-    # with open("pyautoarima.log", "a") as f:
-    #     f.writelines([f"pyautoarima: Created vertices with phi = {list(v_phi)} and theta = {list(v_theta)}\n"])
+    ), [stats_id, dim, v_phi.tolist(), v_theta.tolist(), v_state])
 $$;
 
 CREATE OR REPLACE FUNCTION pyautoarima_batch_incremental_update(
@@ -206,121 +256,65 @@ RETURNS BOOLEAN
 LANGUAGE plpython3u
 AS $$
 plpy.execute("SELECT activate_python_venv();")
-if 'np' not in GD:
-    GD['np'] = __import__('numpy')
 np = GD['np']
-
-def transition(state_dict, y_raw, phi_v, theta_v, c_val):
-    diff_lags = np.array(state_dict['diff_lags'], dtype=float) if state_dict['diff_lags'] else np.array([])
-    y_lags = np.array(state_dict['y_lags'], dtype=float) if state_dict['y_lags'] else np.array([])
-    e_lags = np.array(state_dict['e_lags'], dtype=float) if state_dict['e_lags'] else np.array([])
-
-    x = y_raw
-    for i in range(len(diff_lags)):
-        delta = x - diff_lags[i]
-        diff_lags[i] = x
-        x = delta
-
-    y = x
-    y_hat = c_val
-    if len(phi_v) > 0 and len(y_lags) > 0:
-        y_hat += np.dot(phi_v, y_lags)
-    if len(theta_v) > 0 and len(e_lags) > 0:
-        y_hat += np.dot(theta_v, e_lags)
-
-    eps = y - y_hat
-
-    if len(y_lags) > 0:
-        y_lags = np.roll(y_lags, 1)
-        y_lags[0] = y
-    if len(e_lags) > 0:
-        e_lags = np.roll(e_lags, 1)
-        e_lags[0] = eps
-
-    return {
-        'p': state_dict['p'], 'q': state_dict['q'],
-        'css': state_dict['css'] + eps*eps,
-        'y_lags': list(y_lags),
-        'e_lags': list(e_lags),
-        'diff_lags': list(diff_lags)
-    }
+transition = GD['transition']
 
 res = plpy.execute(f"SELECT phi, theta, c, incremental_state FROM model_pyautoarima_stats WHERE id = {stats_id}")
 if not res: 
     return True
-centre = res[0]
+row = res[0]
+phi = np.array(row['phi'], dtype=float) if row['phi'] else np.array([], dtype=float)
+theta = np.array(row['theta'], dtype=float) if row['theta'] else np.array([], dtype=float)
+c = row['c']
+c_state = row['incremental_state']
 
-c_state = centre['incremental_state']
 is_ok = True
 
 if is_incremental:
-    v_rows = plpy.execute(f"SELECT id, incremental_state, phi, theta FROM pyautoarima_vertices WHERE stats_id = {stats_id}")
-    v_states = {row['id']: {'state': row['incremental_state'], 'phi': row['phi'], 'theta': row['theta']} for row in v_rows}
+    # Breach check for p+q=0 (matching main.py)
+    if c_state['p'] + c_state['q'] == 0:
+        is_ok = False
     
-    for new_y in new_ys:
-        c_state = transition(c_state, new_y, centre['phi'], centre['theta'], centre['c'])
-        
-        css_values = []
-        for vid, vdata in v_states.items():
-            v_states[vid]['state'] = transition(vdata['state'], new_y, vdata['phi'], vdata['theta'], centre['c'])
-            css_values.append(v_states[vid]['state']['css'])
-        
-        if css_values and min(css_values) < c_state['css'] * (1 - 1e-12):
+    v_rows = plpy.execute(f"SELECT id, incremental_state, phi, theta FROM pyautoarima_vertices WHERE stats_id = {stats_id}")
+    v_data = []
+    for vr in v_rows:
+        v_data.append({
+            'id': vr['id'],
+            'state': vr['incremental_state'],
+            'phi': np.array(vr['phi'], dtype=float) if vr['phi'] else np.array([], dtype=float),
+            'theta': np.array(vr['theta'], dtype=float) if vr['theta'] else np.array([], dtype=float)
+        })
+    
+    for y in new_ys:
+        c_state = transition(c_state, y, phi, theta, c)
+        for vd in v_data:
+            vd['state'] = transition(vd['state'], y, vd['phi'], vd['theta'], c)
+
+    # Breach check for CSS (matching main.py)
+    if is_ok and v_data:
+        min_css = min(vd['state']['css'] for vd in v_data)
+        if min_css < c_state['css'] * (1 - 1e-12):
             is_ok = False
-            break
 
-    if is_ok and v_states:
-        ids = list(v_states.keys())
-        cases_p = " ".join([f"WHEN id = {vid} THEN {v_states[vid]['state']['p']}" for vid in ids])
-        cases_q = " ".join([f"WHEN id = {vid} THEN {v_states[vid]['state']['q']}" for vid in ids])
-        cases_css = " ".join([f"WHEN id = {vid} THEN {v_states[vid]['state']['css']}" for vid in ids])
-        cases_y = " ".join([f"WHEN id = {vid} THEN ARRAY[{','.join(str(x) for x in v_states[vid]['state']['y_lags'])}]::double precision[]" if v_states[vid]['state']['y_lags'] else f"WHEN id = {vid} THEN ARRAY[]::double precision[]" for vid in ids])
-        cases_e = " ".join([f"WHEN id = {vid} THEN ARRAY[{','.join(str(x) for x in v_states[vid]['state']['e_lags'])}]::double precision[]" if v_states[vid]['state']['e_lags'] else f"WHEN id = {vid} THEN ARRAY[]::double precision[]" for vid in ids])
-        cases_d = " ".join([f"WHEN id = {vid} THEN ARRAY[{','.join(str(x) for x in v_states[vid]['state']['diff_lags'])}]::double precision[]" if v_states[vid]['state']['diff_lags'] else f"WHEN id = {vid} THEN ARRAY[]::double precision[]" for vid in ids])
-
-        plpy.execute(f"""
-            UPDATE pyautoarima_vertices
-            SET incremental_state = ROW(
-                CASE {cases_p} END,
-                CASE {cases_q} END,
-                CASE {cases_css} END,
-                CASE {cases_y} END,
-                CASE {cases_e} END,
-                CASE {cases_d} END
-            )::pyautoarima_incremental_state
-            WHERE id IN ({','.join(str(vid) for vid in ids)})
-        """)
+    if is_ok and v_data:
+        # Update vertex states in DB
+        for vd in v_data:
+            s = vd['state']
+            plpy.execute(plpy.prepare(
+                "UPDATE pyautoarima_vertices SET incremental_state = $1 WHERE id = $2",
+                ["pyautoarima_incremental_state", "bigint"]
+            ), [s, vd['id']])
 else:
-    for new_y in new_ys:
-        c_state = transition(c_state, new_y, centre['phi'], centre['theta'], centre['c'])
+    for y in new_ys:
+        c_state = transition(c_state, y, phi, theta, c)
 
-y_lags_sql = f"ARRAY[{','.join(str(x) for x in c_state['y_lags'])}]" if c_state['y_lags'] else "ARRAY[]::double precision[]"
-e_lags_sql = f"ARRAY[{','.join(str(x) for x in c_state['e_lags'])}]" if c_state['e_lags'] else "ARRAY[]::double precision[]"
-diff_lags_sql = f"ARRAY[{','.join(str(x) for x in c_state['diff_lags'])}]" if c_state['diff_lags'] else "ARRAY[]::double precision[]"
-
-plpy.execute(f"""
-    UPDATE model_pyautoarima_stats 
-    SET incremental_state = ROW(
-        {c_state['p']}, {c_state['q']}, {c_state['css']},
-        {y_lags_sql}, {e_lags_sql}, {diff_lags_sql}
-    )::pyautoarima_incremental_state
-    WHERE id = {stats_id}
-""")
+# Update centre state in DB
+plpy.execute(plpy.prepare(
+    "UPDATE model_pyautoarima_stats SET incremental_state = $1 WHERE id = $2",
+    ["pyautoarima_incremental_state", "bigint"]
+), [c_state, stats_id])
 
 return is_ok
-$$;
-
-CREATE OR REPLACE FUNCTION pyautoarima_incremental_update(
-    stats_id BIGINT,
-    is_incremental BOOLEAN,
-    new_y DOUBLE PRECISION
-)
-RETURNS BOOLEAN
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    RETURN pyautoarima_batch_incremental_update(stats_id, is_incremental, ARRAY[new_y]);
-END;
 $$;
 
 CREATE OR REPLACE FUNCTION pyautoarima_fit_series(
@@ -330,12 +324,11 @@ RETURNS pyautoarima_fit_result
 LANGUAGE plpython3u
 AS $$
 plpy.execute("SELECT activate_python_venv();")
-if 'np' not in GD:
-    GD['np'] = __import__('numpy')
-if 'pm' not in GD:
-    GD['pm'] = __import__('pmdarima')
 np = GD['np']
 pm = GD['pm']
+pickle = GD['pickle']
+
+np.random.seed(42)
 
 model = pm.auto_arima(
     y,
@@ -347,15 +340,7 @@ model = pm.auto_arima(
 )
 
 p, d, q = model.order
-residuals = model.resid()
-css = np.sum(residuals ** 2)
-
-# with open("pyautoarima.log", "a") as f:
-#     f.writelines([f"Trained pyautoarima with {len(y)} records, p = {p}, d = {d}, q = {q}, css = {css}\n"])
-
-phi = []
-theta = []
-c = 0.0
+phi, theta, c = [], [], 0.0
 
 for name, val in zip(model.arima_res_.param_names, model.arima_res_.params):
     if name in ("const", "intercept"):
@@ -365,66 +350,23 @@ for name, val in zip(model.arima_res_.param_names, model.arima_res_.params):
     elif name.startswith("ma.L"):
         theta.append(float(val))
 
-return (p, d, q, phi, theta, c, css)
-$$;
+# Initial state CSS
+state = {
+    'p': p, 'q': q,
+    'css': 0.0,
+    'y_lags': [0.0] * p,
+    'e_lags': [0.0] * q,
+    'diff_lags': [0.0] * d
+}
+arr_phi = np.array(phi)
+arr_theta = np.array(theta)
+transition = GD['transition']
+for val in y:
+    state = transition(state, val, arr_phi, arr_theta, c)
 
-CREATE OR REPLACE FUNCTION pyautoarima_init_state_helper(
-    ys DOUBLE PRECISION[], 
-    phi DOUBLE PRECISION[], 
-    theta DOUBLE PRECISION[], 
-    c DOUBLE PRECISION, 
-    p INT, 
-    q INT, 
-    d INT
-)
-RETURNS pyautoarima_incremental_state
-LANGUAGE plpython3u AS $$
-plpy.execute("SELECT activate_python_venv();")
-if 'np' not in GD:
-    GD['np'] = __import__('numpy')
-np = GD['np']
+model_pickle = pickle.dumps(model)
 
-def transition(state_dict, y_raw, phi_v, theta_v, c_val):
-    diff_lags = np.array(state_dict['diff_lags'], dtype=float)
-    y_lags = np.array(state_dict['y_lags'], dtype=float)
-    e_lags = np.array(state_dict['e_lags'], dtype=float)
-    
-    x = y_raw
-    for i in range(len(diff_lags)):
-        delta = x - diff_lags[i]
-        diff_lags[i] = x
-        x = delta
-    y = x
-    
-    y_hat = c_val
-    if len(phi_v) > 0 and len(y_lags) > 0: 
-        y_hat += np.dot(phi_v, y_lags)
-    if len(theta_v) > 0 and len(e_lags) > 0: 
-        y_hat += np.dot(theta_v, e_lags)
-    
-    eps = y - y_hat
-    
-    if len(y_lags) > 0:
-        y_lags = np.roll(y_lags, 1); y_lags[0] = y
-    if len(e_lags) > 0:
-        e_lags = np.roll(e_lags, 1); e_lags[0] = eps
-        
-    return {
-        'p': state_dict['p'], 'q': state_dict['q'],
-        'css': state_dict['css'] + eps*eps, 
-        'y_lags': list(y_lags), 
-        'e_lags': list(e_lags), 
-        'diff_lags': list(diff_lags)
-    }
-
-state = {'p': p, 'q': q, 'css': 0.0, 'y_lags': [0.0]*p, 'e_lags': [0.0]*q, 'diff_lags': [0.0]*d}
-phi_arr = np.array(phi)
-theta_arr = np.array(theta)
-
-for y_val in ys:
-    state = transition(state, y_val, phi_arr, theta_arr, c)
-
-return state
+return (p, d, q, phi, theta, c, state['css'], model_pickle)
 $$;
 
 CREATE OR REPLACE FUNCTION pyautoarima_train(
@@ -442,26 +384,32 @@ DECLARE
     v_series DOUBLE PRECISION[];
     v_fit pyautoarima_fit_result;
     v_inc_state pyautoarima_incremental_state;
+    v_stats_id BIGINT;
 BEGIN
     PERFORM set_config('search_path', 'public,pg_temp', true);
     
-    -- Extract series manually to pass to helper
     EXECUTE format('SELECT array_agg(%I ORDER BY %I) FROM %I WHERE %I IS NOT NULL', 
                    value_col, date_col, input_tab, value_col) INTO v_series;
-                   
+                    
     v_fit := pyautoarima_fit_series(v_series);
 
     SELECT m.id FROM models m INTO v_model_id WHERE m.model_type = 'pyautoarima'::model AND m.input_table = input_tab AND m.date_column = date_col AND m.value_column = value_col;
 
-    v_inc_state := pyautoarima_init_state_helper(v_series, v_fit.phi, v_fit.theta, v_fit.c, v_fit.p, v_fit.q, v_fit.d);
+    v_inc_state := pyautoarima_full_table_state(v_series, v_fit.phi, v_fit.theta, v_fit.c, v_fit.p, v_fit.q, v_fit.d);
 
     UPDATE model_pyautoarima_stats SET is_active = FALSE WHERE model_id = v_model_id;
     
-    INSERT INTO model_pyautoarima_stats (model_id, phi, theta, d, c, incremental_state, is_incremental, is_active)
-    VALUES (v_model_id, v_fit.phi, v_fit.theta, v_fit.d, v_fit.c, v_inc_state, is_incremental, TRUE)
-    ON CONFLICT ON CONSTRAINT unique_model_pyautoarima_stats
-    DO UPDATE SET is_active = TRUE;
+    INSERT INTO model_pyautoarima_stats (model_id, phi, theta, d, c, incremental_state, model_pickle, is_incremental, is_active)
+    VALUES (v_model_id, v_fit.phi, v_fit.theta, v_fit.d, v_fit.c, v_inc_state, v_fit.model_pickle, is_incremental, TRUE)
+    ON CONFLICT (model_id, phi, theta, d, c)
+    DO UPDATE SET is_active = TRUE, model_pickle = EXCLUDED.model_pickle, incremental_state = EXCLUDED.incremental_state, is_incremental = EXCLUDED.is_incremental
+    RETURNING id INTO v_stats_id;
     
+    IF is_incremental THEN
+        DELETE FROM pyautoarima_vertices WHERE stats_id = v_stats_id;
+        PERFORM pyautoarima_generate_vertices(v_stats_id, v_fit.p, v_fit.q, v_fit.d, v_fit.phi, v_fit.theta, v_fit.c, v_series);
+    END IF;
+
     RETURN v_fit;
 END;
 $$;
@@ -480,8 +428,6 @@ AS $$
 DECLARE
     v_model_id BIGINT;
     v_fit pyautoarima_fit_result;
-    v_stats_id BIGINT;
-    v_series DOUBLE PRECISION[];
 BEGIN
     PERFORM set_config('search_path', 'public,pg_temp', true);
 
@@ -490,16 +436,6 @@ BEGIN
     RETURNING id INTO v_model_id;
 
     v_fit := pyautoarima_train(input_table, date_column, value_column, is_incremental);
-
-    IF is_incremental THEN
-        SELECT s.id FROM model_pyautoarima_stats s INTO v_stats_id WHERE s.model_id = v_model_id AND s.is_active = TRUE;
-        EXECUTE format('SELECT array_agg(%I ORDER BY %I) FROM %I WHERE %I IS NOT NULL', 
-                       value_column, date_column, input_table, value_column) INTO v_series;
-
-        PERFORM pyautoarima_generate_vertices(
-            v_stats_id, v_fit.p, v_fit.q, v_fit.d, v_fit.phi, v_fit.theta, v_fit.c, v_series
-        );
-    END IF;
 
     EXECUTE format(
         'CREATE TRIGGER pyautoarima_on_insert_%I_%I AFTER INSERT ON %I REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION pyautoarima_on_insert_trigger(%L, %L, %L, %L);',
@@ -522,33 +458,23 @@ DECLARE
     v_is_incremental BOOLEAN := TG_ARGV[3];
     v_model RECORD;
     v_ok BOOLEAN;
-    v_value DOUBLE PRECISION;
     v_series DOUBLE PRECISION[];
 BEGIN
     PERFORM set_config('search_path', 'public,pg_temp', true);
 
-    SELECT m.id, s.id AS stats_id, (s.incremental_state).p, s.d, (s.incremental_state).q, s.phi, s.theta, s.c
-    INTO v_model
+    SELECT s.id AS stats_id
     FROM models m
     INNER JOIN model_pyautoarima_stats s ON s.model_id = m.id
     WHERE m.model_type = 'pyautoarima'::model AND m.input_table = v_input_table AND m.date_column = v_date_column AND m.value_column = v_value_column AND s.is_active = TRUE
-    LIMIT 1;
+    LIMIT 1
+    INTO v_model;
 
     IF NOT FOUND THEN RETURN NULL; END IF;
-    IF (v_model.p + v_model.q) = 0 THEN
-        v_is_incremental := FALSE;
-    END IF;
-
-    IF v_is_incremental AND NOT EXISTS (SELECT 1 FROM pyautoarima_vertices WHERE stats_id = v_model.stats_id) THEN
-        EXECUTE format('SELECT array_agg(%I ORDER BY %I) FROM %I WHERE %I IS NOT NULL', 
-                       v_value_column, v_date_column, v_input_table, v_value_column) INTO v_series;
-        PERFORM pyautoarima_generate_vertices(v_model.stats_id, v_model.p, v_model.q, v_model.d, v_model.phi, v_model.theta, v_model.c, v_series);
-    END IF; 
-
+    
     EXECUTE format('SELECT array_agg(%I ORDER BY %I) FROM new_rows', v_value_column, v_date_column) INTO v_series;
     v_ok := pyautoarima_batch_incremental_update(v_model.stats_id, v_is_incremental, v_series);
 
-    IF NOT v_ok OR NOT v_is_incremental THEN
+    IF NOT v_ok THEN
         PERFORM pyautoarima_train(v_input_table, v_date_column, v_value_column, v_is_incremental);
     END IF;
 
@@ -568,18 +494,10 @@ LANGUAGE plpython3u
 SECURITY DEFINER
 AS $$
 plpy.execute("SELECT activate_python_venv();")
-import numpy as np
+pickle = GD['pickle']
 
-# -------------------------------
-# Load model
-# -------------------------------
 sql = f"""
-SELECT 
-    (s.incremental_state).p,
-    s.d,
-    (s.incremental_state).q,
-    s.phi, s.theta, s.c,
-    s.incremental_state
+SELECT s.model_pickle
 FROM models m
 JOIN model_pyautoarima_stats s ON s.model_id = m.id
 WHERE m.model_type = 'pyautoarima'::model
@@ -589,77 +507,17 @@ WHERE m.model_type = 'pyautoarima'::model
   AND s.is_active = TRUE
 LIMIT 1
 """
-model_row = plpy.execute(sql)
-if not model_row:
-    plpy.error(f"No trained pyautoarima model found for {input_table}, {date_column}, {value_column}")
-m = model_row[0]
+res = plpy.execute(sql)
+if not res:
+    plpy.error("Model not found")
 
-p, d, q = m["p"], m["d"], m["q"]
-phi, theta, c = m["phi"], m["theta"], m["c"]
-residuals = m["incremental_state"]["e_lags"]
+model = pickle.loads(res[0]['model_pickle'])
+forecast_vals = model.predict(n_periods=horizon)
 
-# -------------------------------
-# Load time series
-# -------------------------------
-arr_sql = f"""
-SELECT array_agg({value_column} ORDER BY {date_column}) AS vals
-FROM {input_table}
-WHERE {value_column} IS NOT NULL
-"""
-arr_row = plpy.execute(arr_sql)
-vals = arr_row[0]["vals"]
-if not vals or len(vals) < 2:
-    plpy.error(f"No data available for forecasting in {input_table}.{value_column}")
-
-vals = np.array(vals, dtype=float)
-
-# -------------------------------
-# Difference if needed
-# -------------------------------
-if d > 0:
-    initial_vals = vals[:d].copy()
-    for i in range(d):
-        vals[i+1:] = vals[i+1:] - vals[i:-1].copy()
-
-# -------------------------------
-# Select last values for forecast
-# -------------------------------
-ncond = max(p, q)
-last_vals = vals[-ncond:] if ncond > 0 else np.array([], dtype=float)
-
-# -------------------------------
-# Forecast
-# -------------------------------
-forecast = np.zeros(horizon, dtype=float)
-
-for t in range(horizon):
-    yhat = c
-    if p > 0:
-        yhat += sum(phi[i]*last_vals[-(i+1)] for i in range(p))
-    if q > 0:
-        yhat += sum(theta[i]*residuals[-(i+1)] for i in range(q))
-    eps = 0  # assume zero innovation for forecast
-    forecast[t] = yhat
-    # Shift last_vals and residuals
-    if p > 0:
-        last_vals = np.append(last_vals[1:], yhat)
-    if q > 0:
-        residuals = np.append(residuals[1:], eps)
-
-# -------------------------------
-# Re-integrate if differenced
-# -------------------------------
-if d > 0:
-    for i in range(horizon):
-        forecast[i] += vals[-d+i] if i < d else forecast[i-1]
-
-# -------------------------------
-# Compute forecast dates
-# -------------------------------
 date_sql = f"SELECT MAX({date_column}) AS last_date FROM {input_table}"
 last_date = plpy.execute(date_sql)[0]["last_date"]
-arr_forecasts = "{" + ",".join(str(float(v)) for v in forecast) + "}"
 
+arr_forecasts = "{" + ",".join(str(float(v)) for v in forecast_vals) + "}"
 return plpy.execute(f"""
     SELECT
         '{last_date}'::timestamp + (i * '{forecast_step}'::interval) AS forecast_date,
