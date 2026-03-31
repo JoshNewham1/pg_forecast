@@ -13,7 +13,7 @@ INSERT INTO pg_forecast_fcast_eval(t, x)
 SELECT
     ('2026-01-01'::date + s.i) AS t,
     random() AS x
-FROM generate_series(1, 1000) AS s(i);
+FROM generate_series(1, 1000000) AS s(i);
 
 -- C version
 SELECT  
