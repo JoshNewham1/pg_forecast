@@ -675,7 +675,7 @@ def append_results_to_file(model_name, iteration, result_dict):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python benchmark.py <model> <iterations>")
+        print("Usage: python test_joinboost.py <model> <iterations>")
         print("Available models: duckdb, postgres, timescale, citus, sklearn, xgb_mem, xgb_ooc")
         sys.exit(1)
 

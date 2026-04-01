@@ -171,10 +171,10 @@ def arima_forecast_query(last_vals: list[float], last_residuals: list[float], p:
 
 def arima_run_forecast_incremental_query(p, d, q, phi, theta, c, last_y_diffs, last_residuals, last_original_vals, last_date, horizon, forecast_step, log_transform):
     """
-    Build a SQLAlchemy text query to call arima_run_forecast_incremental_v2.
+    Build a SQLAlchemy text query to call arima_run_forecast_incremental.
     """
     query_str = """
-        SELECT * FROM arima_run_forecast_incremental_v2(
+        SELECT * FROM arima_run_forecast_incremental(
             :p, :d, :q, :phi, :theta, :c, :last_y_diffs, :last_residuals, :last_original_vals, :last_date, :horizon, :forecast_step, :log_transform
         )
     """
@@ -640,7 +640,7 @@ def test_arima_run_forecast_incremental_p_2_d_1_q_2(test_engine):
             assert_close(val, expected_forecast[i], name=f"Step {i+1}")
 
 
-def test_arima_run_forecast_incremental_null_repro(test_engine):
+def test_arima_run_forecast_incremental_null_should_error(test_engine):
     p, d, q = 0, 1, 0
     phi = []
     theta = []
@@ -658,7 +658,8 @@ def test_arima_run_forecast_incremental_null_repro(test_engine):
     )
 
     with test_engine.connect() as conn:
-        conn.execute(query).fetchall()
+        with pytest.raises(Exception):
+            conn.execute(query).fetchall()
 
 
 def test_arima_incremental_matches_regular_p_2_d_1_q_2(test_engine):
@@ -809,6 +810,7 @@ def test_autoarima_finds_low_loss_model(test_engine):
         conn.execute(text("""
             SELECT remove_forecast('autoarima', 'pg_forecast_unit_test', 't', 'value');
             TRUNCATE TABLE pg_forecast_unit_test;
+            SELECT setseed(0.42);
             INSERT INTO pg_forecast_unit_test (t, series_id, value)
             SELECT 
                 '2023-01-01'::timestamp + (n || ' minutes')::interval,
