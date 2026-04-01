@@ -11,14 +11,24 @@ The system consists of three main components:
 
 ## Installation
 
+First, clone this repo and all its dependencies (in `eval/`):
+
+```bash
+git clone --recursive https://github.com/JoshNewham1/pg_forecast.git
+```
+
 ### Prerequisites
 
-To build and run the project, ensure the following dependencies are installed:
+Then, to build and run the project, ensure the following dependencies are installed:
 
 - **Build Tools**: `gcc`, `make`
-- **PostgreSQL**: `postgresql-server-dev-14` (or later)
+- **PostgreSQL**: `postgresql-server-dev-xx` (xx matches your version of PostgreSQL e.g., 18)
 - **Libraries**: `libnlopt-dev`
 - **Python**: Python 3.12.3 (recommended for TFB compatibility) and `venv`
+
+```bash
+sudo apt install gcc make postgresql-server-dev-18 libnlopt-dev
+```
 
 ### Building the PostgreSQL Extension
 
@@ -52,7 +62,7 @@ This project utilises several datasets that are a few gigabytes each. Due to the
 ### 1. Time Series Forecasting Benchmark (TFB)
 - **Source**: [TFB Dataset (Google Drive)](https://drive.google.com/file/d/1vgpOmAygokoUt235piWKUjfwao6KwLv7/view?usp=drive_link)
 - **Target Location**: `eval/TFB/dataset/`
-- **Usage**: The accuracy benchmark (RQ1).
+- **Usage**: The accuracy benchmark (RQ1)
 
 ### 2. Monash Time Series Repository
 - **Source**: [Monash TSF (Hugging Face)](https://huggingface.co/datasets/Monash-University/monash_tsf/tree/main/data)
