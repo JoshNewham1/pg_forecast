@@ -527,3 +527,155 @@ return plpy.execute(f"""
 $$;
 
 COMMIT;
+
+-- Generic
+CREATE OR REPLACE FUNCTION create_forecast(
+    model_name TEXT,
+    input_table TEXT,
+    date_column TEXT,
+    value_column TEXT,
+    args JSONB DEFAULT '{}'
+)
+RETURNS BOOLEAN -- Was forecast creation successful
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_result BOOLEAN;
+BEGIN
+    v_result :=
+        CASE model_name
+            WHEN 'autoarima' THEN
+                (SELECT autoarima_train(
+                    input_table,
+                    date_column,
+                    value_column
+                )) IS NOT NULL
+            WHEN 'pyautoarima' THEN
+                (SELECT pyautoarima_create(
+                    input_table,
+                    date_column,
+                    value_column,
+                    COALESCE((args->>'use_continuous_agg')::boolean, FALSE),
+                    COALESCE((args->>'is_incremental')::boolean, FALSE)
+                )) IS NOT NULL
+            ELSE
+                NULL
+        END;
+
+    IF v_result IS NULL THEN
+        RAISE EXCEPTION '% not supported, please try again', model_name;
+    END IF;
+
+    RETURN v_result;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION run_forecast(
+    model_name TEXT,
+    input_table TEXT,
+    date_column TEXT,
+    value_column TEXT,
+    horizon INT,
+    forecast_step INTERVAL DEFAULT '1 day'
+)
+RETURNS TABLE(forecast_date TIMESTAMP, forecast_value DOUBLE PRECISION)
+SECURITY DEFINER
+AS $$
+DECLARE
+    rec_model RECORD;
+    v_opt_result arima_optimise_result;
+    v_func_name TEXT;
+    v_func_exists BOOLEAN;
+    v_last_date TIMESTAMP;
+BEGIN
+    -- Safety precaution for SECURITY DEFINER
+    PERFORM set_config('search_path', 'public,pg_temp', true);
+    
+    IF forecast_step IS NULL THEN
+        -- TODO: Estimate step from data
+        forecast_step := '1 day'::interval;
+    END IF;
+
+    IF model_name = 'autoarima' THEN
+        -- Get params and hyperparams for forecasting
+        EXECUTE format(
+            'SELECT 
+                m.id,
+                m.use_log_transform,
+                a.d, a.c, 
+                a.phi, a.theta,
+                (a.incremental_state).p,
+                (a.incremental_state).q,
+                (a.incremental_state).e_lags AS residuals,
+                (a.incremental_state).y_lags,
+                (a.incremental_state).diff_buf,
+                (a.incremental_state).css
+            FROM models m
+            INNER JOIN model_arima_stats a ON m.id = a.model_id AND a.is_active = TRUE
+            WHERE m.model_type = %L AND m.input_table = %L AND m.date_column = %L AND m.value_column = %L',
+            
+            model_name, input_table, date_column, value_column
+        ) INTO rec_model;
+
+        IF rec_model IS NULL THEN
+            RAISE WARNING 'run_forecast: no autoarima model found, please run create_forecast first';
+            RETURN;
+        END IF;
+
+        -- Get the last timestamp to build forecast dates
+        EXECUTE format(
+            'SELECT MAX(%I) FROM %I',
+            date_column,
+            input_table
+        )
+        INTO v_last_date;
+
+        RETURN QUERY
+            SELECT 
+                *
+            FROM
+                arima_run_forecast_incremental(
+                    rec_model.p,
+                    rec_model.d,
+                    rec_model.q,
+                    rec_model.phi,
+                    rec_model.theta,
+                    rec_model.c,
+                    rec_model.y_lags,
+                    rec_model.residuals,
+                    rec_model.diff_buf,
+                    v_last_date,
+                    horizon,
+                    forecast_step,
+                    rec_model.use_log_transform
+                );
+        RETURN;
+    ELSIF model_name = 'pyautoarima' THEN
+        v_func_name := model_name || '_forecast';
+
+        -- Check if the function exists in the current schema
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_proc p
+            JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE p.proname = v_func_name
+            AND n.nspname = 'public'
+        ) INTO v_func_exists;
+
+        IF v_func_exists THEN
+            RETURN QUERY EXECUTE format(
+                'SELECT * FROM %I(%L, %L, %L, %L, %L)',
+                v_func_name,
+                input_table,
+                date_column,
+                value_column,
+                horizon,
+                forecast_step
+            );
+        ELSE
+            RAISE WARNING 'run_forecast: % is not a valid model', model_name;
+            RETURN;
+        END IF;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;

@@ -20,14 +20,6 @@ BEGIN
                     date_column,
                     value_column
                 )) IS NOT NULL
-            WHEN 'pyautoarima' THEN
-                (SELECT pyautoarima_create(
-                    input_table,
-                    date_column,
-                    value_column,
-                    COALESCE((args->>'use_continuous_agg')::boolean, FALSE),
-                    COALESCE((args->>'is_incremental')::boolean, FALSE)
-                )) IS NOT NULL
             ELSE
                 NULL
         END;
@@ -120,32 +112,6 @@ BEGIN
                     rec_model.use_log_transform
                 );
         RETURN;
-    ELSIF model_name = 'pyautoarima' THEN
-        v_func_name := model_name || '_forecast';
-
-        -- Check if the function exists in the current schema
-        SELECT EXISTS (
-            SELECT 1
-            FROM pg_proc p
-            JOIN pg_namespace n ON p.pronamespace = n.oid
-            WHERE p.proname = v_func_name
-            AND n.nspname = 'public'
-        ) INTO v_func_exists;
-
-        IF v_func_exists THEN
-            RETURN QUERY EXECUTE format(
-                'SELECT * FROM %I(%L, %L, %L, %L, %L)',
-                v_func_name,
-                input_table,
-                date_column,
-                value_column,
-                horizon,
-                forecast_step
-            );
-        ELSE
-            RAISE WARNING 'run_forecast: % is not a valid model', model_name;
-            RETURN;
-        END IF;
     END IF;
 END;
 $$ LANGUAGE plpgsql;
